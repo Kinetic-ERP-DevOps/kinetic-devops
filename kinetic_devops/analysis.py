@@ -86,7 +86,51 @@ def _resolve_ai_base_url(raw_value: str | None) -> str:
     if env_value:
         return env_value
 
-    raise ValueError("AI base URL is required. Set KINETIC_AI_BASE_URL or pass --ai-base-url.")
+    stored = str(_stored_ai_profile().get("base_url") or "").strip()
+    if stored:
+        return stored
+
+    raise ValueError(
+        "AI base URL is required. Store one with 'uv run python -m kinetic_devops.auth ai-set', "
+        "or pass --ai-base-url."
+    )
+
+
+def _stored_ai_profile() -> dict[str, Any]:
+    """The AI profile stored by 'auth ai-set' (keyring), or {} if unavailable."""
+    try:
+        from kinetic_devops.auth import get_ai_profile
+
+        return get_ai_profile()
+    except Exception:
+        return {}
+
+
+def _ai_client_settings(base_url: str) -> tuple[str, dict[str, str]]:
+    """(api_style, extra headers) for base_url. The stored profile's style applies
+    only when it is for this same URL; the API key is looked up by URL."""
+    url = normalize_base_url(base_url)
+    profile = _stored_ai_profile()
+    style = profile.get("api_style") if normalize_base_url(str(profile.get("base_url") or "")) == url else None
+    headers: dict[str, str] = {}
+    try:
+        from kinetic_devops.auth import get_ai_api_key
+
+        key = get_ai_api_key(url)
+    except Exception:
+        key = ""
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return (style or "openai"), headers
+
+
+def select_model(models: list[str], base_url: str) -> str:
+    """The stored default model when the server offers it, else the first listed."""
+    profile = _stored_ai_profile()
+    preferred = str(profile.get("model") or "").strip()
+    if preferred and normalize_base_url(str(profile.get("base_url") or "")) == normalize_base_url(base_url) and preferred in models:
+        return preferred
+    return models[0]
 
 
 def run_git(repo: Path, args: list[str], timeout: int = 60) -> CmdResult:
@@ -113,8 +157,9 @@ def normalize_base_url(base_url: str) -> str:
 
 
 def fetch_models(base_url: str, timeout: int) -> list[str]:
-    url = f"{normalize_base_url(base_url)}/v1/models"
-    req = request.Request(url=url, method="GET")
+    style, headers = _ai_client_settings(base_url)
+    path = "/api/models" if style == "openwebui" else "/v1/models"
+    req = request.Request(url=f"{normalize_base_url(base_url)}{path}", headers=headers, method="GET")
     with request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     data = payload.get("data") or []
@@ -122,18 +167,30 @@ def fetch_models(base_url: str, timeout: int) -> list[str]:
 
 
 def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: int = 360) -> dict[str, Any]:
-    url = f"{normalize_base_url(base_url)}/v1/completions"
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "temperature": 0.15,
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
+    style, headers = _ai_client_settings(base_url)
+    if style == "openwebui":
+        # Open WebUI exposes the chat API only; the prompt becomes a single user message.
+        url = f"{normalize_base_url(base_url)}/api/chat/completions"
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.15,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+    else:
+        url = f"{normalize_base_url(base_url)}/v1/completions"
+        body = {
+            "model": model,
+            "prompt": prompt,
+            "temperature": 0.15,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
     req = request.Request(
         url=url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
     with request.urlopen(req, timeout=timeout) as resp:
@@ -148,6 +205,9 @@ def extract_text(ai_response: dict[str, Any]) -> str:
             text = first.get("text")
             if isinstance(text, str):
                 return text.strip()
+            message = first.get("message")  # chat-completions response shape
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"].strip()
     return ""
 
 
@@ -591,7 +651,7 @@ def _run_diff_review(args: argparse.Namespace) -> int:
     models = fetch_models(ai_base_url, args.ai_timeout)
     if not models:
         raise RuntimeError("No local AI models available")
-    model = models[0]
+    model = select_model(models, ai_base_url)
 
     items = [build_snapshot_item(repo)]
     items.extend(build_commit_items(repo, base_ref=base_ref, max_commits=args.max_commits))
