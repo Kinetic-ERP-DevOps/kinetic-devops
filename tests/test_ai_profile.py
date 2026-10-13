@@ -48,6 +48,8 @@ class AIProfileTestBase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"KINETIC_AI_BASE_URL": ""})
         env.start()
         self.addCleanup(env.stop)
+        analysis.set_active_ai_profile(None)
+        self.addCleanup(analysis.set_active_ai_profile, None)
 
 
 class TestProfileStorage(AIProfileTestBase):
@@ -55,7 +57,7 @@ class TestProfileStorage(AIProfileTestBase):
         auth.set_ai_profile("http://ai-host:3000/", "openwebui", "llama3", api_key=FAKE_KEY)
         profile = auth.get_ai_profile()
         self.assertEqual(profile, {"base_url": "http://ai-host:3000", "api_style": "openwebui", "model": "llama3"})
-        self.assertNotIn(FAKE_KEY, self.kr.store[(auth.SERVICE_AI, "profile")])
+        self.assertNotIn(FAKE_KEY, self.kr.store[(auth.SERVICE_AI, "profiles")])
         self.assertEqual(auth.get_ai_api_key("http://ai-host:3000/"), FAKE_KEY)
 
     def test_none_key_keeps_existing_key(self):
@@ -140,6 +142,68 @@ class TestAnalysisUsesProfile(AIProfileTestBase):
         self.assertEqual(analysis.select_model(["a", "llama3"], "http://ai-host:3000"), "llama3")
         self.assertEqual(analysis.select_model(["a", "b"], "http://ai-host:3000"), "a")
         self.assertEqual(analysis.select_model(["a", "llama3"], "http://other:1"), "a")
+
+
+
+class TestNamedProfiles(AIProfileTestBase):
+    URL = "http://ai-host:3000"
+
+    def test_profiles_on_one_server_share_a_key_and_first_is_default(self):
+        auth.set_ai_profile(self.URL, "openwebui", "local/deep", api_key=FAKE_KEY, name="deep")
+        auth.set_ai_profile(self.URL, "openwebui", "local/fast", name="fast")
+        default, profiles = auth.list_ai_profiles()
+        self.assertEqual(default, "deep")
+        self.assertEqual(sorted(profiles), ["deep", "fast"])
+        self.assertEqual(auth.get_ai_profile("fast")["model"], "local/fast")
+        self.assertEqual(auth.get_ai_api_key(self.URL), FAKE_KEY)
+        self.assertNotIn(FAKE_KEY, self.kr.store[(auth.SERVICE_AI, "profiles")])
+
+    def test_make_default_and_set_default(self):
+        auth.set_ai_profile(self.URL, "openwebui", name="a")
+        auth.set_ai_profile(self.URL, "openwebui", name="b", make_default=True)
+        self.assertEqual(auth.list_ai_profiles()[0], "b")
+        auth.set_default_ai_profile("a")
+        self.assertEqual(auth.list_ai_profiles()[0], "a")
+        with self.assertRaises(ValueError):
+            auth.set_default_ai_profile("missing")
+
+    def test_clearing_one_profile_keeps_a_key_still_in_use(self):
+        auth.set_ai_profile(self.URL, "openwebui", api_key=FAKE_KEY, name="deep")
+        auth.set_ai_profile(self.URL, "openwebui", name="fast")
+        self.assertTrue(auth.clear_ai_profile("deep"))
+        self.assertEqual(auth.get_ai_api_key(self.URL), FAKE_KEY)
+        self.assertEqual(auth.list_ai_profiles()[0], "fast")
+        self.assertTrue(auth.clear_ai_profile("fast"))
+        self.assertEqual(auth.get_ai_api_key(self.URL), "")
+        self.assertEqual(auth.list_ai_profiles(), ("", {}))
+
+    def test_legacy_single_profile_is_migrated(self):
+        legacy = {"base_url": self.URL, "api_style": "openwebui", "model": "m"}
+        self.kr.set_password(auth.SERVICE_AI, "profile", json.dumps(legacy))
+        self.assertEqual(auth.list_ai_profiles(), ("default", {"default": legacy}))
+        auth.set_ai_profile(self.URL, "openwebui", "m2", name="fast")
+        self.assertIsNone(self.kr.get_password(auth.SERVICE_AI, "profile"))
+        self.assertEqual(sorted(auth.list_ai_profiles()[1]), ["default", "fast"])
+
+    def test_profile_name_validation(self):
+        with self.assertRaises(ValueError):
+            auth.set_ai_profile(self.URL, "openwebui", name="has space")
+
+    def test_analysis_uses_selected_profile_and_rejects_unknown(self):
+        auth.set_ai_profile(self.URL, "openwebui", "local/deep", name="deep")
+        auth.set_ai_profile("http://other:1234", "openai", "big", name="other")
+        models = ["local/fast", "local/deep"]
+        self.assertEqual(analysis.select_model(models, analysis._resolve_ai_base_url("")), "local/deep")
+        analysis.set_active_ai_profile("other")
+        self.assertEqual(analysis._resolve_ai_base_url(""), "http://other:1234")
+        self.assertEqual(analysis._ai_client_settings("http://other:1234")[0], "openai")
+        with self.assertRaises(ValueError):
+            analysis.set_active_ai_profile("missing")
+
+    def test_explicit_url_gets_style_from_matching_profile(self):
+        auth.set_ai_profile(self.URL, "openwebui", name="deep")
+        auth.set_ai_profile("http://other:1234", "openai", name="other")
+        self.assertEqual(analysis._ai_client_settings(self.URL)[0], "openwebui")
 
 
 if __name__ == "__main__":

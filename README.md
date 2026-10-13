@@ -84,8 +84,10 @@ Common environment variables:
 - `KINETIC_ACTIVE_ROOT` (default: `D:\Kinetic_SDK`)
 - `KINETIC_AI_BASE_URL` (fallback only, e.g. for runners without a keyring; normally the AI server is
   stored in the keyring with `uv run python -m kinetic_devops.auth ai-set`, which also stores its API
-  key, API style (`openwebui` or `openai`) and default model -- see `auth ai-show` / `auth ai-clear`.
-  Order: `--ai-base-url`, then the stored profile, then this variable)
+  key, API style (`openwebui` or `openai`) and default model. Profiles are named (`ai-set --name fast`,
+  `--name deep`), share one stored key per server, and are chosen with `analysis --ai-profile NAME`
+  (default: `auth ai-default NAME`); see `auth ai-show` / `auth ai-clear`.
+  Order: `--ai-base-url`, then the selected/default profile, then this variable)
 - `KINETIC_AI_TIMEOUT` (default: `180`)
 - `KINETIC_ANALYSIS_MAX_COMMITS` (default: `20`)
 - `KINETIC_ANALYSIS_LEGACY_OUT_DIR` (default: `D:\Kinetic_SDK\temp\legacy_intake_reviews`)
