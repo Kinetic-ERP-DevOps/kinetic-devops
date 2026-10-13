@@ -1,0 +1,111 @@
+# Git ignore file for project
+Data/
+bin/
+obj/
+exports/
+temp/
+tmp/
+exports/
+projects/
+
+# IDE specific files
+__pycache__/
+.vs
+.git
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.pydevproject
+*.project
+*.classpath
+*.settings/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+scripts/ai_env.local.ps1
+scripts/ai_env.local.sh
+scripts/ai_env.local.bat
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# Package distribution
+dist/
+build/
+*.egg-info/
+
+# Logs
+logs/*.log
+logs/*.out
+logs/*.err
+*.log
+*.out
+*.err
+*.bak_*
+BootstrapLogs/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+
+# Test artifacts and logs
+tests/test_results.log
+tests/__pycache__/
+tests/.pytest_cache/
+*.pyc
+refresh.log
+
+# Generated Temporary Files (Scripts)
+env_vars_tmp.bat
+env_vars_tmp.ps1
+.git_commit_msg.tmp
+git_lost+found/
+*.temp.jsonc
+*_escaped.json
+*_escaped.jsonc
+
+## Debug and Content files
+#*.content.jsonc
+#*.content.json
+#*.debug.json
+#*.tmp.json
+
+# uv specific
+.uv/
+
+# Specific to your local workspace
+.python-version

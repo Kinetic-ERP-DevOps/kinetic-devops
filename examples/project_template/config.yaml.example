@@ -1,0 +1,112 @@
+# Local Project Configuration
+# This file shows how to configure your custom project
+
+project:
+  name: My Kinetic Project
+  version: 1.0.0
+  description: Custom implementation and extensions
+
+# Environment settings
+environments:
+  # Each environment can have different credentials/URLs
+  development:
+    url: http://localhost:3000
+    company: DEV_COMPANY
+  
+  test:
+    url: https://test-kinetic.mycompany.com
+    company: TEST_COMPANY
+  
+  production:
+    url: https://kinetic.mycompany.com
+    company: PRODUCTION_COMPANY
+
+# Project settings
+settings:
+  # Loader configuration
+  loader:
+    auto_discovery: true
+    validate_on_load: true
+    
+  # Logging
+  logging:
+    level: INFO
+    output: logs/
+    
+  # Job scheduling (if using APScheduler or similar)
+  jobs:
+    sync_companies:
+      schedule: "0 2 * * *"  # Daily at 2 AM
+      timeout_minutes: 30
+      retry_on_failure: true
+      max_retries: 3
+    
+    validation:
+      schedule: "30 22 * * *"  # Daily at 10:30 PM
+      timeout_minutes: 20
+
+# Notification settings
+notifications:
+  # Email notifications
+  email:
+    enabled: true
+    recipients:
+      - devops@mycompany.com
+      - admin@mycompany.com
+    send_on:
+      - job_failure
+      - validation_error
+      - long_running_job
+  
+  # Slack integration
+  slack:
+    enabled: false
+    webhook_url: YOUR_SLACK_WEBHOOK_URL
+    channel: '#devops'
+    send_on:
+      - critical_error
+
+# Custom data directories
+data:
+  exports_directory: ./exports/
+  logs_directory: ./logs/
+  backups_directory: ./backups/
+
+# Integration settings
+integrations:
+  # Extensions to kinetic-devops modules
+  extensions:
+    - type: custom_baq
+      module: functions.pull_customers
+      
+    - type: custom_layer
+      module: layers.CLIENT_A.dimension_layer
+      
+    - type: custom_bpm
+      module: BPM.po_approval
+
+# Feature flags
+features:
+  # Enable/disable features for testing
+  dry_run_mode: false
+  validation_strict: true
+  enable_notifications: true
+  detailed_logging: false
+
+# Company-specific settings (multi-tenant support)
+companies:
+  CLIENT_A:
+    code: CLIENT_A
+    name: Client A Corporation
+    custom_layer: layers.CLIENT_A
+    
+  CLIENT_B:
+    code: CLIENT_B
+    name: Client B Industries
+    # CLIENT_B doesn't use custom layer
+
+# Notes
+# - Copy this file to project root before running
+# - Environment variables will override YAML values
+# - Keep sensitive credentials in environment variables or .env files
+# - Never commit real credentials to Git

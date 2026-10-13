@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinetic-devops"
+version = "0.1.0a6"
+description = "Python toolkit for Epicor Kinetic environment management, CI/CD automation, and data migration workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "keyring",
+    "requests",
+]
+authors = [
+    {name = "Kinetic DevOps Contributors"}
+]
+license = "Apache-2.0"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+kinetic-devops = "kinetic_devops.__main__:main"
+repo-maker = "kinetic_devops.repo_maker:main"
+repomaker = "kinetic_devops.repomaker.__main__:main"
+reposmith = "kinetic_devops.repomaker.reposmith:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["kinetic_devops*"]
+exclude = ["tests*", "Documents*", "exports*", "projects*", "temp*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+norecursedirs = [
+    "temp",
+    "tmp",
+    "exports",
+    "projects",
+    "bin",
+    "Data",
+    ".git",
+    ".venv",
+    "venv",
+    "env",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+addopts = "--strict-markers --disable-warnings"
+
+[tool.uv]
+# Pre-compile installed dependencies to bytecode during install/sync, so the
+# first run after setup does not pay to compile them (e.g. keyring, requests).
+compile-bytecode = true

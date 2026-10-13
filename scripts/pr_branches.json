@@ -1,0 +1,74 @@
+[
+  {
+    "Head": "pr/01-fs-risk-matrix",
+    "Base": "main",
+    "Title": "feat(fs): add overwrite risk matrix and granular permission model",
+    "Body": "## Summary\n- Add overwrite risk classification matrix in fs ops.\n- Add granular force requirement mapping.\n- Establish shared write-permission evaluation behavior.\n\n## Validation\n- Unit tests for risk matrix and force mapping."
+  },
+  {
+    "Head": "pr/02-base-client-resolver",
+    "Base": "pr/01-fs-risk-matrix",
+    "Title": "feat(base-client): enforce granular overwrite flags in resolver",
+    "Body": "## Summary\n- Integrate risk matrix into output-path resolver.\n- Add granular force/no-force controls and confirmation flow.\n- Improve conflict handling consistency across file writes.\n\n## Validation\n- Unit tests for overwrite policy enforcement."
+  },
+  {
+    "Head": "pr/03-solutions-adoption",
+    "Base": "pr/02-base-client-resolver",
+    "Title": "feat(solutions): adopt core file-resolution policy",
+    "Body": "## Summary\n- Route solutions backup/build artifacts through shared resolver.\n- Ensure consistent conflict behavior for server-downloaded artifacts.\n\n## Validation\n- Solutions-focused tests updated/added."
+  },
+  {
+    "Head": "pr/04-zdatatable-adoption",
+    "Base": "pr/03-solutions-adoption",
+    "Title": "feat(zdatatable): adopt file-resolution safeguards",
+    "Body": "## Summary\n- Apply centralized file conflict policy to zdatatable flows.\n- Keep output handling behavior consistent with core rules.\n\n## Validation\n- Zdatatable regression tests."
+  },
+  {
+    "Head": "pr/05-export-all-adoption",
+    "Base": "pr/04-zdatatable-adoption",
+    "Title": "feat(export-all): apply resolver policy across export orchestration",
+    "Body": "## Summary\n- Integrate core file-resolution policy into export-all pipelines.\n- Standardize artifact output conflict handling.\n\n## Validation\n- Export-all tests."
+  },
+  {
+    "Head": "pr/06-cli-wiring",
+    "Base": "pr/05-export-all-adoption",
+    "Title": "feat(cli): register shared file-resolution options",
+    "Body": "## Summary\n- Wire shared file-resolution CLI options across key commands.\n- Ensure consistent runtime configuration of overwrite policy.\n\n## Validation\n- CLI argument registration tests."
+  },
+  {
+    "Head": "pr/07-service-modules-adoption",
+    "Base": "pr/06-cli-wiring",
+    "Title": "feat(modules): adopt core file-resolution policy across service exporters",
+    "Body": "## Summary\n- Apply centralized conflict policy to BAQ/BOReader/EFX/FileService/MetaFX paths.\n- Remove module-specific divergence in overwrite behavior.\n\n## Validation\n- Service/module execution sanity checks."
+  },
+  {
+    "Head": "pr/08-kineticcore-safeguard",
+    "Base": "pr/07-service-modules-adoption",
+    "Title": "feat(core): add cache-write safeguard for high-risk paths",
+    "Body": "## Summary\n- Add backup-before-overwrite safeguard for high-risk cache write scenarios.\n- Align KineticCore write behavior with policy expectations.\n\n## Validation\n- Core behavior sanity checks."
+  },
+  {
+    "Head": "pr/09-architecture-rfc",
+    "Base": "main",
+    "Title": "docs(architecture): add state-of-truth and zero-trust CI/CD RFC drafts",
+    "Body": "## Summary\n- Add architecture discussion drafts for state-of-truth and zero-trust CI/CD.\n- Discussion-only docs PR (no runtime changes)."
+  },
+  {
+    "Head": "pr/10-security-scanner-hardening",
+    "Base": "main",
+    "Title": "feat(security): harden sensitive-data scanner exclusions and path scoping",
+    "Body": "## Summary\n- Fix exclusion path normalization (exports, .\\exports, ./exports).\n- Ensure explicit --path scopes file and git-history scanning.\n- Re-add exports/ ignore where needed for local artifacts.\n\n## Validation\n- Added scanner exclusion regression tests.\n- Verified explicit ./exports scan behavior."
+  },
+  {
+    "Head": "pr/11-script-ux-tooling",
+    "Base": "main",
+    "Title": "feat(scripts): improve tooling UX and helper utilities",
+    "Body": "## Summary\n- Add/refresh script helpers for local tooling workflows.\n- Improve script usage ergonomics/documentation where included in this branch."
+  },
+  {
+    "Head": "pr/12-docs-changelog",
+    "Base": "main",
+    "Title": "docs: update changelog and project documentation",
+    "Body": "## Summary\n- Update changelog for recent work.\n- Refresh project documentation to reflect current behavior and usage."
+  }
+]

@@ -1,0 +1,63 @@
+# Project template .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific
+.env
+.env.local
+config.yaml
+logs/
+exports/
+backups/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+Thumbs.db
+.AppleDouble
+.LSOverride
+Desktop.ini
+
+# Testing
+.tox/
+.nox/
+.hypothesis/
+
+# Note: This is a local project directory
+# See /README.md for details on how to organize your custom code

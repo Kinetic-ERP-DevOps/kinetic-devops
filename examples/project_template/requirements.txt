@@ -1,0 +1,34 @@
+# Project template requirements
+# Copy this to your project root and install with: pip install -r requirements.txt
+
+# Core kinetic-devops package
+kinetic-devops>=0.1.0a1
+
+# Optional dependencies for common patterns
+
+# For YAML config support
+pyyaml>=6.0
+
+# For scheduled jobs (if using BPM/jobs)
+apscheduler>=3.10.0
+
+# For enhanced logging
+python-json-logger>=2.0.0
+
+# For data export/import
+openpyxl>=3.0.0  # Excel support
+pandas>=1.5.0     # Data manipulation
+
+# For API/HTTP testing
+requests>=2.28.0
+
+# Development/testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=22.0.0
+flake8>=4.0.0
+mypy>=0.990
+
+# Documentation
+sphinx>=5.0.0
+sphinx-rtd-theme>=1.0.0

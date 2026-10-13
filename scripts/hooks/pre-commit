@@ -1,0 +1,477 @@
+#!/usr/bin/env python
+"""
+scripts/hooks/pre-commit - packaged pre-commit hook for Kinetic SDK
+
+This file is the repository-tracked copy of the pre-commit hook. Developers
+should install it into their local `.git/hooks/pre-commit` or set
+`git config core.hooksPath scripts/hooks` to use hooks from the repo.
+
+Usage:
+  # To install locally
+    copy scripts\\hooks\\pre-commit .git\\hooks\\pre-commit
+  # Make executable if on Unix: chmod +x .git/hooks/pre-commit
+
+When run, this script executes the SDK test runner and blocks commits if
+tests fail.
+
+Unified Kinetic SDK Pre-Commit Hook.
+Orchestrates:
+1. Unit Tests (tests/run_tests.py)
+2. Stringified JSON validation (prevents double-encoding)
+3. Content Sync (ensures .jsonc matches .content.jsonc)
+4. Index Sequencing (ensures "index": n fields are sequential)
+"""
+import sys
+import subprocess
+import json
+import re
+import os
+
+# Ensure UTF-8 encoding for Windows terminals to support emojis
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+
+from pathlib import Path
+
+
+SETTINGS_SERVICE = "kinetic-devops-settings"
+NOREPLY_ACCOUNT = "github-noreply-email"
+COMPANY_CODE_GROUPS = (
+    ("S", "O", "L"),
+    ("E", "S", "V"),
+    ("N", "C", "O"),
+    ("M", "E", "T"),
+    ("E", "T", "S"),
+)
+
+# --- UTILITIES ---
+
+def is_dry_run() -> bool:
+    """Return True when pre-commit should validate wiring without heavy checks."""
+    args = set(sys.argv[1:])
+    if "--dry-run" in args or "-n" in args:
+        return True
+
+    env_value = str(os.getenv("PRE_COMMIT_DRY_RUN", "")).strip().lower()
+    return env_value in {"1", "true", "yes", "on"}
+
+
+def is_remote_scan_only() -> bool:
+    args = set(sys.argv[1:])
+    if "--remote-scan-only" in args:
+        return True
+
+    env_value = str(os.getenv("KD_REMOTE_SENSITIVE_SCAN", "")).strip().lower()
+    return env_value in {"1", "true", "yes", "on"}
+
+def strip_comments(content):
+    """Removes // and /* */ comments from JSONC for parsing."""
+    content = re.sub(r'//.*', '', content)
+    content = re.sub(r'/\*[\s\S]*?\*/', '', content)
+    return content
+
+def get_staged_files():
+    """Returns a list of file paths currently staged for commit."""
+    try:
+        output = subprocess.check_output(
+            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"]
+        ).decode('utf-8').strip()
+        return [f for f in output.split('\n') if f]
+    except subprocess.CalledProcessError:
+        return []
+
+def get_repo_root():
+    return Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel']).strip().decode('utf-8'))
+
+
+def _env_true(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _git_output(args):
+    try:
+        return subprocess.check_output(args, text=True).strip()
+    except Exception:
+        return ""
+
+
+def _public_github_owner() -> str:
+    url = _git_output(["git", "remote", "get-url", "public"])
+    if not url:
+        return ""
+
+    if "github.com" not in url.lower():
+        return ""
+
+    # Examples:
+    # - https://github.com/owner/repo.git
+    # - git@github.com:owner/repo.git
+    # - ssh://git@github.com/owner/repo.git
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return (match.group(1) or "").strip()
+
+
+def _read_cached_noreply() -> str:
+    # Explicit env override wins and does not require keyring access.
+    env_value = str(os.getenv("KD_GITHUB_NOREPLY_EMAIL", "")).strip()
+    if env_value.endswith("@users.noreply.github.com"):
+        return env_value
+
+    try:
+        import keyring
+
+        value = str(keyring.get_password(SETTINGS_SERVICE, NOREPLY_ACCOUNT) or "").strip()
+        if value.endswith("@users.noreply.github.com"):
+            return value
+    except Exception:
+        pass
+
+    return ""
+
+
+def _cache_noreply(email_value: str) -> None:
+    if not str(email_value or "").endswith("@users.noreply.github.com"):
+        return
+    try:
+        import keyring
+
+        keyring.set_password(SETTINGS_SERVICE, NOREPLY_ACCOUNT, str(email_value).strip())
+    except Exception:
+        pass
+
+
+def _resolve_noreply_email(owner: str) -> str:
+    cached = _read_cached_noreply()
+    if cached:
+        return cached
+
+    login = _git_output(["gh", "api", "user", "--jq", ".login"])
+    user_id = _git_output(["gh", "api", "user", "--jq", ".id"])
+
+    candidate = ""
+    if login and user_id and user_id.isdigit():
+        candidate = f"{user_id}+{login}@users.noreply.github.com"
+    elif login:
+        candidate = f"{login}@users.noreply.github.com"
+    elif owner:
+        candidate = f"{owner}@users.noreply.github.com"
+
+    if candidate:
+        _cache_noreply(candidate)
+    return candidate
+
+
+def ensure_public_email_privacy() -> int:
+    """Ensure commit email is GitHub noreply when pushing to public GitHub remote.
+
+    Default behavior is auto-fix. Set KD_SKIP_EMAIL_PRIVACY=1 to disable.
+    """
+    if _env_true("KD_SKIP_EMAIL_PRIVACY"):
+        print("⚠️  PRE-COMMIT: Skipping email privacy guard (KD_SKIP_EMAIL_PRIVACY=1).")
+        return 0
+
+    owner = _public_github_owner()
+    if not owner:
+        return 0
+
+    current_email = _git_output(["git", "config", "--get", "user.email"])
+    if current_email.endswith("@users.noreply.github.com"):
+        return 0
+
+    candidate = _resolve_noreply_email(owner)
+
+    if not candidate:
+        print("❌ PRE-COMMIT: Could not determine GitHub noreply email for public remote.")
+        print("   Set git user.email to a noreply address or set KD_SKIP_EMAIL_PRIVACY=1 to override.")
+        return 1
+
+    result = subprocess.run(["git", "config", "--local", "user.email", candidate], capture_output=True)
+    if result.returncode != 0:
+        print("❌ PRE-COMMIT: Failed to set local git user.email to noreply.")
+        print("   Set git user.email manually or set KD_SKIP_EMAIL_PRIVACY=1 to override.")
+        return 1
+
+    print(f"🔒 PRE-COMMIT: Set local git user.email to GitHub noreply ({candidate}).")
+    return 0
+
+
+def _company_token_pattern() -> str:
+    codes = "|".join("".join(chars) for chars in COMPANY_CODE_GROUPS)
+    return rf"(?<![A-Za-z0-9_])({codes})(?![A-Za-z0-9_])"
+
+
+def run_sensitive_data_gate(repo_root, remote_scan=False):
+    """Run the sensitive-data scanner in blocking mode."""
+    if _env_true("KD_SKIP_SENSITIVE_SCAN"):
+        print("⚠️  PRE-COMMIT: Skipping sensitive data gate (KD_SKIP_SENSITIVE_SCAN=1).")
+        return 0
+
+    mode_label = "remote history" if remote_scan else "staged content"
+    print("=" * 70)
+    print(f"  PRE-COMMIT: Running sensitive data gate ({mode_label})...")
+    print("=" * 70)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "kinetic_devops.find_sensitive_data",
+        "--path",
+        ".",
+        "--no-generic-base64",
+        "--fail-on-findings",
+        "--custom-pattern",
+        _company_token_pattern(),
+    ]
+    if remote_scan:
+        cmd.extend(["--no-keyring", "--history"])
+    else:
+        cmd.append("--staged")
+
+    result = subprocess.run(cmd, cwd=str(repo_root), capture_output=False)
+    if result.returncode != 0:
+        print("❌ PRE-COMMIT: Sensitive data gate failed. Commit rejected.")
+        return 1
+    return 0
+
+# --- CHECK 1: TEST SUITE ---
+
+def run_tests(repo_root):
+    """Run all pre-commit checks."""
+    print("=" * 70)
+    print("  PRE-COMMIT: Running test suite...")
+    print("=" * 70)
+    
+    # Git exports GIT_DIR and friends to hooks. In a linked worktree GIT_DIR is
+    # absolute, so tests that run git inside their own temporary repositories
+    # would silently operate on this repository instead. The test suite locates
+    # repositories itself, so run it without them.
+    test_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR"}
+    }
+
+    # Run tests via the installed CLI entry point
+    result = subprocess.run(
+        [sys.executable, "-m", "kinetic_devops.cli.test_runner"],
+        cwd=str(repo_root),
+        capture_output=False,
+        env=test_env,
+    )
+    
+    if result.returncode == 0:
+        print("\n" + "=" * 70)
+        print("✅ PRE-COMMIT: All tests passed. Commit allowed.")
+        print("=" * 70)
+        return 0
+    else:
+        print("\n" + "=" * 70)
+        print("❌ PRE-COMMIT: Tests failed. Commit blocked.")
+        print("=" * 70)
+        return 1
+
+# --- CHECK 2 & 3: JSON CONTENT VALIDATION ---
+
+def is_stringified_json(content):
+    """Checks if a JSON file actually contains a string encoded JSON inside."""
+    try:
+        obj = json.loads(strip_comments(content))
+        if isinstance(obj, str):
+            # It's a single string. Try parsing it again.
+            # If it parses to a dict/list, it's stringified JSON (bad).
+            inner = json.loads(obj)
+            if isinstance(inner, (dict, list)):
+                return True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
+
+def check_content_sync(file_path):
+    """Ensures file.jsonc contains the object defined in file.content.jsonc"""
+    path_obj = Path(file_path)
+    # Check for both .json and .jsonc content files
+    possible_content = [
+        path_obj.with_suffix('').with_suffix('.content.jsonc'),
+        path_obj.with_suffix('').with_suffix('.content.json')
+    ]
+    
+    content_file = next((p for p in possible_content if p.exists()), None)
+    if not content_file:
+        return True # No content file to sync with
+
+    try:
+        with open(content_file, 'r', encoding='utf-8') as f:
+            target_obj = json.loads(strip_comments(f.read()))
+        
+        # Read staged content (what is about to be committed)
+        staged_raw = subprocess.check_output(['git', 'show', f':{file_path}']).decode('utf-8')
+        staged_obj = json.loads(strip_comments(staged_raw))
+
+        # Simple recursion to find if target_obj is inside staged_obj
+        def contains(container, target):
+            if container == target: return True
+            if isinstance(container, dict):
+                return any(contains(v, target) for v in container.values())
+            if isinstance(container, list):
+                return any(contains(i, target) for i in container)
+            return False
+
+        # In Kinetic, the content is often stringified inside the value
+        # So we also check values that look like strings
+        def contains_stringified(container, target):
+            if isinstance(container, str):
+                if not container.strip().startswith(('{', '[')): return False
+                try:
+                    parsed = json.loads(container)
+                    if parsed == target: return True
+                except: pass
+            
+            if isinstance(container, dict):
+                return any(contains_stringified(v, target) for v in container.values())
+            if isinstance(container, list):
+                return any(contains_stringified(i, target) for i in container)
+            return False
+
+        return contains(staged_obj, target_obj) or contains_stringified(staged_obj, target_obj)
+
+    except Exception:
+        return False # Fail safe
+
+# --- CHECK 4: INDEX SEQUENCER (AUTO-FIX) ---
+
+def validate_and_fix_indices(file_path):
+    """
+    Scans for lists where objects have an 'index' property.
+    Ensures they are sequential (0, 1, 2...).
+    Rewrites the file if needed.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # We can only safely auto-fix pure JSON. 
+        # For JSONC, we'd lose comments on write-back.
+        # We'll rely on our strip_comments to READ, but only WRITE back if standard JSON load works cleanly.
+        is_jsonc = '//' in content or '/*' in content
+        
+        data = json.loads(strip_comments(content))
+        modified = False
+
+        def recursive_fix(obj):
+            nonlocal modified
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    recursive_fix(v)
+            elif isinstance(obj, list):
+                # Identify if this is an indexed list
+                indexed_items = [x for x in obj if isinstance(x, dict) and 'index' in x and isinstance(x['index'], int)]
+                
+                # Only re-sequence if the list is primarily indexed items (>50% heuristic or just simple existence)
+                if len(indexed_items) > 1:
+                    # Check if sequence is correct
+                    current_indices = [x['index'] for x in indexed_items]
+                    expected = list(range(len(indexed_items)))
+                    
+                    if current_indices != expected:
+                        # Re-sequence
+                        for i, item in enumerate(indexed_items):
+                            if item['index'] != i:
+                                item['index'] = i
+                                modified = True
+                
+                for item in obj:
+                    recursive_fix(item)
+
+        recursive_fix(data)
+
+        if modified:
+            if is_jsonc:
+                print(f"⚠️  detected index mismatch in {file_path}, but skipped auto-fix because it contains comments (JSONC).")
+                return False
+            else:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                print(f"🔧 Auto-fixed sequence indices in {file_path}")
+                return False # Return False to block commit so user can stage the fix
+
+        return True
+
+    except Exception:
+        return True # Skip if parsing fails
+
+# --- MAIN ENTRY ---
+
+def main():
+    repo_root = get_repo_root()
+    os.chdir(repo_root)
+
+    if is_dry_run():
+        files = get_staged_files()
+        json_files = [f for f in files if f.endswith((".json", ".jsonc"))]
+        print("=" * 70)
+        print("PRE-COMMIT DRY RUN")
+        print("=" * 70)
+        print(f"Repository root: {repo_root}")
+        print("Checks that would run:")
+        print("0. Public GitHub email privacy guard (auto-set noreply by default, cached in keyring)")
+        print("1. Sensitive data gate via kinetic_devops.find_sensitive_data")
+        print("2. SDK test suite via kinetic_devops.cli.test_runner")
+        print("3. Stringified JSON validation on staged .json/.jsonc files")
+        print("4. .content sync validation for staged JSON artifacts")
+        print("5. Index sequencing validation for staged JSON artifacts")
+        print(f"Staged files: {len(files)} total, {len(json_files)} json/jsonc")
+        print("DRY RUN RESULT: PASS")
+        sys.exit(0)
+
+    if is_remote_scan_only():
+        if run_sensitive_data_gate(repo_root, remote_scan=True) != 0:
+            sys.exit(1)
+        print("PRE-COMMIT: Remote sensitive data gate passed.")
+        sys.exit(0)
+
+    # 0. Enforce public commit email privacy defaults.
+    if ensure_public_email_privacy() != 0:
+        print("❌ PRE-COMMIT: Email privacy check failed. Commit rejected.")
+        sys.exit(1)
+
+    # 1. Run sensitive data gate against staged content.
+    if run_sensitive_data_gate(repo_root, remote_scan=False) != 0:
+        sys.exit(1)
+
+    # 2. Run Tests
+    if run_tests(repo_root) != 0:
+        print("❌ PRE-COMMIT: Tests failed. Commit rejected.")
+        sys.exit(1)
+
+    files = get_staged_files()
+    json_files = [f for f in files if f.endswith(('.json', '.jsonc'))]
+    
+    errors = 0
+
+    for f in json_files:
+        # Skip the content files themselves from checking
+        if '.content.' in f: continue
+
+        if is_stringified_json(Path(f).read_text(encoding='utf-8')):
+            print(f"❌ REJECTED: {f} appears to contain stringified JSON.")
+            errors += 1
+        
+        if not check_content_sync(f):
+            print(f"❌ REJECTED: {f} is out of sync with its .content file.")
+            errors += 1
+            
+        if not validate_and_fix_indices(f):
+            print(f"❌ REJECTED: {f} had index errors (Auto-fix applied? check file).")
+            print(f"   Action: 'git add {f}' and commit again.")
+            errors += 1
+
+    if errors > 0:
+        sys.exit(1)
+    
+    print("PRE-COMMIT: All checks passed.")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()

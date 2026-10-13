@@ -1,0 +1,68 @@
+name: Post Publish Release Validation
+
+on:
+  workflow_run:
+    workflows: ["Publish Python package"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate-release:
+    name: Validate published release artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail fast if publish workflow failed
+        if: ${{ github.event.workflow_run.conclusion != 'success' }}
+        run: |
+          echo "Publish workflow conclusion: ${{ github.event.workflow_run.conclusion }}"
+          exit 1
+
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Validate package version appears on PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=$(python - <<'PY'
+          import pathlib
+
+          try:
+            import tomllib
+          except ModuleNotFoundError:
+            import tomli as tomllib
+
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          print(tomllib.loads(text)["project"]["version"])
+          PY
+          )
+
+          echo "Validating kinetic-devops ${version} on PyPI..."
+
+          found="false"
+          for _ in {1..18}; do
+            if curl -fsS "https://pypi.org/pypi/kinetic-devops/${version}/json" >/dev/null; then
+              found="true"
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ "$found" != "true" ]]; then
+            echo "Release validation failed: kinetic-devops ${version} not visible on PyPI yet."
+            exit 1
+          fi
+
+          echo "Release validation succeeded: kinetic-devops ${version} is visible on PyPI."
+
+      - name: Write workflow summary
+        if: ${{ success() }}
+        run: |
+          echo "## Release Validation Passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Publish run: ${{ github.event.workflow_run.html_url }}" >> "$GITHUB_STEP_SUMMARY"

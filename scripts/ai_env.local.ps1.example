@@ -1,0 +1,4 @@
+# Copy this file to scripts/ai_env.local.ps1 and edit the values for your machine.
+
+$env:KINETIC_AI_BASE_URL = '<your-local-ai-url>'
+$env:KINETIC_AI_TIMEOUT = '180'
