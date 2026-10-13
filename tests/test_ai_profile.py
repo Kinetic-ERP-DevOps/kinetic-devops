@@ -92,6 +92,13 @@ class TestAnalysisUsesProfile(AIProfileTestBase):
         self.assertEqual(analysis._resolve_ai_base_url(""), "http://ai-host:3000")
         self.assertEqual(analysis._resolve_ai_base_url("http://explicit:1234"), "http://explicit:1234")
 
+    def test_stored_profile_beats_env_var_which_is_only_a_fallback(self):
+        with mock.patch.dict(os.environ, {"KINETIC_AI_BASE_URL": "http://from-env:8080"}):
+            self.assertEqual(analysis._resolve_ai_base_url(""), "http://from-env:8080")
+            auth.set_ai_profile("http://ai-host:3000", "openwebui")
+            self.assertEqual(analysis._resolve_ai_base_url(""), "http://ai-host:3000")
+            self.assertEqual(analysis._resolve_ai_base_url("http://explicit:1234"), "http://explicit:1234")
+
     def test_missing_url_error_points_to_ai_set(self):
         with self.assertRaises(ValueError) as ctx:
             analysis._resolve_ai_base_url("")

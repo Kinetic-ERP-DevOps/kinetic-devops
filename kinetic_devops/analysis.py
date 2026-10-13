@@ -78,21 +78,23 @@ def _default_ignore_patterns() -> list[str]:
 
 
 def _resolve_ai_base_url(raw_value: str | None) -> str:
+    """--ai-base-url, else the profile stored with 'auth ai-set' (keyring), else
+    the KINETIC_AI_BASE_URL fallback for users/runners without a stored profile."""
     value = str(raw_value or "").strip()
     if value:
         return value
-
-    env_value = str(os.getenv("KINETIC_AI_BASE_URL", "")).strip()
-    if env_value:
-        return env_value
 
     stored = str(_stored_ai_profile().get("base_url") or "").strip()
     if stored:
         return stored
 
+    env_value = str(os.getenv("KINETIC_AI_BASE_URL", "")).strip()
+    if env_value:
+        return env_value
+
     raise ValueError(
         "AI base URL is required. Store one with 'uv run python -m kinetic_devops.auth ai-set', "
-        "or pass --ai-base-url."
+        "pass --ai-base-url, or set KINETIC_AI_BASE_URL."
     )
 
 
@@ -1123,7 +1125,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="analysis_command", required=True, metavar="<command>")
 
-    ai_url_help = "OpenAI-compatible AI server base URL (default: KINETIC_AI_BASE_URL; one of them is required)"
+    ai_url_help = (
+        "AI server base URL (default: the profile stored with 'auth ai-set', else KINETIC_AI_BASE_URL; "
+        "one of them is required)"
+    )
 
     diff = subparsers.add_parser(
         "diff-review",
