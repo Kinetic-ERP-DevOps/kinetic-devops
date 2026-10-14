@@ -77,16 +77,96 @@ def _default_ignore_patterns() -> list[str]:
     return ["Epicor-Rest-PostmanSamples", "OneDrive - Epicor Users Group"]
 
 
+# Named profile chosen with --ai-profile for this run (None = the stored default).
+_ACTIVE_AI_PROFILE: str | None = None
+
+
+def set_active_ai_profile(name: str | None) -> None:
+    """Select which stored AI profile this process uses (None = the default)."""
+    global _ACTIVE_AI_PROFILE
+    previous = _ACTIVE_AI_PROFILE
+    _ACTIVE_AI_PROFILE = (name or "").strip() or None
+    if _ACTIVE_AI_PROFILE and not _stored_ai_profile():
+        missing, _ACTIVE_AI_PROFILE = _ACTIVE_AI_PROFILE, previous
+        raise ValueError(
+            f"No AI profile named '{missing}'. "
+            "List them with 'uv run python -m kinetic_devops.auth ai-show'."
+        )
+
+
 def _resolve_ai_base_url(raw_value: str | None) -> str:
+    """--ai-base-url, else the selected (or default) profile stored with
+    'auth ai-set' (keyring), else the KINETIC_AI_BASE_URL fallback for
+    users/runners without a stored profile."""
     value = str(raw_value or "").strip()
     if value:
         return value
+
+    stored = str(_stored_ai_profile().get("base_url") or "").strip()
+    if stored:
+        return stored
 
     env_value = str(os.getenv("KINETIC_AI_BASE_URL", "")).strip()
     if env_value:
         return env_value
 
-    raise ValueError("AI base URL is required. Set KINETIC_AI_BASE_URL or pass --ai-base-url.")
+    raise ValueError(
+        "AI base URL is required. Store one with 'uv run python -m kinetic_devops.auth ai-set', "
+        "pass --ai-base-url, or set KINETIC_AI_BASE_URL."
+    )
+
+
+def _stored_ai_profile() -> dict[str, Any]:
+    """The selected (or default) AI profile stored by 'auth ai-set', or {}."""
+    try:
+        from kinetic_devops.auth import get_ai_profile
+
+        return get_ai_profile(_ACTIVE_AI_PROFILE)
+    except Exception:
+        return {}
+
+
+def _profile_for_url(base_url: str) -> dict[str, Any]:
+    """The selected profile when it is for base_url; otherwise any stored
+    profile for that URL (so an explicit --ai-base-url still gets its style)."""
+    url = normalize_base_url(base_url)
+    selected = _stored_ai_profile()
+    if normalize_base_url(str(selected.get("base_url") or "")) == url:
+        return selected
+    try:
+        from kinetic_devops.auth import list_ai_profiles
+
+        for profile in list_ai_profiles()[1].values():
+            if normalize_base_url(str(profile.get("base_url") or "")) == url:
+                return profile
+    except Exception:
+        pass
+    return {}
+
+
+def _ai_client_settings(base_url: str) -> tuple[str, dict[str, str]]:
+    """(api_style, extra headers) for base_url: the style of the matching stored
+    profile (default openai); the API key is looked up by URL."""
+    url = normalize_base_url(base_url)
+    style = _profile_for_url(url).get("api_style")
+    headers: dict[str, str] = {}
+    try:
+        from kinetic_devops.auth import get_ai_api_key
+
+        key = get_ai_api_key(url)
+    except Exception:
+        key = ""
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return (style or "openai"), headers
+
+
+def select_model(models: list[str], base_url: str) -> str:
+    """The matching profile's default model when the server offers it, else the first listed."""
+    preferred = str(_profile_for_url(base_url).get("model") or "").strip()
+    if preferred and preferred in models:
+        return preferred
+    return models[0]
 
 
 def run_git(repo: Path, args: list[str], timeout: int = 60) -> CmdResult:
@@ -113,8 +193,9 @@ def normalize_base_url(base_url: str) -> str:
 
 
 def fetch_models(base_url: str, timeout: int) -> list[str]:
-    url = f"{normalize_base_url(base_url)}/v1/models"
-    req = request.Request(url=url, method="GET")
+    style, headers = _ai_client_settings(base_url)
+    path = "/api/models" if style == "openwebui" else "/v1/models"
+    req = request.Request(url=f"{normalize_base_url(base_url)}{path}", headers=headers, method="GET")
     with request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     data = payload.get("data") or []
@@ -122,18 +203,30 @@ def fetch_models(base_url: str, timeout: int) -> list[str]:
 
 
 def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: int = 360) -> dict[str, Any]:
-    url = f"{normalize_base_url(base_url)}/v1/completions"
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "temperature": 0.15,
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
+    style, headers = _ai_client_settings(base_url)
+    if style == "openwebui":
+        # Open WebUI exposes the chat API only; the prompt becomes a single user message.
+        url = f"{normalize_base_url(base_url)}/api/chat/completions"
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.15,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+    else:
+        url = f"{normalize_base_url(base_url)}/v1/completions"
+        body = {
+            "model": model,
+            "prompt": prompt,
+            "temperature": 0.15,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
     req = request.Request(
         url=url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
     with request.urlopen(req, timeout=timeout) as resp:
@@ -148,6 +241,9 @@ def extract_text(ai_response: dict[str, Any]) -> str:
             text = first.get("text")
             if isinstance(text, str):
                 return text.strip()
+            message = first.get("message")  # chat-completions response shape
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"].strip()
     return ""
 
 
@@ -591,7 +687,7 @@ def _run_diff_review(args: argparse.Namespace) -> int:
     models = fetch_models(ai_base_url, args.ai_timeout)
     if not models:
         raise RuntimeError("No local AI models available")
-    model = models[0]
+    model = select_model(models, ai_base_url)
 
     items = [build_snapshot_item(repo)]
     items.extend(build_commit_items(repo, base_ref=base_ref, max_commits=args.max_commits))
@@ -1063,14 +1159,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="analysis_command", required=True, metavar="<command>")
 
-    ai_url_help = "OpenAI-compatible AI server base URL (default: KINETIC_AI_BASE_URL; one of them is required)"
+    ai_profile_help = "Stored AI profile to use (see 'auth ai-show'; default: the default profile)"
+    ai_url_help = (
+        "AI server base URL (default: the profile stored with 'auth ai-set', else KINETIC_AI_BASE_URL; "
+        "one of them is required)"
+    )
 
     diff = subparsers.add_parser(
         "diff-review",
         help="Incremental snapshot plus commit local AI review",
         description=(
             "Reviews the repo's uncommitted working-tree diff plus each commit in <base-ref>..HEAD with an "
-            "AI model (the first model the server lists). The diffs and patches are SENT TO THE AI SERVER. "
+            "AI model (the selected profile's default model when the server offers it, else the first "
+            "model the server lists). The diffs and patches are SENT TO THE AI SERVER. "
             "Writes one JSON + Markdown file per item, plus run_report.json and run_summary.md, into "
             "--out-dir."
         ),
@@ -1085,6 +1186,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of commits to review (default: KINETIC_ANALYSIS_MAX_COMMITS or 20)",
     )
     diff.add_argument("--ai-base-url", metavar="URL", default="", help=ai_url_help)
+    diff.add_argument("--ai-profile", metavar="NAME", default="", help=ai_profile_help)
     diff.add_argument(
         "--ai-timeout", metavar="SECONDS", type=int, default=int(_env("KINETIC_AI_TIMEOUT", "180")),
         help="Per-request AI timeout in seconds (default: KINETIC_AI_TIMEOUT or 180)",
@@ -1168,6 +1270,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum commits per repo (default: KINETIC_ANALYSIS_MAX_COMMITS or 10)",
     )
     legacy.add_argument("--ai-base-url", metavar="URL", default="", help=ai_url_help)
+    legacy.add_argument("--ai-profile", metavar="NAME", default="", help=ai_profile_help)
     legacy.add_argument(
         "--ai-timeout", metavar="SECONDS", type=int, default=int(_env("KINETIC_AI_TIMEOUT", "45")),
         help="Per-request AI timeout in seconds (default: KINETIC_AI_TIMEOUT or 45)",
@@ -1215,6 +1318,7 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        set_active_ai_profile(getattr(args, "ai_profile", "") or None)
         if args.analysis_command == "diff-review":
             raise SystemExit(_run_diff_review(args))
         if args.analysis_command == "no-commit-review":

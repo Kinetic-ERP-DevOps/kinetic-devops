@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0a7] - 2026-10-13
+
 ### Added
+- EFx `plan` / `deploy`: build the package an environment repository declares (per-environment
+  deployment record + source ref), show how it differs from the live library and any drift, and deploy
+  it with `ImportLibrary` (OverwriteMode=1) -- idempotent, snapshot before, verify after, record the
+  result. Rollback is a deploy of an earlier ref.
+- `test-pilot --allow-env`: run a saved function in an explicitly named environment; picks the staging
+  or published endpoint from the library's state.
+- `auth rename OLD NEW [--dry-run]`: rename a saved environment without re-entering credentials
+  (config, cached sessions and the last-session pointer move; encrypted vaults stay encrypted).
+- AI server profiles in the OS keyring: `auth ai-set --name NAME` / `ai-show` / `ai-default` /
+  `ai-clear` store named profiles (URL, API style `openwebui` | `openai`, default model) with the API key
+  kept once per server URL, never on the command line. `analysis --ai-profile NAME` selects one;
+  Open WebUI's `/api/models` + `/api/chat/completions` and bearer keys are supported.
+- Sensitive-data scanner: configured environment nicknames are reported as non-failing notices.
+- Every CLI explains its subcommands and arguments in `-h`; commands that write to Epicor, delete data
+  or print secrets are labelled.
+- Test/hook opt-ins for restricted workstations: `KINETIC_HOOK_PYTHON` (run hook checks with an existing
+  interpreter instead of building a new environment), `KINETIC_SKIP_CONSOLE_SCRIPT_TESTS`,
+  `KINETIC_TEST_TIMEOUT_SCALE`, `KINETIC_TEST_TMPDIR`.
 - `kinetic_devops/efx_library.py`: EFx Function Library management (`Ice.Lib.EfxLibraryDesignerSvc`) --
   `list`/`export`/`export-all`/`import` CLI subcommands, verified live against a real environment.
 - Per-function C# source extraction and push-back: `pull-source` extracts each function's embedded
@@ -23,11 +43,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   convention.
 
 ### Changed
+- `--help` is much faster: `keyring` and `requests` load on first use; dependencies are pre-compiled at
+  install (`[tool.uv] compile-bytecode`).
+- `repomaker` uses argparse for its top-level command and help (behavior unchanged).
+- `analysis`: the AI server comes from `--ai-base-url`, then the stored profile, then the
+  `KINETIC_AI_BASE_URL` fallback.
+- `trim_trace_paths`: site-specific redaction terms (company IDs, plant patterns, names, employee IDs,
+  usernames) load from a local file (`$KINETIC_TRACE_REDACTIONS` or
+  `~/.kinetic-devops/trace_redactions.json`) instead of the code.
+- Repository-management scripts require `-Repo` instead of defaulting to an account.
+- Dependency updates: `requests` 2.34.2, `urllib3` 2.8.0.
 - Dependency updates: integrated Dependabot upgrade for `urllib3` from `2.6.3` to `2.7.0` via `uv.lock`.
 - Project runtime requirement now targets Python `3.10+` (from `3.8+`) in package metadata and README.
 - `Documents/ARCHITECTURE.md`: corrected its service-module example, which documented a
   `boreader_service.py`/`BOReaderService(base_url, headers)` pattern that no longer matches reality --
   every current service module subclasses `KineticBaseClient` directly.
+
+### Fixed
+- Pre-commit hook: the hook installer resolves the real hooks directory (works from linked worktrees);
+  the test suite runs without git's repository environment variables, which in linked worktrees made
+  tests operate on the real repository.
+- `github.com` host checks require a dot boundary in the host suffix.
+- `KineticCore`: a clear error when no keyring backend is available.
+
+### Security
+- This release starts a new public history: organization-specific references were removed from the
+  code, documentation and tests. Earlier releases (0.1.0a1-0.1.0a6) are superseded.
 
 ## [0.1.0a6] - 2026-09-09
 
