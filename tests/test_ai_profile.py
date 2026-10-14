@@ -71,6 +71,23 @@ class TestProfileStorage(AIProfileTestBase):
         with self.assertRaises(ValueError):
             auth.set_ai_profile("http://ai-host:3000", "bogus")
 
+    def test_rejects_urls_with_credentials_query_fragment_or_no_host(self):
+        for bad in (
+            "https://user:pass@ai-host:3000",
+            "https://user@ai-host",
+            "https://ai-host:3000?token=x",
+            "https://ai-host:3000/#frag",
+            "https://ai-host:3000/?",
+            "https://",
+            "http://ai-host:notaport",
+            "ftp://ai-host",
+        ):
+            with self.subTest(url=bad), self.assertRaises(ValueError):
+                auth.set_ai_profile(bad, "openwebui")
+        self.assertEqual(auth.list_ai_profiles(), ("", {}))
+        profile = auth.set_ai_profile("https://ai-host:3000/api/", "openwebui")
+        self.assertEqual(profile["base_url"], "https://ai-host:3000/api")
+
     def test_clear_removes_profile_and_key(self):
         auth.set_ai_profile("http://ai-host:3000", "openwebui", "", api_key="sk-1")
         self.assertTrue(auth.clear_ai_profile())
@@ -199,6 +216,8 @@ class TestNamedProfiles(AIProfileTestBase):
         self.assertEqual(analysis._ai_client_settings("http://other:1234")[0], "openai")
         with self.assertRaises(ValueError):
             analysis.set_active_ai_profile("missing")
+        # A failed selection keeps the previous valid one.
+        self.assertEqual(analysis._resolve_ai_base_url(""), "http://other:1234")
 
     def test_explicit_url_gets_style_from_matching_profile(self):
         auth.set_ai_profile(self.URL, "openwebui", name="deep")

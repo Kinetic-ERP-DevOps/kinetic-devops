@@ -84,10 +84,12 @@ _ACTIVE_AI_PROFILE: str | None = None
 def set_active_ai_profile(name: str | None) -> None:
     """Select which stored AI profile this process uses (None = the default)."""
     global _ACTIVE_AI_PROFILE
+    previous = _ACTIVE_AI_PROFILE
     _ACTIVE_AI_PROFILE = (name or "").strip() or None
     if _ACTIVE_AI_PROFILE and not _stored_ai_profile():
+        missing, _ACTIVE_AI_PROFILE = _ACTIVE_AI_PROFILE, previous
         raise ValueError(
-            f"No AI profile named '{_ACTIVE_AI_PROFILE}'. "
+            f"No AI profile named '{missing}'. "
             "List them with 'uv run python -m kinetic_devops.auth ai-show'."
         )
 
@@ -1168,7 +1170,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Incremental snapshot plus commit local AI review",
         description=(
             "Reviews the repo's uncommitted working-tree diff plus each commit in <base-ref>..HEAD with an "
-            "AI model (the first model the server lists). The diffs and patches are SENT TO THE AI SERVER. "
+            "AI model (the selected profile's default model when the server offers it, else the first "
+            "model the server lists). The diffs and patches are SENT TO THE AI SERVER. "
             "Writes one JSON + Markdown file per item, plus run_report.json and run_summary.md, into "
             "--out-dir."
         ),
