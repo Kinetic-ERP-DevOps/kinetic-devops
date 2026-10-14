@@ -76,6 +76,26 @@ def _normalize_ai_url(base_url: str) -> str:
     return str(base_url or "").strip().rstrip("/")
 
 
+def _validate_ai_url(url: str) -> str:
+    """An absolute http(s) URL with a host and nothing that belongs elsewhere:
+    credentials embedded as user:password@ would land in the non-secret profile
+    record (and ai-show output), so they, queries and fragments are rejected."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        parts.port  # raises ValueError for a malformed port
+    except ValueError as exc:
+        raise ValueError(f"AI base URL is malformed: {exc}") from None
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ValueError("AI base URL must be an absolute http:// or https:// URL with a host")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("AI base URL must not contain credentials; store the key with ai-set instead")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise ValueError("AI base URL must not contain a query string or fragment")
+    return url
+
+
 def _read_ai_store() -> Dict[str, Any]:
     raw = keyring.get_password(SERVICE_AI, "profiles")
     try:
@@ -137,8 +157,7 @@ def set_ai_profile(
     name = str(name or "").strip()
     if not name or any(ch.isspace() for ch in name):
         raise ValueError("Profile name must be non-empty and contain no whitespace.")
-    if not url.lower().startswith(("http://", "https://")):
-        raise ValueError("AI base URL must start with http:// or https://")
+    url = _validate_ai_url(url)
     if api_style not in AI_API_STYLES:
         raise ValueError(f"api_style must be one of {AI_API_STYLES}")
     profile = {"base_url": url, "api_style": api_style, "model": str(model or "").strip()}
