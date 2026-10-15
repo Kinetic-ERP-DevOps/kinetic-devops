@@ -1,8 +1,8 @@
 # Scripts & Developer Tooling
 
-## Environment Setup (PYTHONPATH & Kinetic Config)
+## Environment Setup (Kinetic Config)
 
-Before running helper scripts, initialize the environment to set `PYTHONPATH` and Kinetic configuration variables.
+Run `uv sync` once: it installs `kinetic_devops` (from `src/`) into `.venv`, so helper scripts import it without any `PYTHONPATH`. Then initialize the Kinetic configuration variables:
 
 ### Windows (Command Prompt / batch):
 
@@ -10,10 +10,9 @@ Before running helper scripts, initialize the environment to set `PYTHONPATH` an
 scripts\env_init.bat [env-name]
 ```
 
-This activates a Python venv (if present) and sets:
+This activates the uv venv (`.venv`, if present) and sets:
 - `KIN_COMPANY`, `KIN_ENV_NAME` (script context vars)
 - `KINETIC_TAXCONFIG_DB` (SQLite config location)
-- `PYTHONPATH` (points to repo root so scripts can import `kinetic_devops`)
 
 The script generates and executes a randomized temp `.bat` file under your OS temp directory, then securely erases it.
 
@@ -244,8 +243,8 @@ python -m kinetic_devops meta --env <ENV> --user <USER> layers dump5.json dump6.
 python -m kinetic_devops meta --env <ENV> --user <USER> layers dump5.json dump6.json --dry-run
 
 # Trim trace files and generate a delta sidecar for review
-python kinetic_devops/trim_trace_paths.py trace.json --drop "*.request.headers.Authorization" --delta-mode summary --delta-format jsonc
-python kinetic_devops/trim_trace_paths.py trace.json --drop "*.request.headers.Authorization" --delta-mode annotated --delta-format both --no-delta-redact-values
+uv run python -m kinetic_devops.trim_trace_paths trace.json --drop "*.request.headers.Authorization" --delta-mode summary --delta-format jsonc
+uv run python -m kinetic_devops.trim_trace_paths trace.json --drop "*.request.headers.Authorization" --delta-mode annotated --delta-format both --no-delta-redact-values
 
 # Migrate API key access scope from one instance to another (direct remap)
 python -m kinetic_devops scope --source-env SourceEnv --target-env TargetEnv --from-scope LEGACY_SCOPE --to-scope NEW_SCOPE

@@ -114,10 +114,10 @@ table of test counts since it goes stale the moment a test is added (this one ha
 Three files enforce an **exact-match** registry between declared modules and what's actually on disk,
 so nothing new ships without at least a smoke test:
 
-- `tests/test_module_coverage_matrix.py` -- `PACKAGE_MODULE_MATRIX` (every `kinetic_devops/*.py`) and
+- `tests/test_module_coverage_matrix.py` -- `PACKAGE_MODULE_MATRIX` (every `src/kinetic_devops/*.py`) and
   `SCRIPT_MODULE_MATRIX` (every `scripts/*.py`)
 - `tests/cli_matrix.py` / `test_cli_matrix_consistency.py` -- `CLI_MODULES` (every directly
-  CLI-runnable module) and the router-tool mapping in `kinetic_devops/__main__.py`
+  CLI-runnable module) and the router-tool mapping in `src/kinetic_devops/__main__.py`
 
 If you add or remove a module, script, or CLI entrypoint, update the matching registry -- see
 [CONTRIBUTING.md](../CONTRIBUTING.md) for the full table of what maps to what.

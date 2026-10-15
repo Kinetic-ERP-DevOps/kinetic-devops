@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The package now lives in `src/kinetic_devops/` (src layout; moved with `git mv`, so `git log --follow`
+  keeps each file's history). Packaging finds it via `where = ["src"]`.
+- No more `sys.path` / `PYTHONPATH` tweaks in scripts, tests or `env_init`: the package is imported from
+  the environment `uv sync` installs, so run things with `uv run`. The `env_init` wrappers default to
+  uv's `.venv`; a worktree hook run with `KINETIC_HOOK_PYTHON` puts that worktree's `src/` first.
+- CI (GitHub and Forgejo) installs with `uv sync --locked` and runs everything through `uv run`.
+- This completes the src-layout migration; its roadmap and tracker documents are removed.
+
+### Added
+- CI job "Built Wheel Smoke Test": builds the sdist and wheel, checks the wheel contains only
+  `kinetic_devops/`, installs it into a clean environment and, from outside the checkout, imports every
+  module and starts each console script and module CLI.
+
+### Fixed
+- `auth ai-set` accepts only absolute http(s) AI base URLs with a host; embedded credentials, query
+  strings and fragments are rejected. A failed `--ai-profile` selection keeps the previous profile.
+
 ## [0.1.0a7] - 2026-10-13
 
 ### Added

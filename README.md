@@ -260,7 +260,7 @@ See [examples/complete_flow.py](examples/complete_flow.py) for a complete auth �
 
 ```
 kinetic-devops/           # Core library (published)
-├── kinetic_devops/       # Main package
+├── src/kinetic_devops/   # Main package (src layout)
 ├── scripts/              # Helper scripts
 ├── tests/                # Test suite
 └── projects/             # (Optional) User project submodules

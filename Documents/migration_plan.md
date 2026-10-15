@@ -169,9 +169,7 @@ README.md
 
 Documents/
 ├── ARCHITECTURE.md
-├── migration_plan.md
-├── migration_tracker.md
-└── ROADMAP.md
+└── migration_plan.md
 
 scripts/
 └── README.md
