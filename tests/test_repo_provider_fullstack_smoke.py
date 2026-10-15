@@ -13,6 +13,15 @@ class TestRepoProviderFullstackSmoke(unittest.TestCase):
     def setUpClass(cls):
         cls.mod = importlib.import_module("kinetic_devops.repo_maker")
 
+    def setUp(self):
+        # Never reach the real OS keyring: an unpatched token lookup read the
+        # developer's stored token, and on headless Linux (WSL) it blocked on a
+        # "set a password for the default keyring" prompt until someone answered.
+        # Default: nothing stored; tests of the keyring path patch it themselves.
+        patcher = patch("keyring.get_password", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_github_payload(self):
         payload = self.mod.build_branch_protection_payload("github", "main", "Python Test Gate", 2)
         self.assertTrue(payload["required_status_checks"]["strict"])
