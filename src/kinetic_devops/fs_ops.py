@@ -30,7 +30,9 @@ def find_repo_root(path: str) -> Optional[str]:
     code, out = _run_git(["rev-parse", "--show-toplevel"], cwd)
     if code != 0 or not out:
         return None
-    return os.path.abspath(out)
+    # realpath, like describe_overwrite_risk: comparable with paths that
+    # were given in another form (8.3 short names, other case, symlinks).
+    return os.path.realpath(out)
 
 
 def _parse_check_ignore_verbose_line(line: str) -> Dict[str, str]:
@@ -160,7 +162,11 @@ def is_write_permitted(
 
 
 def describe_overwrite_risk(path: str) -> Dict[str, object]:
-    abs_path = os.path.abspath(path)
+    # realpath, not abspath: on Windows a path may use 8.3 short names (e.g. a
+    # TEMP folder under C:\Users\RUNNER~1) while git reports the repository
+    # root in long form; relpath between the two would wrongly put the file
+    # outside the repository.
+    abs_path = os.path.realpath(path)
     exists = os.path.exists(abs_path)
     repo_root = find_repo_root(abs_path)
     info: Dict[str, object] = {
