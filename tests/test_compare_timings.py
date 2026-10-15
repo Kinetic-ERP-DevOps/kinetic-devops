@@ -55,6 +55,16 @@ class TestCompareTimings(unittest.TestCase):
         self.assertIn("3. Failures in only some environments", report)
         self.assertIn("AssertionError", report)
 
+    def test_same_label_from_different_commits_is_not_merged(self):
+        _write_run(self.dir, "native-old", "native", {"a": ("failed", 1.0, "boom")}, commit="aaaaaaa1")
+        _write_run(self.dir, "native-new", "native", {"a": ("passed", 2.0)}, commit="bbbbbbb2")
+        runs = compare_timings.collect([str(self.dir)])
+        self.assertEqual(sorted(r.label for r in runs), ["native [aaaaaaa hw hw1]", "native [bbbbbbb hw hw1]"])
+        self.assertTrue(all(r.repeats == 1 for r in runs))
+        self.assertNotIn("flaky", {r.tests["tests.test_mod.TestX.a"][0] for r in runs})
+        report = compare_timings.report(runs, None, 5)
+        self.assertIn("runs come from different commits", report)
+
     def test_busy_start_is_flagged(self):
         _write_run(self.dir, "quiet", "quiet", {"a": ("passed", 1.0)}, cpu_busy_start=5.0)
         _write_run(self.dir, "busy", "busy", {"a": ("passed", 1.0)}, cpu_busy_start=80.0)

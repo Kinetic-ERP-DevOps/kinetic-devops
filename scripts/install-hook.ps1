@@ -93,13 +93,17 @@ esac
 
 export UV_LINK_MODE=copy
 export PYTHONUTF8=1
-if [ -n "$KINETIC_HOOK_PYTHON" ]; then
-    PY="$KINETIC_HOOK_PYTHON"
-elif command -v uv >/dev/null 2>&1; then
-    PY="uv run python"
-else
-    PY="python"
-fi
+# The explicit interpreter is quoted on its own (its path may contain spaces);
+# `uv run python` is a multi-word fallback, so they can't share one variable.
+run_python() {
+    if [ -n "$KINETIC_HOOK_PYTHON" ]; then
+        "$KINETIC_HOOK_PYTHON" "$@"
+    elif command -v uv >/dev/null 2>&1; then
+        uv run python "$@"
+    else
+        python "$@"
+    fi
+}
 
 ZERO=0000000000000000000000000000000000000000
 TESTED=""
@@ -112,7 +116,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
     echo "pre-push: Windows Sandbox test of $local_ref ($local_sha)..."
-    $PY scripts/sandbox_test.py --commit "$local_sha" </dev/null
+    run_python scripts/sandbox_test.py --commit "$local_sha" </dev/null
     status=$?
     if [ $status -eq 2 ]; then
         echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2

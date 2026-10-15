@@ -10,6 +10,13 @@ $ErrorActionPreference = "Continue"
 $repo = (Get-Location).Path
 $failures = New-Object System.Collections.Generic.List[string]
 
+# The env_init checks construct the SDK's config manager in child processes;
+# keep them away from the real OS keyring (saved environments, salts, an
+# encrypted vault) like the test suite does. Restored before exiting, since
+# this script may run in the caller's PowerShell process.
+$previousKeyringBackend = $env:PYTHON_KEYRING_BACKEND
+$env:PYTHON_KEYRING_BACKEND = "keyring.backends.null.Keyring"
+
 function Check([string]$name, [bool]$ok, [string]$detail = "") {
     if ($ok) {
         Write-Host "[PASS] $name"
@@ -78,6 +85,8 @@ Check "install-hook.ps1 runs" ($r.Code -eq 0) $r.Text
 $hook = Join-Path (git rev-parse --path-format=absolute --git-path hooks) "pre-commit"
 $hookText = if (Test-Path $hook) { Get-Content -Raw $hook } else { "" }
 Check "installed hook uses src/ for KINETIC_HOOK_PYTHON" ($hookText -match [regex]::Escape('PYTHONPATH="$REPO_ROOT/src')) $hook
+
+$env:PYTHON_KEYRING_BACKEND = $previousKeyringBackend
 
 Write-Host ""
 if ($failures.Count -gt 0) {

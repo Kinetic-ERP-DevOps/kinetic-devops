@@ -239,12 +239,15 @@ def main(argv: list[str] | None = None) -> int:
         # The native run always tests the working tree, so it matches the other
         # environments only for --working-tree, or a clean tree at the commit.
         head = _git("rev-parse", "HEAD", cwd=repo_root)
-        dirty = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repo_root).returncode != 0
+        # Untracked, non-ignored files count: a new tests/test_*.py would run
+        # here but be missing from the commit tested elsewhere.
+        dirty = bool(_git("status", "--porcelain", "--untracked-files=normal", cwd=repo_root))
         if args.working_tree or (sha == head and not dirty):
             runners["native"] = lambda xml: run_native(repo_root, xml, sha, args.native)
         else:
             status["native"] = ("skipped: this machine runs the working tree, which isn't the commit "
-                                "tested elsewhere (use --working-tree, or a clean tree at that commit)")
+                                "tested elsewhere -- it has changes or untracked files (use "
+                                "--working-tree, or a clean tree at that commit)")
     if "sandbox" in envs:
         runners["sandbox"] = lambda xml: run_sandbox(xml, sha)
     if "wsl" in envs:
@@ -265,7 +268,12 @@ def main(argv: list[str] | None = None) -> int:
     for n in range(1, args.repeat + 1):
         for env, runner in runners.items():
             print(f"run_timings: {LABELS[env]} (run {n}/{args.repeat}) ...")
-            result = runner(record(env, n))
+            xml = record(env, n)
+            # Never let a report from an earlier invocation stand in for this
+            # run: if setup fails before pytest writes, the run must show as failed.
+            for stale in (xml, xml.with_suffix(".json"), xml.with_suffix(".bundle")):
+                stale.unlink(missing_ok=True)
+            result = runner(xml)
             if result != "ok" or env not in status:
                 status[env] = result
 

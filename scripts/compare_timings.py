@@ -84,12 +84,38 @@ def collect(paths: list[str]) -> list[Run]:
     return combine([load_run(f) for f in files])
 
 
+def _context(run: Run) -> tuple:
+    """What must match for two records to count as repeats of one run."""
+    meta = run.meta
+    return (run.label, meta.get("commit", ""), (meta.get("hardware") or {}).get("id", ""),
+            meta.get("python", ""), tuple(sorted(meta.get("extras", []))))
+
+
 def combine(runs: list[Run]) -> list[Run]:
-    groups: dict[str, list[Run]] = {}
+    """Merge repeats -- records with the same label AND the same commit,
+    hardware, Python and extra checks -- into one Run with median times.
+    Records that share a label but differ in context stay separate, with the
+    differing part added to the label so they can be told apart."""
+    groups: dict[tuple, list[Run]] = {}
     for run in runs:
-        groups.setdefault(run.label, []).append(run)
+        groups.setdefault(_context(run), []).append(run)
+    label_counts: dict[str, int] = {}
+    for key in groups:
+        label_counts[key[0]] = label_counts.get(key[0], 0) + 1
+    used: set[str] = set()
+    for key, group in groups.items():
+        if label_counts[key[0]] > 1:  # same label, different context
+            _, commit, hw, python, _ = key
+            suffix = " ".join(filter(None, [commit[:7], f"hw {hw}" if hw else "", f"py {python}" if python else ""]))
+            name, n = f"{key[0]} [{suffix}]", 2
+            while name in used:  # e.g. differing only in extra checks
+                name, n = f"{key[0]} [{suffix} #{n}]", n + 1
+            used.add(name)
+            for run in group:
+                run.label = name
     combined = []
-    for label, group in groups.items():
+    for key, group in groups.items():
+        label = group[0].label
         if len(group) == 1:
             combined.append(group[0])
             continue
