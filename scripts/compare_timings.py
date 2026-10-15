@@ -26,10 +26,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import statistics
 import os
 import platform
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -43,6 +45,8 @@ class Run:
     # test id -> (status, seconds, message); status: passed|skipped|failed|error
     tests: dict = field(default_factory=dict)
     suite_seconds: float = 0.0
+    repeats: int = 1
+    suite_range: tuple | None = None  # (min, max) suite seconds when repeated
 
     def count(self, status: str) -> int:
         return sum(1 for s, _, _ in self.tests.values() if s == status)
@@ -71,11 +75,45 @@ def load_run(xml_path: Path) -> Run:
 
 
 def collect(paths: list[str]) -> list[Run]:
+    """Load runs; repeated runs of one environment (same label) become one
+    Run with median times."""
     files: list[Path] = []
     for raw in paths:
         path = Path(raw)
         files.extend(sorted(path.glob("*.xml")) if path.is_dir() else [path])
-    return [load_run(f) for f in files]
+    return combine([load_run(f) for f in files])
+
+
+def combine(runs: list[Run]) -> list[Run]:
+    groups: dict[str, list[Run]] = {}
+    for run in runs:
+        groups.setdefault(run.label, []).append(run)
+    combined = []
+    for label, group in groups.items():
+        if len(group) == 1:
+            combined.append(group[0])
+            continue
+        meta = dict(group[0].meta)
+        ends = [r.meta.get("end_to_end_seconds") for r in group if r.meta.get("end_to_end_seconds") is not None]
+        meta["end_to_end_seconds"] = statistics.median(ends) if ends else None
+        busy = [r.meta.get("cpu_busy_start") for r in group if r.meta.get("cpu_busy_start") is not None]
+        meta["cpu_busy_start"] = max(busy) if busy else None
+        merged = Run(label=label, meta=meta, repeats=len(group),
+                     suite_seconds=statistics.median(r.suite_seconds for r in group),
+                     suite_range=(min(r.suite_seconds for r in group), max(r.suite_seconds for r in group)))
+        for test in set().union(*(r.tests for r in group)):
+            results = [r.tests[test] for r in group if test in r.tests]
+            statuses = {status for status, _, _ in results}
+            if len(statuses) == 1:
+                status = results[0][0]
+            elif statuses & {"failed", "error"} and "passed" in statuses:
+                status = "flaky"  # passed in some repeats, failed in others
+            else:
+                status = max(statuses, key=lambda st: sum(1 for r in results if r[0] == st))
+            message = next((m for st, _, m in results if st != "passed" and m), "")
+            merged.tests[test] = (status, statistics.median(t for _, t, _ in results), message)
+        combined.append(merged)
+    return combined
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -110,15 +148,24 @@ def report(runs: list[Run], baseline: str | None, top: int) -> str:
             r.label + (" *" if r is base else ""),
             r.meta.get("python", "?"), r.meta.get("os", "?"), str(r.meta.get("cpus", "?")),
             (r.meta.get("hardware") or {}).get("id", "?") + (" (VM)" if r.meta.get("virtualized") else ""),
-            str(r.count("passed") + r.count("failed") + r.count("error")),
-            str(r.count("skipped")), str(r.count("failed") + r.count("error")),
-            _secs(r.suite_seconds) + _ratio(r.suite_seconds, base.suite_seconds),
+            str(r.repeats),
+            "-" if r.meta.get("cpu_busy_start") is None else f"{r.meta['cpu_busy_start']:.0f}%",
+            str(r.count("passed") + r.count("failed") + r.count("error") + r.count("flaky")),
+            str(r.count("skipped")), str(r.count("failed") + r.count("error") + r.count("flaky")),
+            _secs(r.suite_seconds) + _ratio(r.suite_seconds, base.suite_seconds)
+            + (f" [{r.suite_range[0]:.1f}-{r.suite_range[1]:.1f}]" if r.suite_range else ""),
             _secs(r.meta.get("end_to_end_seconds")),
             ", ".join(r.meta.get("extras", [])),
         ])
-    out.append("1. Totals (* = baseline)\n" + _table(
-        ["Environment", "Python", "OS", "CPUs", "Hardware", "Ran", "Skipped", "Failed", "Suite", "End-to-end",
-         "Extras"], rows))
+    out.append("1. Totals (* = baseline; with repeats: medians, suite [min-max]; Busy = this machine's CPU "
+               "use when the run started)\n" + _table(
+        ["Environment", "Python", "OS", "CPUs", "Hardware", "Runs", "Busy", "Ran", "Skipped", "Failed", "Suite",
+         "End-to-end", "Extras"], rows))
+    busy_runs = [r for r in runs if (r.meta.get("cpu_busy_start") or 0) >= BUSY_THRESHOLD]
+    if busy_runs:
+        out.append("\nBusy machine: " + ", ".join(f"{r.label} ({r.meta['cpu_busy_start']:.0f}%)" for r in busy_runs)
+                   + f" started with the CPU at least {BUSY_THRESHOLD}% busy -- timings unreliable; "
+                   "rerun when idle or use --repeat.")
 
     base_ran = {t for t, (s, _, _) in base.tests.items() if s != "skipped"}
     notes = []
@@ -166,7 +213,7 @@ def report(runs: list[Run], baseline: str | None, top: int) -> str:
     # 3. Environment-only failures
     rows = []
     for test in all_tests:
-        failed = [r for r in runs if r.tests.get(test, ("",))[0] in ("failed", "error")]
+        failed = [r for r in runs if r.tests.get(test, ("",))[0] in ("failed", "error", "flaky")]
         if failed and len(failed) < len(runs):
             for r in failed:
                 rows.append([test.split("tests.", 1)[-1], r.label, r.tests[test][2][:90]])
@@ -225,7 +272,38 @@ def hardware() -> dict:
             "cpus": os.cpu_count()}
 
 
-def write_meta(label: str, out: Path, end_to_end: float | None, extras: list[str], commit: str | None) -> None:
+BUSY_THRESHOLD = 50  # % CPU in use when a run starts; above this the report flags the run
+
+
+def cpu_busy_percent(sample_seconds: float = 1.0) -> float | None:
+    """Share of CPU time in use across all cores over a short sample, or None
+    where it can't be measured. Recorded per run so the report can flag runs
+    that started on a busy machine."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            def times():
+                idle, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+                ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+                value = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+                return value(idle), value(kernel) + value(user)  # kernel time includes idle
+        else:
+            def times():
+                fields = [int(x) for x in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+                return fields[3] + (fields[4] if len(fields) > 4 else 0), sum(fields)
+        idle1, total1 = times()
+        time.sleep(sample_seconds)
+        idle2, total2 = times()
+        total = total2 - total1
+        return round(100.0 * (1 - (idle2 - idle1) / total), 1) if total > 0 else None
+    except (OSError, ValueError, AttributeError, IndexError):
+        return None
+
+
+def write_meta(label: str, out: Path, end_to_end: float | None, extras: list[str], commit: str | None,
+               cpu_busy_start: float | None = None) -> None:
     if not commit:
         try:
             commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -241,6 +319,7 @@ def write_meta(label: str, out: Path, end_to_end: float | None, extras: list[str
         "virtualized": False,
         "end_to_end_seconds": end_to_end,
         "extras": extras,
+        "cpu_busy_start": cpu_busy_start,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(meta, indent=2), encoding="utf-8")

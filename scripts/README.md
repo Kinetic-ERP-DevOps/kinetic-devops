@@ -124,9 +124,15 @@ Informative only -- nothing here fails a build. Each environment records a run a
 `python -m pytest --junitxml` (per-test time, outcome and skip reason) plus a small metadata file
 (label, commit, Python, OS, CPUs, end-to-end time, extra checks included).
 
-- `uv run python scripts/run_timings.py [--working-tree] [--envs native,sandbox,wsl]` runs the suite
-  on this machine, in the kept Windows Sandbox and in WSL (each skipped with a note if unavailable)
-  and writes the records to `temp/timings/<commit>/`.
+- `uv run python scripts/run_timings.py [--working-tree] [--envs native,sandbox,wsl,alpine] [--repeat N]`
+  runs the suite on this machine, in the kept Windows Sandbox, in WSL (default: the newest
+  `Ubuntu-NN.NN` distro with uv; `--wsl-distro` to choose) and in a throwaway `python:3.14-alpine`
+  container via Podman in a WSL distro that has it (musl coverage; `--podman-distro`), each skipped
+  with the reason if unavailable, and writes the records to `temp/timings/<commit>/`. With
+  `--repeat N` each environment runs N times and the report compares medians (with the min-max
+  range, and tests that passed in some repeats and failed in others marked flaky). Each record notes
+  how busy this machine's CPU was when the run started; runs that started 50% busy or more are
+  flagged as unreliable.
 - CI records every run too: download the `timings-*` artifacts of a CI run (GitHub Linux/Windows,
   Forgejo Linux) into the same folder to compare with the local environments.
 - `uv run python scripts/compare_timings.py report temp/timings/<commit>/ [--baseline windows-native]`

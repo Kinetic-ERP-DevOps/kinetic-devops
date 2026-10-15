@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-push hook runs the full check when enabled with `git config kinetic.prepushSandbox true`;
   commits that already passed are skipped.
 - Environment comparison (informative only): every CI test job records its run as JUnit XML plus
-  metadata and uploads it; `scripts/run_timings.py` records this machine, the kept Windows Sandbox and
-  WSL; `scripts/compare_timings.py report` shows totals (suite and end-to-end, with each run's scope
+  metadata and uploads it; `scripts/run_timings.py` records this machine, the kept Windows Sandbox,
+  WSL (newest Ubuntu with uv) and a `python:3.14-alpine` container via Podman, with `--repeat N` for
+  medians, flaky-test detection and a busy-machine flag; `scripts/compare_timings.py report` shows totals (suite and end-to-end, with each run's scope
   and where scopes differ), tests not run everywhere with skip reasons, environment-only failures,
   and like-for-like per-module/per-test times. CI now runs the suite via `python -m pytest` (same
   tests as `tests.test_runner`).
