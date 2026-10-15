@@ -80,13 +80,30 @@ class TestBranchProtectionAutomation(unittest.TestCase):
         self.assertEqual(fj_payload["status_check_contexts"], ["Python Test Gate"])
 
     def test_main_dry_run_returns_zero(self):
+        # The example leaves the Forgejo owner/repo blank so they come from the
+        # checkout's origin remote; fill them in so the result doesn't depend
+        # on how (or whether) this checkout has an origin.
+        cfg = json.loads(
+            Path("scripts/branch_protection.targets.example.json").read_text(encoding="utf-8")
+        )
+        for target in cfg["targets"]:
+            if target["provider"] == "forgejo":
+                target.update(
+                    owner="example",
+                    repo="kinetic-devops",
+                    forgejo_api_base="https://forgejo.example.invalid/api/v1",
+                )
+
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = self.mod.main([
-                "--config",
-                "scripts/branch_protection.targets.example.json",
-            ])
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "targets.json"
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = self.mod.main([
+                    "--config",
+                    str(cfg_path),
+                ])
 
         self.assertEqual(code, 0)
         self.assertIn("Mode: dry-run", stdout.getvalue())
