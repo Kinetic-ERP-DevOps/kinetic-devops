@@ -22,8 +22,12 @@ Usage:
     uv run python scripts/sandbox_test.py --fresh         # restart the sandbox first (clean machine)
     uv run python scripts/sandbox_test.py --stop          # stop the kept sandbox and exit
 
-Exit codes: 0 passed, 1 failed (or timed out), 2 Windows Sandbox unavailable,
-or a sandbox this tool did not start is running (nothing was tested). Commits
+A sandbox that is already running but unknown to this tool (a stale id, an
+earlier session, or one opened by hand) is adopted: the job folder and Git are
+shared into it with `wsb share`, so it never blocks a run.
+
+Exit codes: 0 passed, 1 failed (or timed out), 2 Windows Sandbox unavailable
+(nothing was tested). Commits
 that pass a full run are recorded in <git-dir>/kinetic-sandbox-passed; the
 opt-in pre-push hook skips those, so you can test ahead of a push.
 """
@@ -149,21 +153,73 @@ def _stop_kept() -> bool:
     return False
 
 
+def _remember(sandbox_id: str, how: str) -> None:
+    STATE.write_text(json.dumps({"id": sandbox_id, how: time.strftime("%Y-%m-%dT%H:%M:%S")}),
+                     encoding="utf-8")
+
+
+def _wait_ready(sandbox_id: str, seconds: int = 300) -> bool:
+    """Wait until the sandbox accepts commands. They run as SYSTEM: a sandbox started
+    with `wsb start` has no logged-in user session until its window is opened."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            if _wsb("exec", "--id", sandbox_id, "-r", "System", "-c", "cmd /c exit 0",
+                    timeout=60).get("ExitCode") == 0:
+                return True
+        except (RuntimeError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(5)
+    return False
+
+
+def _guest_has(sandbox_id: str, guest_path: str) -> bool:
+    command = f'cmd /c if exist "{guest_path}" (exit 0) else (exit 1)'
+    return _wsb("exec", "--id", sandbox_id, "-r", "System", "-c", command).get("ExitCode") == 0
+
+
+def _adopt(sandbox_id: str) -> None:
+    """Re-hydrate a running sandbox this tool doesn't know (stale id, an earlier
+    session, or one opened by hand): share the job folder and Git into it."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    # A marker file proves the guest path shows *this* host folder, not a stale mapping.
+    marker = f"host-{os.getpid()}-{int(time.time())}"
+    (BASE / marker).write_text("kinetic-devops sandbox job folder\n", encoding="utf-8")
+    try:
+        if not _guest_has(sandbox_id, rf"{GUEST_BASE}\{marker}"):
+            _wsb("share", "--id", sandbox_id, "-f", str(BASE), "-s", GUEST_BASE, "-w")
+            if not _guest_has(sandbox_id, rf"{GUEST_BASE}\{marker}"):
+                raise RuntimeError(f"could not share {BASE} into sandbox {sandbox_id} as {GUEST_BASE}")
+    finally:
+        (BASE / marker).unlink(missing_ok=True)
+    if not _guest_has(sandbox_id, r"C:\Git\cmd\git.exe") and not _guest_has(sandbox_id, r"C:\kd-git\cmd\git.exe"):
+        _wsb("share", "--id", sandbox_id, "-f", str(_git_install_root()), "-s", r"C:\kd-git")
+    _remember(sandbox_id, "adopted")
+
+
 def _ensure_sandbox(fresh: bool) -> str | None:
-    """Reuse the sandbox this tool started, or start one. Always checks what is
-    running first: only one Windows Sandbox can run at a time."""
+    """Reuse the sandbox this tool started, adopt one that is already running, or
+    start one. Always checks what is running first: only one Windows Sandbox can
+    run at a time."""
     if fresh:
         _stop_kept()
+        if _running_ids():
+            print("sandbox_test: --fresh: a sandbox this tool did not start is still running; "
+                  "close it first. Skipped.")
+            return None
     running = _running_ids()
     kept = _kept_id()
     if kept and kept in running:
         print(f"sandbox_test: reusing running sandbox {kept}.")
         return kept
     if running:
-        print("sandbox_test: a Windows Sandbox that this tool did not start is running "
-              f"({', '.join(running)}); only one can run at a time. Close it (or "
-              "`wsb stop --id <id>`) and retry. Skipped.")
-        return None
+        sandbox_id = running[0]
+        print(f"sandbox_test: adopting running sandbox {sandbox_id} (sharing the job folder into it).")
+        if not _wait_ready(sandbox_id, 60):
+            print(f"sandbox_test: sandbox {sandbox_id} does not accept commands; close it and retry. Skipped.")
+            return None
+        _adopt(sandbox_id)
+        return sandbox_id
 
     BASE.mkdir(parents=True, exist_ok=True)
     config = _wsb_config([(BASE, GUEST_BASE, False), (_git_install_root(), r"C:\Git", True)])
@@ -171,18 +227,10 @@ def _ensure_sandbox(fresh: bool) -> str | None:
     sandbox_id = _wsb("start", "-c", config).get("Id", "")
     if not sandbox_id:
         raise RuntimeError("wsb start did not return a sandbox id")
-    STATE.write_text(json.dumps({"id": sandbox_id, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}),
-                     encoding="utf-8")
-    deadline = time.monotonic() + 300
-    while time.monotonic() < deadline:  # wait for the sandbox's user session
-        try:
-            if _wsb("exec", "--id", sandbox_id, "-r", "ExistingLogin", "-c", "cmd /c exit 0",
-                    timeout=60).get("ExitCode") == 0:
-                return sandbox_id
-        except (RuntimeError, subprocess.TimeoutExpired):
-            pass
-        time.sleep(5)
-    raise RuntimeError(f"sandbox {sandbox_id} started but its session never became ready")
+    _remember(sandbox_id, "started")
+    if not _wait_ready(sandbox_id):
+        raise RuntimeError(f"sandbox {sandbox_id} started but its session never became ready")
+    return sandbox_id
 
 
 def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min: int,
@@ -199,7 +247,7 @@ def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min:
     command = (rf"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {guest_job}\repo\scripts\sandbox_run.ps1"
                rf" -JobDir {guest_job}")
     try:
-        _wsb("exec", "--id", sandbox_id, "-r", "ExistingLogin", "-c", command, timeout=timeout_min * 60)
+        _wsb("exec", "--id", sandbox_id, "-r", "System", "-c", command, timeout=timeout_min * 60)
     except subprocess.TimeoutExpired:
         print(f"sandbox_test: no result after {timeout_min} minutes; logs in {job / 'out'}")
         return 1, job
@@ -277,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
             "Run tests for a commit on Windows in Windows Sandbox, including the native checks "
             "(.exe launchers, .ps1 scripts) that local runs defer. Default: the full suite plus "
             "the Windows smoke checks, in a sandbox that is kept running and reused. "
-            "Exit 0 pass, 1 fail, 2 sandbox unavailable or occupied."
+            "A running sandbox it doesn't know is adopted. Exit 0 pass, 1 fail, 2 sandbox unavailable."
         )
     )
     parser.add_argument("--commit", default="HEAD", help="Commit to test (default: HEAD)")

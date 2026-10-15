@@ -6,7 +6,7 @@
 #   folder holds repo\ (checkout of the commit), options.json and out\.
 # - One-shot mode (no -JobDir, started as the sandbox's logon command):
 #   C:\kd-in holds repo\ and options.json, C:\kd-out receives the logs.
-# C:\Git is the host's Git install (read-only). Installs uv if missing, syncs
+# C:\Git (C:\kd-git in an adopted sandbox) is the host's Git install (read-only). Installs uv if missing, syncs
 # into a fresh copy of the checkout, then runs what options.json asks for:
 #   suite: "full" (tests.test_runner), "none", or a list of unittest names
 #   smoke: true/false (scripts/windows_smoke.ps1)
@@ -42,7 +42,8 @@ function Step([string]$name, [scriptblock]$body) {
 }
 
 Set-Content -Path $summary -Value ("Windows Sandbox run started " + (Get-Date -Format s))
-$env:PATH = "C:\Git\cmd;C:\Git\usr\bin;" + $env:PATH
+# Host Git: C:\Git when mapped at start, C:\kd-git when shared into an adopted sandbox.
+$env:PATH = "C:\Git\cmd;C:\Git\usr\bin;C:\kd-git\cmd;C:\kd-git\usr\bin;" + $env:PATH
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 # The sandbox has no endpoint-security agent: run the native (.exe launcher) checks.

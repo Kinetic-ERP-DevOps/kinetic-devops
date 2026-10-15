@@ -93,8 +93,13 @@ scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushCont
 - `scripts/windows_smoke.ps1`: the Windows-only checks (console-script launchers, `env_init.ps1` and
   `env_init.bat`, `install-hook.ps1`). Run it from the repo root of a throwaway checkout after
   `uv sync`. GitHub's `windows-latest` CI job runs it on every pull request.
-- `scripts/sandbox_test.py`: runs the test suite and the smoke checks for a commit on a clean Windows
-  in Windows Sandbox (no endpoint-security agent). Exit 0 pass, 1 fail, 2 sandbox unavailable.
+- `scripts/sandbox_test.py`: runs the test suite and the smoke checks for a commit on Windows in
+  Windows Sandbox (no endpoint-security agent). With the Windows Sandbox CLI (`wsb`, Windows 11 24H2+)
+  one sandbox is kept running and reused: each run checks what is running first, reuses its sandbox,
+  adopts a running one it doesn't know (stale id, earlier session, opened by hand -- the job folder is
+  shared into it with `wsb share`), or starts one. Each job gets a fresh checkout and `.venv`; uv and
+  its cache stay warm. `--fresh` restarts it clean, `--stop` stops it, `--one-shot` uses a self-closing
+  sandbox (the fallback without `wsb`). Exit 0 pass, 1 fail, 2 sandbox unavailable.
 
 ## Branch Protection Automation (GitHub + Forgejo)
 

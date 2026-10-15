@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/windows_smoke.ps1` (console-script launchers, `env_init.ps1` / `env_init.bat`,
   `install-hook.ps1`) under Windows PowerShell 5.1.
 - `scripts/sandbox_test.py`: tests a commit on a clean Windows in Windows Sandbox: the full suite plus
-  the Windows smoke checks, or `--native-only`, `--tests NAME ...`, `--smoke-only`. An optional
+  the Windows smoke checks, or `--native-only`, `--tests NAME ...`, `--smoke-only`. With `wsb` it
+  keeps one sandbox running and reuses it (adopting a running sandbox it doesn't know via
+  `wsb share`), so later runs skip boot and uv setup. An optional
   pre-push hook runs the full check when enabled with `git config kinetic.prepushSandbox true`;
   commits that already passed are skipped.
 - CI job "Built Wheel Smoke Test": builds the sdist and wheel, checks the wheel contains only
