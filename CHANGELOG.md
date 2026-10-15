@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module and starts each console script and module CLI.
 
 ### Fixed
+- Encrypted-vault tests never ran on Windows: `cryptography` was only present where `keyring` pulls
+  it in (Linux). It is now a dev dependency and a user-facing extra (`kinetic-devops[vault]`). When
+  it is installed but can't load -- e.g. endpoint security blocks its native library -- the error
+  says so (with the cause) instead of claiming it is missing, and the tests skip with that reason.
 - Removed `[tool.uv] compile-bytecode` (added in 0.1.0a7): it made every `uv run` recompile all
   installed packages (~4 s each time), and on machines with endpoint security those cache writes
   intermittently failed ("user-mapped section open", os error 1224). Python caches bytecode on first

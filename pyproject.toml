@@ -28,6 +28,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
+[project.optional-dependencies]
+# Encrypted credential vault (kinetic_devops.crypto); imported lazily, so the
+# rest of the toolkit works without it.
+vault = ["cryptography>=42"]
+
 [project.scripts]
 kinetic-devops = "kinetic_devops.__main__:main"
 repo-maker = "kinetic_devops.repo_maker:main"
@@ -44,6 +49,9 @@ include = ["kinetic_devops*"]
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",
+    # So the encrypted-vault tests run on every platform, not only where
+    # keyring pulls cryptography in (Linux).
+    "cryptography>=42",
 ]
 
 [tool.pytest.ini_options]

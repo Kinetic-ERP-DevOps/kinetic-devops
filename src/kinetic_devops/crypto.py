@@ -18,8 +18,16 @@ def _ensure_cryptography():
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         return PBKDF2HMAC, hashes, AESGCM
+    except ImportError as e:
+        if getattr(e, "name", "") == "cryptography" or "No module named 'cryptography" in str(e):
+            raise RuntimeError(
+                "Missing 'cryptography' library. Install with: uv pip install 'kinetic-devops[vault]'"
+            ) from e
+        # Installed but not loadable, e.g. its native library was blocked
+        # (endpoint security) or built for another platform.
+        raise RuntimeError(f"'cryptography' is installed but could not be loaded: {e}") from e
     except Exception as e:
-        raise RuntimeError("Missing 'cryptography' library. Install with: pip install cryptography")
+        raise RuntimeError(f"'cryptography' could not be loaded: {e}") from e
 
 
 def derive_key(passphrase: str, salt: bytes, iterations: int = 200_000) -> bytes:
