@@ -68,8 +68,21 @@ jobs:
           python -m pip install uv
           uv sync --locked
 
+      # Same tests as tests.test_runner, via pytest for per-test timings and skip
+      # reasons (JUnit XML); scripts/compare_timings.py compares environments.
       - name: Run regression suite
-        run: uv run python -m tests.test_runner
+        run: uv run python -m pytest -q -p no:cacheprovider --junitxml="timings/forgejo-linux-py${{ matrix.python-version }}.xml"
+
+      - name: Record timing metadata
+        if: always()
+        run: uv run python scripts/compare_timings.py meta --label "forgejo-linux-py${{ matrix.python-version }}" --out "timings/forgejo-linux-py${{ matrix.python-version }}.json" --extra "native checks"
+
+      - name: Upload timing record
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: timings-forgejo-linux-py${{ matrix.python-version }}
+          path: timings/
 
   wheel-smoke-test:
     name: Built Wheel Smoke Test

@@ -47,7 +47,7 @@ uv run python tests/test_runner.py
 ```
 
 - The test runner validates the environment, discovers tests under `tests/`, and writes results to `tests/test_results.log`.
-- CI invokes the test runner via `uv run python -m tests.test_runner` (Linux on GitHub and Forgejo, plus `windows-latest` on GitHub).
+- CI runs the same tests via `uv run python -m pytest` (Linux on GitHub and Forgejo, plus `windows-latest` on GitHub), which also records per-test timings (see "Comparing Environments").
 
 ---
 
@@ -107,6 +107,27 @@ scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushCont
   shared into it with `wsb share`), or starts one. Each job gets a fresh checkout and `.venv`; uv and
   its cache stay warm. `--fresh` restarts it clean, `--stop` stops it, `--one-shot` uses a self-closing
   sandbox (the fallback without `wsb`). Exit 0 pass, 1 fail, 2 sandbox unavailable.
+
+## Comparing Environments (timings)
+
+Informative only -- nothing here fails a build. Each environment records a run as JUnit XML from
+`python -m pytest --junitxml` (per-test time, outcome and skip reason) plus a small metadata file
+(label, commit, Python, OS, CPUs, end-to-end time, extra checks included).
+
+- `uv run python scripts/run_timings.py [--working-tree] [--envs native,sandbox,wsl]` runs the suite
+  on this machine, in the kept Windows Sandbox and in WSL (each skipped with a note if unavailable)
+  and writes the records to `temp/timings/<commit>/`.
+- CI records every run too: download the `timings-*` artifacts of a CI run (GitHub Linux/Windows,
+  Forgejo Linux) into the same folder to compare with the local environments.
+- `uv run python scripts/compare_timings.py report temp/timings/<commit>/ [--baseline windows-native]`
+  prints: totals per environment (suite time and end-to-end time, with each run's scope -- tests run,
+  skipped, failed, extra checks -- and where scopes differ, what differs, so apples-to-oranges totals
+  are labelled as such); tests not run in every environment, with the skip reasons; failures that
+  happen in only some environments; and per-module/per-test times over the tests that passed
+  everywhere (the like-for-like comparison).
+
+Always invoke pytest as `python -m pytest`: endpoint security may block the generated `pytest.exe`
+launcher.
 
 ## Branch Protection Automation (GitHub + Forgejo)
 

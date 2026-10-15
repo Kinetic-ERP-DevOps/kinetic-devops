@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wsb share`), so later runs skip boot and uv setup. An optional
   pre-push hook runs the full check when enabled with `git config kinetic.prepushSandbox true`;
   commits that already passed are skipped.
+- Environment comparison (informative only): every CI test job records its run as JUnit XML plus
+  metadata and uploads it; `scripts/run_timings.py` records this machine, the kept Windows Sandbox and
+  WSL; `scripts/compare_timings.py report` shows totals (suite and end-to-end, with each run's scope
+  and where scopes differ), tests not run everywhere with skip reasons, environment-only failures,
+  and like-for-like per-module/per-test times. CI now runs the suite via `python -m pytest` (same
+  tests as `tests.test_runner`).
 - CI job "Built Wheel Smoke Test": builds the sdist and wheel, checks the wheel contains only
   `kinetic_devops/`, installs it into a clean environment and, from outside the checkout, imports every
   module and starts each console script and module CLI.

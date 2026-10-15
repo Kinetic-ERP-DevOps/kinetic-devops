@@ -68,8 +68,21 @@ jobs:
           python -m pip install uv
           uv sync --locked
 
+      # Same tests as tests.test_runner, via pytest for per-test timings and skip
+      # reasons (JUnit XML); scripts/compare_timings.py compares environments.
       - name: Run regression suite
-        run: uv run python -m tests.test_runner
+        run: uv run python -m pytest -q -p no:cacheprovider --junitxml="timings/github-linux-py${{ matrix.python-version }}.xml"
+
+      - name: Record timing metadata
+        if: always()
+        run: uv run python scripts/compare_timings.py meta --label "github-linux-py${{ matrix.python-version }}" --out "timings/github-linux-py${{ matrix.python-version }}.json" --extra "native checks"
+
+      - name: Upload timing record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timings-github-linux-py${{ matrix.python-version }}
+          path: timings/
 
   wheel-smoke-test:
     name: Built Wheel Smoke Test
@@ -160,7 +173,19 @@ jobs:
 
       - name: Run regression suite
         shell: pwsh
-        run: uv run python -m tests.test_runner
+        run: uv run python -m pytest -q -p no:cacheprovider --junitxml="timings/github-windows-py3.12.xml"
+
+      - name: Record timing metadata
+        if: always()
+        shell: pwsh
+        run: uv run python scripts/compare_timings.py meta --label "github-windows-py3.12" --out "timings/github-windows-py3.12.json" --extra "native checks" --extra "windows smoke checks (separate step)"
+
+      - name: Upload timing record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timings-github-windows-py3.12
+          path: timings/
 
       - name: Windows smoke checks (Windows PowerShell 5.1)
         shell: powershell

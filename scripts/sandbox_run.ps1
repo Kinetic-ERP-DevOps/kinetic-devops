@@ -9,7 +9,8 @@
 #   C:\kd-in holds repo\ and options.json, C:\kd-out receives the logs.
 # C:\Git (C:\kd-git in an adopted sandbox) is the host's Git install (read-only). Installs uv if missing, syncs
 # into a fresh copy of the checkout, then runs what options.json asks for:
-#   suite: "full" (tests.test_runner), "none", or a list of unittest names
+#   suite: "full" (tests.test_runner), "pytest-junit" (same tests via pytest,
+#          writing out\junit.xml), "none", or a list of unittest names
 #   smoke: true/false (scripts/windows_smoke.ps1)
 # with native checks enabled, and writes out\RESULT (PASS/FAIL). One-shot mode
 # then shuts the sandbox down unless options.json has "keep_open": true.
@@ -75,6 +76,13 @@ git config --global user.email "sandbox@example.invalid"
 Step "uv sync" { uv sync --locked }
 if ($options.suite -is [string]) {
     if ($options.suite -eq "full") { Step "test suite" { uv run python -m tests.test_runner --native } }
+    # Same tests via pytest, with per-test timings for scripts/compare_timings.py.
+    if ($options.suite -eq "pytest-junit") {
+        $junit = Join-Path $out "junit.xml"
+        Step "test suite (pytest)" { uv run python -m pytest -q -p no:cacheprovider "--junitxml=$junit" }
+        # This environment's own Python/OS for the timing record; the host adds end-to-end time.
+        uv run python scripts/compare_timings.py meta --label windows-sandbox --out (Join-Path $out "junit.json") --extra "native checks" 2>&1 | Out-Null
+    }
 } else {
     $names = @($options.suite)
     Step "selected tests" { uv run python -m unittest -v @names }

@@ -104,6 +104,26 @@ def _checkout(repo_root: Path, sha: str, dest: Path) -> None:
     _git("checkout", "--quiet", sha, cwd=dest)
 
 
+def snapshot_working_tree(repo_root: Path) -> str:
+    """Commit object for the working tree as it is -- tracked changes plus
+    untracked, non-ignored files -- built in a temporary index, so the real
+    index, stash list and refs are untouched (`git stash create` would miss
+    untracked files)."""
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", *args], cwd=repo_root, env=env, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        git("read-tree", "HEAD")
+        git("add", "-A")
+        tree = git("write-tree")
+        if tree == git("rev-parse", "HEAD^{tree}"):
+            return git("rev-parse", "HEAD")
+        return git("commit-tree", tree, "-p", "HEAD", "-m", "sandbox_test: working tree snapshot")
+
+
 def _bundle(repo_root: Path, sha: str, dest: Path) -> None:
     """Write `sha` (and its history) to a git bundle file. Bundles carry refs, so
     point a temporary ref under refs/kinetic-sandbox/ at the commit (it may be an
@@ -317,15 +337,17 @@ def _passed(out_dir: Path) -> bool:
 
 
 def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep_files: bool,
-        fresh: bool, one_shot: bool) -> int:
+        fresh: bool, one_shot: bool, junit_out: Path | None = None) -> int:
+    """Exit code as documented; with junit_out, the suite runs via pytest and
+    its JUnit XML (per-test timings) is copied to junit_out."""
+    if junit_out and suite == "full":
+        suite = "pytest-junit"
     if sys.platform != "win32" or not SANDBOX_EXE.is_file():
         print("sandbox_test: Windows Sandbox is not available on this machine; skipped.")
         return UNAVAILABLE
     repo_root = Path(_git("rev-parse", "--show-toplevel"))
     if commit == WORKING_TREE:
-        # Snapshot tracked changes as an unreferenced commit; the working tree,
-        # index and stash list are untouched. Clean tree -> HEAD.
-        sha = _git("stash", "create", cwd=repo_root) or _git("rev-parse", "HEAD", cwd=repo_root)
+        sha = snapshot_working_tree(repo_root)
     else:
         sha = _git("rev-parse", "--verify", f"{commit}^{{commit}}", cwd=repo_root)
     options = {"suite": suite, "smoke": smoke, "keep_open": keep_open}
@@ -339,8 +361,16 @@ def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep
     if code == UNAVAILABLE:
         return code
 
-    if code == 0 and suite == "full" and smoke and commit != WORKING_TREE:
+    if code == 0 and suite in ("full", "pytest-junit") and smoke and commit != WORKING_TREE:
         _record_pass(repo_root, sha)
+    if junit_out and work:
+        produced = next(iter(sorted(work.glob("**/out/junit.xml"))), None)
+        if produced:
+            junit_out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(produced, junit_out)
+            print(f"sandbox_test: JUnit XML copied to {junit_out}")
+            if produced.with_suffix(".json").exists():  # the sandbox's own metadata
+                shutil.copyfile(produced.with_suffix(".json"), junit_out.with_suffix(".json"))
     if work and code == 0 and not keep_files:
         shutil.rmtree(work, ignore_errors=True)
     elif work:
@@ -361,7 +391,8 @@ def main(argv: list[str] | None = None) -> int:
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--commit", default="HEAD", help="Commit to test (default: HEAD)")
     target.add_argument("--working-tree", action="store_true",
-                        help="Test uncommitted changes to tracked files (untracked files are not included)")
+                        help="Test the working tree as it is, including uncommitted and untracked "
+                             "(non-ignored) files")
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--native-only", action="store_true",
                        help=f"Only the deferred native checks: {' '.join(NATIVE_TESTS)} plus the smoke checks")
@@ -371,6 +402,9 @@ def main(argv: list[str] | None = None) -> int:
     scope.add_argument("--smoke-only", action="store_true",
                        help="Only scripts/windows_smoke.ps1, no Python tests")
     parser.add_argument("--no-smoke", action="store_true", help="Skip scripts/windows_smoke.ps1")
+    parser.add_argument("--junit-out", type=Path, metavar="FILE",
+                        help="Full suite via pytest; copy its JUnit XML (per-test timings) here "
+                             "(for scripts/compare_timings.py)")
     parser.add_argument("--fresh", action="store_true",
                         help="Stop the kept sandbox first and start a clean one")
     parser.add_argument("--stop", action="store_true", help="Stop the kept sandbox and exit")
@@ -401,8 +435,10 @@ def main(argv: list[str] | None = None) -> int:
     smoke = not args.no_smoke
     if suite == "none" and not smoke:
         parser.error("--smoke-only and --no-smoke together leave nothing to run")
+    if args.junit_out and suite != "full":
+        parser.error("--junit-out needs the full suite (not --native-only/--tests/--smoke-only)")
     return run(WORKING_TREE if args.working_tree else args.commit, suite, smoke, args.timeout, args.keep_open, args.keep_files,
-               args.fresh, args.one_shot)
+               args.fresh, args.one_shot, args.junit_out)
 
 
 if __name__ == "__main__":
