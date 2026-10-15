@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Native checks (tests that execute uv's generated console-script `.exe` launchers) are deferred in
-  local runs and the pre-commit hook, because enterprise endpoint security (e.g. Carbon Black) may
+  local runs and the pre-commit hook, because enterprise endpoint security may
   block newly built unsigned files. They run in CI, in Windows Sandbox, or on request with
   `tests.test_runner --native` / `KINETIC_NATIVE_CHECKS=1`.
 - GitHub CI job "Windows Test Gate" on `windows-latest`: the test suite plus
@@ -46,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Encrypted-vault tests never ran on Windows: `cryptography` was only present where `keyring` pulls
   it in (Linux). It is now a dev dependency and a user-facing extra (`kinetic-devops[vault]`). When
   it is installed but can't load -- e.g. endpoint security blocks its native library -- the error
-  says so (with the cause) instead of claiming it is missing, and the tests skip with that reason.
+  says so (with the cause) instead of claiming it is missing. The vault test is a native check
+  (it loads a native library): deferred in local runs, run in CI, Windows Sandbox and on request.
 - Removed `[tool.uv] compile-bytecode` (added in 0.1.0a7): it made every `uv run` recompile all
   installed packages (~4 s each time), and on machines with endpoint security those cache writes
   intermittently failed ("user-mapped section open", os error 1224). Python caches bytecode on first

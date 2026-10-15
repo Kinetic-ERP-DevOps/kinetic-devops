@@ -3,7 +3,7 @@
 
 The checks that run generated native code -- uv's console-script .exe
 launchers and the .ps1 scripts -- are deferred on a development machine,
-because enterprise endpoint security (e.g. Carbon Black) may block newly built
+because enterprise endpoint security may block newly built
 or edited unsigned files. This runs them, and as much of the suite as you ask
 for, in Windows Sandbox: a Windows with no endpoint-security agent and nothing
 from this machine except the job folder and a read-only view of the local Git

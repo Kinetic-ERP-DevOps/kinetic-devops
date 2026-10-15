@@ -68,12 +68,13 @@ Install the hooks once per clone (PowerShell):
   once without enabling it). Commits that already passed are skipped, so you can run
   `uv run python scripts/sandbox_test.py` before pushing.
 
-### Native checks and enterprise endpoint security (Carbon Black and similar)
+### Native checks and enterprise endpoint security
 
 Managed Windows machines may block or kill **newly built or edited unsigned code**: the console-script
-launchers uv writes (`.venv\Scripts\kinetic-devops.exe` and friends) and new or recently edited
-`.ps1` files. Symptoms: "Access denied" when running a script, a launcher killed mid-run, or a file
-briefly locked right after it is written. `uv run` itself is fine and remains the way to run everything.
+launchers uv writes (`.venv\Scripts\kinetic-devops.exe` and friends), native extension libraries
+of newly installed packages (e.g. `cryptography`'s, used by the encrypted vault) and new or recently
+edited `.ps1` files. Symptoms: "Access denied" when running a script, `DLL load failed ... Access is
+denied` on import, a launcher killed mid-run, or a file briefly locked right after it is written. `uv run` itself is fine and remains the way to run everything.
 
 So the checks that execute that native code are **deferred** on a development machine, never dropped:
 
