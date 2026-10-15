@@ -5,26 +5,34 @@ The checks that run generated native code -- uv's console-script .exe
 launchers and the .ps1 scripts -- are deferred on a development machine,
 because enterprise endpoint security (e.g. Carbon Black) may block newly built
 or edited unsigned files. This runs them, and as much of the suite as you ask
-for, in Windows Sandbox: a clean Windows with no endpoint-security agent and
-nothing from this machine except the checkout and a read-only view of the local
-Git install. Takes several minutes; the sandbox window closes itself when done.
+for, in Windows Sandbox: a Windows with no endpoint-security agent and nothing
+from this machine except the job folder and a read-only view of the local Git
+install.
+
+With the Windows Sandbox CLI (`wsb`, Windows 11 24H2+), one sandbox is kept
+running and reused: every run first checks what is running, reuses the sandbox
+it started earlier, or starts one if none is running. Each job gets a fresh
+checkout and .venv; uv and its cache stay warm, so later runs are much faster
+than the first. Without `wsb` it falls back to a one-shot sandbox per run.
 
 Usage:
     uv run python scripts/sandbox_test.py                 # full suite + smoke checks
     uv run python scripts/sandbox_test.py --native-only   # only the deferred native checks
     uv run python scripts/sandbox_test.py --tests tests.test_cli tests.test_auth_rename
-    uv run python scripts/sandbox_test.py --commit HEAD~1 --keep-open
+    uv run python scripts/sandbox_test.py --fresh         # restart the sandbox first (clean machine)
+    uv run python scripts/sandbox_test.py --stop          # stop the kept sandbox and exit
 
-Exit codes: 0 passed, 1 failed (or timed out), 2 Windows Sandbox unavailable or
-already running (nothing was tested). Commits that pass a full run are recorded
-in <git-dir>/kinetic-sandbox-passed; the opt-in pre-push hook skips those, so
-you can test ahead of a push, and a retried push is instant.
+Exit codes: 0 passed, 1 failed (or timed out), 2 Windows Sandbox unavailable,
+or a sandbox this tool did not start is running (nothing was tested). Commits
+that pass a full run are recorded in <git-dir>/kinetic-sandbox-passed; the
+opt-in pre-push hook skips those, so you can test ahead of a push.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -37,20 +45,17 @@ SANDBOX_EXE = Path(r"C:\Windows\System32\WindowsSandbox.exe")
 UNAVAILABLE = 2
 # The suite's tests that execute generated launchers (deferred locally).
 NATIVE_TESTS = ["tests.test_cli"]
+# Host folder shared read-write with the kept sandbox as C:\kd-jobs.
+BASE = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "kinetic-devops" / "sandbox"
+STATE = BASE / "sandbox.json"
+JOBS = BASE / "jobs"
+GUEST_BASE = r"C:\kd-jobs"
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
     return subprocess.run(
         ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
     ).stdout.strip()
-
-
-def _sandbox_running() -> bool:
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq WindowsSandboxRemoteSession.exe", "/NH"],
-        capture_output=True, text=True,
-    )
-    return "WindowsSandboxRemoteSession" in result.stdout
 
 
 def _git_install_root() -> Path:
@@ -61,17 +66,19 @@ def _git_install_root() -> Path:
     return root
 
 
-def _wsb_config(in_dir: Path, out_dir: Path, git_root: Path) -> str:
-    def folder(host: Path, guest: str, read_only: bool) -> str:
-        return (
-            "    <MappedFolder>\n"
-            f"      <HostFolder>{escape(str(host))}</HostFolder>\n"
-            f"      <SandboxFolder>{guest}</SandboxFolder>\n"
-            f"      <ReadOnly>{'true' if read_only else 'false'}</ReadOnly>\n"
-            "    </MappedFolder>\n"
-        )
-
-    command = r"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\kd-in\repo\scripts\sandbox_run.ps1"
+def _wsb_config(folders: list[tuple[Path, str, bool]], logon_command: str = "") -> str:
+    mapped = "".join(
+        "    <MappedFolder>\n"
+        f"      <HostFolder>{escape(str(host))}</HostFolder>\n"
+        f"      <SandboxFolder>{guest}</SandboxFolder>\n"
+        f"      <ReadOnly>{'true' if read_only else 'false'}</ReadOnly>\n"
+        "    </MappedFolder>\n"
+        for host, guest, read_only in folders
+    )
+    logon = (
+        f"  <LogonCommand>\n    <Command>{escape(logon_command)}</Command>\n  </LogonCommand>\n"
+        if logon_command else ""
+    )
     return (
         "<Configuration>\n"
         "  <Networking>Enable</Networking>\n"
@@ -81,79 +88,196 @@ def _wsb_config(in_dir: Path, out_dir: Path, git_root: Path) -> str:
         "  <AudioInput>Disable</AudioInput>\n"
         "  <VideoInput>Disable</VideoInput>\n"
         "  <MemoryInMB>8192</MemoryInMB>\n"
-        "  <MappedFolders>\n"
-        + folder(in_dir, r"C:\kd-in", True)
-        + folder(out_dir, r"C:\kd-out", False)
-        + folder(git_root, r"C:\Git", True)
-        + "  </MappedFolders>\n"
-        "  <LogonCommand>\n"
-        f"    <Command>{command}</Command>\n"
-        "  </LogonCommand>\n"
+        f"  <MappedFolders>\n{mapped}  </MappedFolders>\n"
+        f"{logon}"
         "</Configuration>\n"
     )
 
 
-def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep_files: bool) -> int:
-    if sys.platform != "win32" or not SANDBOX_EXE.is_file():
-        print("sandbox_test: Windows Sandbox is not available on this machine; skipped.")
-        return UNAVAILABLE
-    if _sandbox_running():
-        print("sandbox_test: a Windows Sandbox is already running (only one is allowed); "
-              "close it and retry. Skipped.")
-        return UNAVAILABLE
+def _checkout(repo_root: Path, sha: str, dest: Path) -> None:
+    _git("clone", "--quiet", "--no-checkout", str(repo_root), str(dest))
+    _git("checkout", "--quiet", sha, cwd=dest)
 
-    repo_root = Path(_git("rev-parse", "--show-toplevel"))
-    sha = _git("rev-parse", "--verify", f"{commit}^{{commit}}", cwd=repo_root)
-    work = Path(tempfile.mkdtemp(prefix="kd-sandbox-"))
-    in_dir, out_dir = work / "in", work / "out"
-    out_dir.mkdir(parents=True)
-    in_dir.mkdir()
 
-    _git("clone", "--quiet", "--no-checkout", str(repo_root), str(in_dir / "repo"))
-    _git("checkout", "--quiet", sha, cwd=in_dir / "repo")
-    options = {"suite": suite, "smoke": smoke, "keep_open": keep_open}
-    (in_dir / "options.json").write_text(json.dumps(options), encoding="utf-8")
-
-    wsb = work / "kd-sandbox.wsb"
-    wsb.write_text(_wsb_config(in_dir, out_dir, _git_install_root()), encoding="utf-8")
-
-    print(f"sandbox_test: testing {sha[:12]} in Windows Sandbox ({json.dumps(options)}).")
-    print(f"sandbox_test: work folder {work}; the sandbox window opens, this takes several minutes...")
-    subprocess.Popen([str(SANDBOX_EXE), str(wsb)])
-
-    result_file = out_dir / "RESULT"
-    deadline = time.monotonic() + timeout_min * 60
-    while not result_file.exists() and time.monotonic() < deadline:
-        time.sleep(10)
-
+def _print_summary(out_dir: Path) -> None:
     summary = out_dir / "summary.txt"
     if summary.exists():
         print(summary.read_text(encoding="utf-8", errors="replace"))
-    if not result_file.exists():
-        print(f"sandbox_test: no result after {timeout_min} minutes; logs in {out_dir}")
-        return 1
 
-    passed = result_file.read_text(encoding="utf-8", errors="replace").strip().endswith("PASS")
-    if passed and suite == "full" and smoke:
-        record = Path(_git("rev-parse", "--path-format=absolute", "--git-path",
-                           "kinetic-sandbox-passed", cwd=repo_root))
-        with record.open("a", encoding="utf-8") as fh:
-            fh.write(f"{sha}\n")
-    if passed and not keep_files and not keep_open:
-        time.sleep(15)  # let the sandbox shut down and release the mapped folders
-        shutil.rmtree(work, ignore_errors=True)
+
+def _record_pass(repo_root: Path, sha: str) -> None:
+    record = Path(_git("rev-parse", "--path-format=absolute", "--git-path",
+                       "kinetic-sandbox-passed", cwd=repo_root))
+    with record.open("a", encoding="utf-8") as fh:
+        fh.write(f"{sha}\n")
+
+
+# --- kept sandbox via the wsb CLI -------------------------------------------
+
+def _wsb_path() -> str | None:
+    return shutil.which("wsb")
+
+
+def _wsb(*args: str, timeout: float | None = 120) -> dict:
+    result = subprocess.run([_wsb_path(), *args, "--raw"], capture_output=True, text=True, timeout=timeout)
+    text = result.stdout.strip()
+    try:
+        return json.loads(text) if text else {}
+    except ValueError:
+        raise RuntimeError(f"wsb {args[0]} failed: {text or result.stderr.strip()}") from None
+
+
+def _running_ids() -> list[str]:
+    return [env["Id"] for env in _wsb("list").get("WindowsSandboxEnvironments", [])]
+
+
+def _kept_id() -> str:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8")).get("id", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _stop_kept() -> bool:
+    kept = _kept_id()
+    if kept and kept in _running_ids():
+        _wsb("stop", "--id", kept)
+        print(f"sandbox_test: stopped sandbox {kept}.")
+        STATE.unlink(missing_ok=True)
+        return True
+    STATE.unlink(missing_ok=True)
+    return False
+
+
+def _ensure_sandbox(fresh: bool) -> str | None:
+    """Reuse the sandbox this tool started, or start one. Always checks what is
+    running first: only one Windows Sandbox can run at a time."""
+    if fresh:
+        _stop_kept()
+    running = _running_ids()
+    kept = _kept_id()
+    if kept and kept in running:
+        print(f"sandbox_test: reusing running sandbox {kept}.")
+        return kept
+    if running:
+        print("sandbox_test: a Windows Sandbox that this tool did not start is running "
+              f"({', '.join(running)}); only one can run at a time. Close it (or "
+              "`wsb stop --id <id>`) and retry. Skipped.")
+        return None
+
+    BASE.mkdir(parents=True, exist_ok=True)
+    config = _wsb_config([(BASE, GUEST_BASE, False), (_git_install_root(), r"C:\Git", True)])
+    print("sandbox_test: starting a Windows Sandbox (kept running for later runs)...")
+    sandbox_id = _wsb("start", "-c", config).get("Id", "")
+    if not sandbox_id:
+        raise RuntimeError("wsb start did not return a sandbox id")
+    STATE.write_text(json.dumps({"id": sandbox_id, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}),
+                     encoding="utf-8")
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:  # wait for the sandbox's user session
+        try:
+            if _wsb("exec", "--id", sandbox_id, "-r", "ExistingLogin", "-c", "cmd /c exit 0",
+                    timeout=60).get("ExitCode") == 0:
+                return sandbox_id
+        except (RuntimeError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(5)
+    raise RuntimeError(f"sandbox {sandbox_id} started but its session never became ready")
+
+
+def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min: int,
+             keep_files: bool) -> tuple[int, Path | None]:
+    sandbox_id = _ensure_sandbox(fresh)
+    if not sandbox_id:
+        return UNAVAILABLE, None
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{sha[:10]}"
+    job = JOBS / name
+    job.mkdir(parents=True)
+    _checkout(repo_root, sha, job / "repo")
+    (job / "options.json").write_text(json.dumps(options), encoding="utf-8")
+    guest_job = rf"{GUEST_BASE}\jobs\{name}"
+    command = (rf"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {guest_job}\repo\scripts\sandbox_run.ps1"
+               rf" -JobDir {guest_job}")
+    try:
+        _wsb("exec", "--id", sandbox_id, "-r", "ExistingLogin", "-c", command, timeout=timeout_min * 60)
+    except subprocess.TimeoutExpired:
+        print(f"sandbox_test: no result after {timeout_min} minutes; logs in {job / 'out'}")
+        return 1, job
+    return (0 if _passed(job / "out") else 1), job
+
+
+# --- one-shot sandbox (no wsb CLI) -------------------------------------------
+
+def run_one_shot(repo_root: Path, sha: str, options: dict, timeout_min: int) -> tuple[int, Path | None]:
+    tasks = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WindowsSandboxRemoteSession.exe", "/NH"],
+                           capture_output=True, text=True).stdout
+    if "WindowsSandboxRemoteSession" in tasks:
+        print("sandbox_test: a Windows Sandbox is already running (only one is allowed); "
+              "close it and retry. Skipped.")
+        return UNAVAILABLE, None
+    work = Path(tempfile.mkdtemp(prefix="kd-sandbox-"))
+    in_dir, out_dir = work / "in", work / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+    _checkout(repo_root, sha, in_dir / "repo")
+    (in_dir / "options.json").write_text(json.dumps(options), encoding="utf-8")
+    wsb = work / "kd-sandbox.wsb"
+    command = r"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\kd-in\repo\scripts\sandbox_run.ps1"
+    wsb.write_text(_wsb_config([(in_dir, r"C:\kd-in", True), (out_dir, r"C:\kd-out", False),
+                                (_git_install_root(), r"C:\Git", True)], command), encoding="utf-8")
+    print("sandbox_test: the sandbox window opens; it closes itself when done...")
+    subprocess.Popen([str(SANDBOX_EXE), str(wsb)])
+    deadline = time.monotonic() + timeout_min * 60
+    while not (out_dir / "RESULT").exists() and time.monotonic() < deadline:
+        time.sleep(10)
+    if not (out_dir / "RESULT").exists():
+        print(f"sandbox_test: no result after {timeout_min} minutes; logs in {out_dir}")
+        return 1, work
+    time.sleep(15)  # let the sandbox shut down and release the mapped folders
+    return (0 if _passed(out_dir) else 1), work
+
+
+def _passed(out_dir: Path) -> bool:
+    _print_summary(out_dir)
+    result = out_dir / "RESULT"
+    return result.exists() and result.read_text(encoding="utf-8", errors="replace").strip().endswith("PASS")
+
+
+def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep_files: bool,
+        fresh: bool, one_shot: bool) -> int:
+    if sys.platform != "win32" or not SANDBOX_EXE.is_file():
+        print("sandbox_test: Windows Sandbox is not available on this machine; skipped.")
+        return UNAVAILABLE
+    repo_root = Path(_git("rev-parse", "--show-toplevel"))
+    sha = _git("rev-parse", "--verify", f"{commit}^{{commit}}", cwd=repo_root)
+    options = {"suite": suite, "smoke": smoke, "keep_open": keep_open}
+    print(f"sandbox_test: testing {sha[:12]} ({json.dumps(options)}).")
+
+    started = time.monotonic()
+    if _wsb_path() and not one_shot:
+        code, work = run_kept(repo_root, sha, options, fresh, timeout_min, keep_files)
     else:
-        print(f"sandbox_test: step logs are in {out_dir}")
-    print(f"sandbox_test: {'PASSED' if passed else 'FAILED'}")
-    return 0 if passed else 1
+        code, work = run_one_shot(repo_root, sha, options, timeout_min)
+    if code == UNAVAILABLE:
+        return code
+
+    if code == 0 and suite == "full" and smoke:
+        _record_pass(repo_root, sha)
+    if work and code == 0 and not keep_files:
+        shutil.rmtree(work, ignore_errors=True)
+    elif work:
+        print(f"sandbox_test: job files and logs are in {work}")
+    print(f"sandbox_test: {'PASSED' if code == 0 else 'FAILED'} in {time.monotonic() - started:.0f}s")
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Run tests for a commit on a clean Windows in Windows Sandbox, including the native "
-            "checks (.exe launchers, .ps1 scripts) that local runs defer. Default: the full suite "
-            "plus the Windows smoke checks. Exit 0 pass, 1 fail, 2 sandbox unavailable or running."
+            "Run tests for a commit on Windows in Windows Sandbox, including the native checks "
+            "(.exe launchers, .ps1 scripts) that local runs defer. Default: the full suite plus "
+            "the Windows smoke checks, in a sandbox that is kept running and reused. "
+            "Exit 0 pass, 1 fail, 2 sandbox unavailable or occupied."
         )
     )
     parser.add_argument("--commit", default="HEAD", help="Commit to test (default: HEAD)")
@@ -165,16 +289,26 @@ def main(argv: list[str] | None = None) -> int:
                             "tests.test_cli.TestCli.test_x) instead of the full suite")
     scope.add_argument("--smoke-only", action="store_true",
                        help="Only scripts/windows_smoke.ps1, no Python tests")
-    parser.add_argument("--no-smoke", action="store_true",
-                        help="Skip scripts/windows_smoke.ps1")
+    parser.add_argument("--no-smoke", action="store_true", help="Skip scripts/windows_smoke.ps1")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Stop the kept sandbox first and start a clean one")
+    parser.add_argument("--stop", action="store_true", help="Stop the kept sandbox and exit")
+    parser.add_argument("--one-shot", action="store_true",
+                        help="Use a new sandbox that closes itself after the run (the default without wsb)")
     parser.add_argument("--timeout", type=int, default=30, metavar="MIN",
                         help="Give up after this many minutes (default: 30)")
     parser.add_argument("--keep-open", action="store_true",
-                        help="Leave the sandbox running after the run, for inspection")
+                        help="One-shot mode: leave the sandbox running after the run")
     parser.add_argument("--keep-files", action="store_true",
-                        help="Keep the temporary checkout and logs even when the run passes")
+                        help="Keep the job checkout and logs even when the run passes")
     args = parser.parse_args(argv)
 
+    if args.stop:
+        if not _wsb_path():
+            parser.error("--stop needs the Windows Sandbox CLI (wsb)")
+        if not _stop_kept():
+            print("sandbox_test: no kept sandbox is running.")
+        return 0
     if args.native_only:
         suite = NATIVE_TESTS
     elif args.tests:
@@ -186,7 +320,8 @@ def main(argv: list[str] | None = None) -> int:
     smoke = not args.no_smoke
     if suite == "none" and not smoke:
         parser.error("--smoke-only and --no-smoke together leave nothing to run")
-    return run(args.commit, suite, smoke, args.timeout, args.keep_open, args.keep_files)
+    return run(args.commit, suite, smoke, args.timeout, args.keep_open, args.keep_files,
+               args.fresh, args.one_shot)
 
 
 if __name__ == "__main__":

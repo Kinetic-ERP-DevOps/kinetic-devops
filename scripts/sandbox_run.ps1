@@ -1,16 +1,28 @@
 #Requires -Version 5.1
 # sandbox_run.ps1 -- runs INSIDE Windows Sandbox; started by scripts/sandbox_test.py.
 #
-# Mapped folders: C:\kd-in (read-only: repo checkout of the commit under test and
-# options.json), C:\kd-out (writable: logs + RESULT), C:\Git (read-only: the
-# host's Git install). Installs uv, syncs, then runs what options.json asks for:
+# Two modes:
+# - Job mode (-JobDir, used with a long-lived sandbox via `wsb exec`): the job
+#   folder holds repo\ (checkout of the commit), options.json and out\.
+# - One-shot mode (no -JobDir, started as the sandbox's logon command):
+#   C:\kd-in holds repo\ and options.json, C:\kd-out receives the logs.
+# C:\Git is the host's Git install (read-only). Installs uv if missing, syncs
+# into a fresh copy of the checkout, then runs what options.json asks for:
 #   suite: "full" (tests.test_runner), "none", or a list of unittest names
 #   smoke: true/false (scripts/windows_smoke.ps1)
-# with native checks enabled. Writes C:\kd-out\RESULT (PASS/FAIL), then shuts the
-# sandbox down unless options.json has "keep_open": true.
+# with native checks enabled, and writes out\RESULT (PASS/FAIL). One-shot mode
+# then shuts the sandbox down unless options.json has "keep_open": true.
+param([string]$JobDir = "")
 
 $ErrorActionPreference = "Continue"
-$out = "C:\kd-out"
+if ($JobDir) {
+    $in = $JobDir
+    $out = Join-Path $JobDir "out"
+} else {
+    $in = "C:\kd-in"
+    $out = "C:\kd-out"
+}
+New-Item -ItemType Directory -Force $out | Out-Null
 $summary = Join-Path $out "summary.txt"
 $failed = $false
 
@@ -35,15 +47,19 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 # The sandbox has no endpoint-security agent: run the native (.exe launcher) checks.
 $env:KINETIC_NATIVE_CHECKS = "1"
-$options = Get-Content -Raw C:\kd-in\options.json | ConvertFrom-Json
+$options = Get-Content -Raw (Join-Path $in "options.json") | ConvertFrom-Json
 Add-Content -Path $summary -Value ("Options: " + ($options | ConvertTo-Json -Compress))
 
-Step "install uv" { powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex" }
 $env:PATH = "$env:USERPROFILE\.local\bin;" + $env:PATH
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Step "install uv" { powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex" }
+}
 
-# Writable copy: uv sync creates .venv inside the checkout.
+# Fresh writable copy per run (uv sync creates .venv inside it); the uv cache
+# stays warm between runs in a long-lived sandbox.
 $repo = "C:\work\kd"
-Step "copy checkout" { New-Item -ItemType Directory -Force C:\work | Out-Null; Copy-Item -Recurse -Force C:\kd-in\repo $repo }
+if (Test-Path $repo) { Remove-Item -Recurse -Force $repo }
+Step "copy checkout" { New-Item -ItemType Directory -Force C:\work | Out-Null; Copy-Item -Recurse -Force (Join-Path $in "repo") $repo }
 Set-Location $repo
 git config --global --add safe.directory '*'
 git config --global user.name "sandbox"
@@ -64,6 +80,6 @@ $result = if ($failed) { "FAIL" } else { "PASS" }
 Add-Content -Path $summary -Value ("Finished " + (Get-Date -Format s) + ": $result")
 Set-Content -Path (Join-Path $out "RESULT") -Value $result
 
-if (-not $options.keep_open) {
+if (-not $JobDir -and -not $options.keep_open) {
     shutdown.exe /s /t 5
 }
