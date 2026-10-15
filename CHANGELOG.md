@@ -17,11 +17,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - This completes the src-layout migration; its roadmap and tracker documents are removed.
 
 ### Added
+- Native checks (tests that execute uv's generated console-script `.exe` launchers) are deferred in
+  local runs and the pre-commit hook, because enterprise endpoint security (e.g. Carbon Black) may
+  block newly built unsigned files. They run in CI, in Windows Sandbox, or on request with
+  `tests.test_runner --native` / `KINETIC_NATIVE_CHECKS=1`.
+- GitHub CI job "Windows Test Gate" on `windows-latest`: the test suite plus
+  `scripts/windows_smoke.ps1` (console-script launchers, `env_init.ps1` / `env_init.bat`,
+  `install-hook.ps1`) under Windows PowerShell 5.1.
+- `scripts/sandbox_test.py`: tests a commit on a clean Windows in Windows Sandbox: the full suite plus
+  the Windows smoke checks, or `--native-only`, `--tests NAME ...`, `--smoke-only`. An optional
+  pre-push hook runs the full check when enabled with `git config kinetic.prepushSandbox true`;
+  commits that already passed are skipped.
 - CI job "Built Wheel Smoke Test": builds the sdist and wheel, checks the wheel contains only
   `kinetic_devops/`, installs it into a clean environment and, from outside the checkout, imports every
   module and starts each console script and module CLI.
 
 ### Fixed
+- `scripts/env_init.bat` was stored with LF-only line endings, which `cmd.exe` misparses;
+  `.gitattributes` now checks out `*.bat` / `*.cmd` with CRLF.
+- The branch-protection dry-run test no longer depends on the checkout's `origin` remote.
 - `auth ai-set` accepts only absolute http(s) AI base URLs with a host; embedded credentials, query
   strings and fragments are rejected. A failed `--ai-profile` selection keeps the previous profile.
 

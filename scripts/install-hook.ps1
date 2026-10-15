@@ -71,6 +71,54 @@ fi
 exit 0
 '@
 
+# Optional pre-push hook: runs scripts/sandbox_test.py (Windows Sandbox, several
+# minutes) for each pushed commit, only when opted in with
+#   git config kinetic.prepushSandbox true    (or KINETIC_PREPUSH_SANDBOX=1)
+# If the sandbox is unavailable or already running, the push continues with a warning.
+# Commits that already passed (scripts/sandbox_test.py records them) are skipped, so
+# run the test before pushing, or retry a push whose connection timed out meanwhile.
+$prePushContent = @'
+#!/bin/sh
+#
+# This file is managed by scripts/install-hook.ps1. Do not edit directly.
+
+if [ "$KINETIC_PREPUSH_SANDBOX" != "1" ] && [ "$(git config --bool kinetic.prepushSandbox 2>/dev/null)" != "true" ]; then
+    exit 0
+fi
+
+export UV_LINK_MODE=copy
+export PYTHONUTF8=1
+if [ -n "$KINETIC_HOOK_PYTHON" ]; then
+    PY="$KINETIC_HOOK_PYTHON"
+elif command -v uv >/dev/null 2>&1; then
+    PY="uv run python"
+else
+    PY="python"
+fi
+
+ZERO=0000000000000000000000000000000000000000
+TESTED=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$ZERO" ] && continue          # branch deletion
+    case " $TESTED " in *" $local_sha "*) continue ;; esac
+    TESTED="$TESTED $local_sha"
+    if grep -qx "$local_sha" "$(git rev-parse --git-path kinetic-sandbox-passed)" 2>/dev/null; then
+        echo "pre-push: $local_sha already passed the Windows Sandbox test."
+        continue
+    fi
+    echo "pre-push: Windows Sandbox test of $local_ref ($local_sha)..."
+    $PY scripts/sandbox_test.py --commit "$local_sha" </dev/null
+    status=$?
+    if [ $status -eq 2 ]; then
+        echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2
+    elif [ $status -ne 0 ]; then
+        echo "pre-push: Windows Sandbox test failed; push aborted. (Skip once with --no-verify.)" >&2
+        exit 1
+    fi
+done
+exit 0
+'@
+
 # --git-path resolves the real hooks directory: in a linked worktree .git is a
 # file, not a folder, and core.hooksPath may point somewhere else entirely.
 $hooksDir = git -C $repoRoot rev-parse --path-format=absolute --git-path hooks | Out-String -Stream
@@ -82,6 +130,9 @@ $hookFile = Join-Path $hooksDir "pre-commit"
 
 New-Item -ItemType Directory -Path $hooksDir -Force -ErrorAction SilentlyContinue | Out-Null
 Set-Content -Path $hookFile -Value $hookContent -Encoding Ascii -Force
+$prePushFile = Join-Path $hooksDir "pre-push"
+Set-Content -Path $prePushFile -Value $prePushContent -Encoding Ascii -Force
 
 Write-Host "✅ Successfully installed pre-commit hook to: $hookFile" -ForegroundColor Green
+Write-Host "✅ Installed the opt-in pre-push hook to: $prePushFile (enable: git config kinetic.prepushSandbox true)" -ForegroundColor Green
 Write-Host "This hook will now run automatically before each commit to prevent issues."

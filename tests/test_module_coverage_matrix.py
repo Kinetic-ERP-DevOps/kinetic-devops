@@ -57,6 +57,7 @@ SCRIPT_MODULE_MATRIX = {
     "pull_tax_configs.py",
     "refresh_post_db.py",
     "repo_maker.py",
+    "sandbox_test.py",
     "rename_MetaUis.py",
     "stash_dangling_commit.py",
     "stash_dangling_objects.py",

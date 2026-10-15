@@ -126,6 +126,41 @@ jobs:
           "$BIN/python" -m kinetic_devops.efx_library --help > /dev/null
           echo "console scripts and module CLIs start"
 
+  # GitHub only: Forgejo has no Windows runner. Real Windows with PowerShell 5.1,
+  # for what the Linux jobs can't see: .exe launchers, env_init.ps1/.bat, the
+  # hook installer, and Windows paths in the test suite.
+  windows-test:
+    name: Windows Test Gate (py3.12)
+    runs-on: windows-latest
+    needs: sensitive-data-gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # pwsh here: Windows PowerShell 5.1 turns a native tool's stderr output
+      # into a step failure. The smoke checks below run under 5.1 on purpose.
+      - name: Install uv and sync the locked environment
+        shell: pwsh
+        run: |
+          python -m pip install uv
+          uv sync --locked --python 3.12
+
+      - name: Run regression suite
+        shell: pwsh
+        run: uv run python -m tests.test_runner
+
+      - name: Windows smoke checks (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\scripts\windows_smoke.ps1
+
   efx-syntax-check-tool-build:
     name: EFx Syntax Check Tool Build
     runs-on: ubuntu-latest

@@ -47,21 +47,54 @@ uv run python tests/test_runner.py
 ```
 
 - The test runner validates the environment, discovers tests under `tests/`, and writes results to `tests/test_results.log`.
-- CI invokes the test runner via `python -m tests.test_runner`.
+- CI invokes the test runner via `uv run python -m tests.test_runner` (Linux on GitHub and Forgejo, plus `windows-latest` on GitHub).
 
 ---
 
-## Pre-commit Hooks
+## Git Hooks
 
-Install the repo-tracked pre-commit hook locally (PowerShell):
+Install the hooks once per clone (PowerShell):
 
 ```powershell
-Copy-Item scripts\hooks\pre-commit .git\hooks\pre-commit
-# or configure Git to use the repo hooks directory
-git config core.hooksPath scripts/hooks
+.\scripts\install-hook.ps1
 ```
 
-The hook runs a blocking sensitive-data scan on staged content and then `python -m tests.test_runner` before each commit.
+- **pre-commit** (always on): a blocking sensitive-data scan of the staged content, then the test
+  suite with native checks deferred (see below). It runs through `uv run`.
+- **pre-push** (opt-in): tests each pushed commit on a clean Windows in Windows Sandbox
+  (`scripts/sandbox_test.py`, several minutes). Enable with `git config kinetic.prepushSandbox true`.
+  If the sandbox is unavailable or already running, the push continues with a warning. Commits that
+  already passed are skipped, so you can run `uv run python scripts/sandbox_test.py` before pushing.
+
+### Native checks and enterprise endpoint security (Carbon Black and similar)
+
+Managed Windows machines may block or kill **newly built or edited unsigned code**: the console-script
+launchers uv writes (`.venv\Scripts\kinetic-devops.exe` and friends) and new or recently edited
+`.ps1` files. Symptoms: "Access denied" when running a script, a launcher killed mid-run, or a file
+briefly locked right after it is written. `uv run` itself is fine and remains the way to run everything.
+
+So the checks that execute that native code are **deferred** on a development machine, never dropped:
+
+- Local test runs and the pre-commit hook skip them (the same commands are still covered via
+  `python -m`), so development is never blocked.
+- CI always runs them (`CI=true`), including GitHub's `windows-latest` job.
+- Windows Sandbox runs them on demand: `uv run python scripts/sandbox_test.py` (full suite plus smoke
+  checks), `--native-only` (just the deferred checks), `--tests NAME ...` (a subset), `--smoke-only`.
+- Run them on this machine intentionally, e.g. while getting the files approved by your security
+  team: `uv run python -m tests.test_runner --native` and `.\scripts\windows_smoke.ps1`
+  (or `KINETIC_NATIVE_CHECKS=1` for any run).
+
+If running `install-hook.ps1` is blocked, the hooks can still be installed: they are the two `sh`
+scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushContent` ->
+`.git/hooks/pre-push`).
+
+## Windows Checks
+
+- `scripts/windows_smoke.ps1`: the Windows-only checks (console-script launchers, `env_init.ps1` and
+  `env_init.bat`, `install-hook.ps1`). Run it from the repo root of a throwaway checkout after
+  `uv sync`. GitHub's `windows-latest` CI job runs it on every pull request.
+- `scripts/sandbox_test.py`: runs the test suite and the smoke checks for a commit on a clean Windows
+  in Windows Sandbox (no endpoint-security agent). Exit 0 pass, 1 fail, 2 sandbox unavailable.
 
 ## Branch Protection Automation (GitHub + Forgejo)
 

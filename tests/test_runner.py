@@ -162,5 +162,16 @@ if __name__ == '__main__':
         action="store_true",
         help="Run environment validation only"
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help=(
+            "Also run the checks that execute generated native code (console-script .exe "
+            "launchers). Local runs defer them by default because endpoint security may "
+            "block newly built unsigned files; CI and scripts/sandbox_test.py always run them."
+        ),
+    )
     args = parser.parse_args()
+    if args.native:
+        os.environ["KINETIC_NATIVE_CHECKS"] = "1"
     sys.exit(run_tests(validate_only=args.validate))
