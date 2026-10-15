@@ -54,6 +54,7 @@ BASE = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "kinetic-de
 STATE = BASE / "sandbox.json"
 JOBS = BASE / "jobs"
 GUEST_BASE = r"C:\kd-jobs"
+WORKING_TREE = ":working-tree:"
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -297,7 +298,12 @@ def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep
         print("sandbox_test: Windows Sandbox is not available on this machine; skipped.")
         return UNAVAILABLE
     repo_root = Path(_git("rev-parse", "--show-toplevel"))
-    sha = _git("rev-parse", "--verify", f"{commit}^{{commit}}", cwd=repo_root)
+    if commit == WORKING_TREE:
+        # Snapshot tracked changes as an unreferenced commit; the working tree,
+        # index and stash list are untouched. Clean tree -> HEAD.
+        sha = _git("stash", "create", cwd=repo_root) or _git("rev-parse", "HEAD", cwd=repo_root)
+    else:
+        sha = _git("rev-parse", "--verify", f"{commit}^{{commit}}", cwd=repo_root)
     options = {"suite": suite, "smoke": smoke, "keep_open": keep_open}
     print(f"sandbox_test: testing {sha[:12]} ({json.dumps(options)}).")
 
@@ -309,7 +315,7 @@ def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep
     if code == UNAVAILABLE:
         return code
 
-    if code == 0 and suite == "full" and smoke:
+    if code == 0 and suite == "full" and smoke and commit != WORKING_TREE:
         _record_pass(repo_root, sha)
     if work and code == 0 and not keep_files:
         shutil.rmtree(work, ignore_errors=True)
@@ -328,7 +334,10 @@ def main(argv: list[str] | None = None) -> int:
             "A running sandbox it doesn't know is adopted. Exit 0 pass, 1 fail, 2 sandbox unavailable."
         )
     )
-    parser.add_argument("--commit", default="HEAD", help="Commit to test (default: HEAD)")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--commit", default="HEAD", help="Commit to test (default: HEAD)")
+    target.add_argument("--working-tree", action="store_true",
+                        help="Test uncommitted changes to tracked files (untracked files are not included)")
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--native-only", action="store_true",
                        help=f"Only the deferred native checks: {' '.join(NATIVE_TESTS)} plus the smoke checks")
@@ -368,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
     smoke = not args.no_smoke
     if suite == "none" and not smoke:
         parser.error("--smoke-only and --no-smoke together leave nothing to run")
-    return run(args.commit, suite, smoke, args.timeout, args.keep_open, args.keep_files,
+    return run(WORKING_TREE if args.working_tree else args.commit, suite, smoke, args.timeout, args.keep_open, args.keep_files,
                args.fresh, args.one_shot)
 
 

@@ -43,13 +43,19 @@ foreach ($tool in @("kinetic-devops", "repomaker", "reposmith", "repo-maker")) {
     Check "$tool --help" ($r.Code -eq 0) $r.Text
 }
 
+# env_init.py exits with "Could not import 'kinetic_devops'" before doing anything
+# else, so either of its later messages is positive evidence the import worked:
+# the unknown-environment notice, or the prompt failing on end-of-input (no
+# environment is stored here and stdin is empty).
+$importedSignal = "Environment 'smoke-env' not recognized|PYTHON CRASH: EOF when reading a line"
+
 # 3. env_init.bat: cmd.exe must parse the whole file (LF-only line endings
 #    scramble it). No Kinetic environment is stored here, so it stops at the
 #    environment prompt; reaching Python is the success signal.
 $r = Run "cmd.exe" @("/c", "scripts\env_init.bat smoke-env < NUL")
 $scrambled = $r.Text -match "is not recognized as an internal or external command|was unexpected at this time"
 Check "env_init.bat parses" (-not $scrambled -and $r.Text -match "Target:") $r.Text
-Check "env_init.bat imports kinetic_devops" ($r.Text -notmatch "Could not import 'kinetic_devops'") $r.Text
+Check "env_init.bat imports kinetic_devops" ($r.Text -match $importedSignal) $r.Text
 
 # 4. env_init.ps1 (dot-sourced in a child Windows PowerShell 5.1): activates
 #    .venv, imports the package without PYTHONPATH.
@@ -59,9 +65,11 @@ try { . .\scripts\env_init.ps1 smoke-env *>&1 | ForEach-Object { "$_" } } catch 
 "VIRTUAL_ENV=$env:VIRTUAL_ENV"
 "PYTHONPATH=$env:PYTHONPATH"
 '@
-$r = Run "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $probe)
+# -EncodedCommand: Windows PowerShell 5.1 mangles double quotes inside native-command arguments.
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+$r = Run "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded)
 Check "env_init.ps1 activates .venv" ($r.Text -match "VIRTUAL_ENV=.*\.venv") $r.Text
-Check "env_init.ps1 imports kinetic_devops" ($r.Text -notmatch "Could not import 'kinetic_devops'") $r.Text
+Check "env_init.ps1 imports kinetic_devops" ($r.Text -match $importedSignal) $r.Text
 Check "env_init.ps1 leaves PYTHONPATH unset" ($r.Text -match "(?m)^PYTHONPATH=$") $r.Text
 
 # 5. install-hook.ps1 writes a hook that points worktree runs at src/.
