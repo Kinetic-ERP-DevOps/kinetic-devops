@@ -86,10 +86,13 @@ So the checks that execute that native code are **deferred** on a development ma
   team: `uv run python -m tests.test_runner --native` and `.\scripts\windows_smoke.ps1`
   (or `KINETIC_NATIVE_CHECKS=1` for any run).
 
-Endpoint security also costs time. On one managed machine the same suite took 112-121 s locally and
-56 s in Windows Sandbox on the same hardware; the gap sat in tests that start Python processes
-(about 3x) and git/file-heavy tests (about 1.6x). On such machines, prefer the kept sandbox for full
-local runs: `uv run python scripts/sandbox_test.py --working-tree`.
+Endpoint security also costs time. On one managed machine (freshly rebooted, nothing else running)
+the same suite, same commit and hardware, took 67 s natively, 21 s in the kept Windows Sandbox and
+9 s in WSL; over the tests that ran everywhere, native was 4x slower than the sandbox, most of all in
+tests that start Python processes (5-7x) and git/file-heavy tests (about 3x). Machine state matters
+too: before a reboot every environment there ran 2-4x slower. On such machines, prefer the kept
+sandbox for full local runs: `uv run python scripts/sandbox_test.py --working-tree`, and compare with
+`scripts/run_timings.py`.
 
 If running `install-hook.ps1` is blocked, the hooks can still be installed: they are the two `sh`
 scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushContent` ->
