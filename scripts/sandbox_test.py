@@ -35,6 +35,7 @@ opt-in pre-push hook skips those, so you can test ahead of a push.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -268,6 +269,48 @@ def _ensure_sandbox(fresh: bool) -> str | None:
     return sandbox_id
 
 
+# Runs in the sandbox for each job (passed as -EncodedCommand, so no quoting
+# issues and no script file on the host). Git comes from MinGit installed on the
+# sandbox's own disk -- once per sandbox, from a zip cached in the shared job
+# folder -- so git-heavy tests don't load git.exe from the host for every call.
+# The host's Git (mapped read-only) stays as fallback and provides `sh` for hooks.
+_JOB_BOOTSTRAP = r"""
+$ErrorActionPreference = 'Continue'
+$mingit = 'C:\tools\mingit\cmd\git.exe'
+if (-not (Test-Path $mingit)) {
+    try {
+        $zip = '__BASE__\cache\MinGit-64-bit.zip'
+        if (-not (Test-Path $zip)) {
+            New-Item -ItemType Directory -Force (Split-Path $zip) | Out-Null
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $release = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers @{ 'User-Agent' = 'kinetic-devops-sandbox-test' }
+            $asset = $release.assets | Where-Object { $_.name -match '^MinGit-[0-9.]+-64-bit\.zip$' } | Select-Object -First 1
+            Invoke-WebRequest $asset.browser_download_url -OutFile "$zip.part" -UseBasicParsing
+            Move-Item -Force "$zip.part" $zip
+        }
+        Expand-Archive -Force $zip 'C:\tools\mingit'
+    } catch {
+        Write-Output "MinGit unavailable, using the host's Git: $_"
+    }
+}
+$env:PATH = 'C:\tools\mingit\cmd;C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin;' + $env:PATH
+if (Test-Path 'C:\work\kd') { Remove-Item -Recurse -Force 'C:\work\kd' }
+git init -q 'C:\work\kd'
+git -C 'C:\work\kd' fetch -q '__JOB__\repo.bundle' '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
+git -C 'C:\work\kd' checkout -q --detach '__SHA__'
+if ($LASTEXITCODE -ne 0) { exit 1 }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\work\kd\scripts\sandbox_run.ps1' -JobDir '__JOB__'
+exit $LASTEXITCODE
+"""
+
+
+def _job_command(guest_job: str, sha: str) -> str:
+    script = (_JOB_BOOTSTRAP.replace("__BASE__", GUEST_BASE).replace("__JOB__", guest_job)
+              .replace("__SHA__", sha))
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+
+
 def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min: int,
              keep_files: bool) -> tuple[int, Path | None]:
     sandbox_id = _ensure_sandbox(fresh)
@@ -282,15 +325,7 @@ def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min:
     _bundle(repo_root, sha, job / "repo.bundle")
     (job / "options.json").write_text(json.dumps(options), encoding="utf-8")
     guest_job = rf"{GUEST_BASE}\jobs\{name}"
-    command = (
-        r"cmd /c set PATH=C:\Git\cmd;C:\kd-git\cmd;%PATH%"
-        r"&& (if exist C:\work\kd rmdir /s /q C:\work\kd)"
-        r"&& git init -q C:\work\kd"
-        rf"&& git -C C:\work\kd fetch -q {guest_job}\repo.bundle +refs/kinetic-sandbox/*:refs/kinetic-sandbox/*"
-        rf"&& git -C C:\work\kd checkout -q --detach {sha}"
-        r"&& powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\work\kd\scripts\sandbox_run.ps1"
-        rf" -JobDir {guest_job}"
-    )
+    command = _job_command(guest_job, sha)
     try:
         _wsb("exec", "--id", sandbox_id, "-r", "System", "-c", command, timeout=timeout_min * 60)
     except subprocess.TimeoutExpired:

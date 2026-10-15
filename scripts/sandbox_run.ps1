@@ -44,8 +44,11 @@ function Step([string]$name, [scriptblock]$body) {
 }
 
 Set-Content -Path $summary -Value ("Windows Sandbox run started " + (Get-Date -Format s))
-# Host Git: C:\Git when mapped at start, C:\kd-git when shared into an adopted sandbox.
-$env:PATH = "C:\Git\cmd;C:\Git\usr\bin;C:\kd-git\cmd;C:\kd-git\usr\bin;" + $env:PATH
+# Git: MinGit on the sandbox's own disk when sandbox_test.py installed it (kept
+# sandbox), else the host's Git -- C:\Git when mapped at start, C:\kd-git when
+# shared into an adopted sandbox. The host's usr\bin provides `sh` for git hooks.
+$env:PATH = "C:\tools\mingit\cmd;C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin;" + $env:PATH
+Add-Content -Path $summary -Value ("git: " + (Get-Command git -ErrorAction SilentlyContinue).Source)
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 # The sandbox has no endpoint-security agent: run the native (.exe launcher) checks.
