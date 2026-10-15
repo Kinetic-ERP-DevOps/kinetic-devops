@@ -104,6 +104,20 @@ def _checkout(repo_root: Path, sha: str, dest: Path) -> None:
     _git("checkout", "--quiet", sha, cwd=dest)
 
 
+def _bundle(repo_root: Path, sha: str, dest: Path) -> None:
+    """Write `sha` (and its history) to a git bundle file. Bundles carry refs, so
+    point a temporary ref under refs/kinetic-sandbox/ at the commit (it may be an
+    unreferenced `git stash create` commit) and remove it again. `git clone`
+    from a bundle only takes branches and tags, so the sandbox fetches
+    refs/kinetic-sandbox/* explicitly."""
+    ref = f"refs/kinetic-sandbox/{os.getpid()}"
+    _git("update-ref", ref, sha, cwd=repo_root)
+    try:
+        _git("bundle", "create", str(dest), ref, cwd=repo_root)
+    finally:
+        _git("update-ref", "-d", ref, cwd=repo_root)
+
+
 def _print_summary(out_dir: Path) -> None:
     summary = out_dir / "summary.txt"
     if summary.exists():
@@ -242,11 +256,21 @@ def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min:
     name = f"{time.strftime('%Y%m%d-%H%M%S')}-{sha[:10]}"
     job = JOBS / name
     job.mkdir(parents=True)
-    _checkout(repo_root, sha, job / "repo")
+    # One bundle file instead of a checkout: writing ~1000 files here, where
+    # endpoint security scans each one, took ~25 s; the bundle takes ~3 s, and
+    # no .ps1 file is written on this machine. The sandbox clones it locally.
+    _bundle(repo_root, sha, job / "repo.bundle")
     (job / "options.json").write_text(json.dumps(options), encoding="utf-8")
     guest_job = rf"{GUEST_BASE}\jobs\{name}"
-    command = (rf"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {guest_job}\repo\scripts\sandbox_run.ps1"
-               rf" -JobDir {guest_job}")
+    command = (
+        r"cmd /c set PATH=C:\Git\cmd;C:\kd-git\cmd;%PATH%"
+        r"&& (if exist C:\work\kd rmdir /s /q C:\work\kd)"
+        r"&& git init -q C:\work\kd"
+        rf"&& git -C C:\work\kd fetch -q {guest_job}\repo.bundle +refs/kinetic-sandbox/*:refs/kinetic-sandbox/*"
+        rf"&& git -C C:\work\kd checkout -q --detach {sha}"
+        r"&& powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\work\kd\scripts\sandbox_run.ps1"
+        rf" -JobDir {guest_job}"
+    )
     try:
         _wsb("exec", "--id", sandbox_id, "-r", "System", "-c", command, timeout=timeout_min * 60)
     except subprocess.TimeoutExpired:
