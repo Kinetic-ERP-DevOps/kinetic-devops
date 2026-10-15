@@ -65,6 +65,15 @@ class TestCompareTimings(unittest.TestCase):
         report = compare_timings.report(runs, None, 5)
         self.assertIn("runs come from different commits", report)
 
+    def test_failure_is_not_outvoted_by_skips_and_keeps_its_message(self):
+        _write_run(self.dir, "x-r1", "x", {"a": ("skipped", 0.0, "deferred")})
+        _write_run(self.dir, "x-r2", "x", {"a": ("skipped", 0.0, "deferred")})
+        _write_run(self.dir, "x-r3", "x", {"a": ("failed", 1.0, "AssertionError: real problem")})
+        run = compare_timings.collect([str(self.dir)])[0]
+        status, _, message = run.tests["tests.test_mod.TestX.a"]
+        self.assertEqual((status, message), ("failed", "AssertionError: real problem"))
+        self.assertEqual(run.count("failed"), 1)
+
     def test_busy_start_is_flagged(self):
         _write_run(self.dir, "quiet", "quiet", {"a": ("passed", 1.0)}, cpu_busy_start=5.0)
         _write_run(self.dir, "busy", "busy", {"a": ("passed", 1.0)}, cpu_busy_start=80.0)

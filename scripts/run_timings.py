@@ -130,6 +130,11 @@ def run_sandbox(xml: Path, sha: str) -> str:
                 extras=["native checks", "windows smoke checks", "bundle transfer + uv sync"])
     meta.write_text(json.dumps(data, indent=2), encoding="utf-8")
     _stamp_vm(meta, busy)
+    if code != 0:
+        # The timing record is kept, but the Windows smoke checks run outside
+        # pytest, so the JUnit report can't show their failure -- say it here.
+        return (f"FAILED (sandbox exit {code}: test suite or Windows smoke checks failed; "
+                "timing record kept, see the sandbox job logs)")
     return "ok"
 
 

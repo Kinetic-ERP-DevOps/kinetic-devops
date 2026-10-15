@@ -130,13 +130,19 @@ def combine(runs: list[Run]) -> list[Run]:
         for test in set().union(*(r.tests for r in group)):
             results = [r.tests[test] for r in group if test in r.tests]
             statuses = {status for status, _, _ in results}
-            if len(statuses) == 1:
-                status = results[0][0]
-            elif statuses & {"failed", "error"} and "passed" in statuses:
+            bad = statuses & {"failed", "error"}
+            if bad and "passed" in statuses:
                 status = "flaky"  # passed in some repeats, failed in others
+            elif bad:
+                # Never let skips outvote a failure: no repeat passed.
+                status = "error" if "error" in bad else "failed"
+            elif "passed" in statuses:
+                status = "passed"  # ran and passed at least once, never failed
             else:
-                status = max(statuses, key=lambda st: sum(1 for r in results if r[0] == st))
-            message = next((m for st, _, m in results if st != "passed" and m), "")
+                status = results[0][0]
+            # A failure's diagnostic beats a skip reason.
+            message = next((m for st, _, m in results if st in ("failed", "error") and m), "") or next(
+                (m for st, _, m in results if st != "passed" and m), "")
             merged.tests[test] = (status, statistics.median(t for _, t, _ in results), message)
         combined.append(merged)
     return combined
