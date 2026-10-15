@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module and starts each console script and module CLI.
 
 ### Fixed
+- Removed `[tool.uv] compile-bytecode` (added in 0.1.0a7): it made every `uv run` recompile all
+  installed packages (~4 s each time), and on machines with endpoint security those cache writes
+  intermittently failed ("user-mapped section open", os error 1224). Python caches bytecode on first
+  import anyway.
 - `scripts/env_init.bat` was stored with LF-only line endings, which `cmd.exe` misparses;
   `.gitattributes` now checks out `*.bat` / `*.cmd` with CRLF.
 - The branch-protection dry-run test no longer depends on the checkout's `origin` remote.

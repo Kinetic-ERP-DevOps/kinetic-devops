@@ -67,8 +67,3 @@ norecursedirs = [
     "*.egg-info",
 ]
 addopts = "--strict-markers --disable-warnings"
-
-[tool.uv]
-# Pre-compile installed dependencies to bytecode during install/sync, so the
-# first run after setup does not pay to compile them (e.g. keyring, requests).
-compile-bytecode = true
