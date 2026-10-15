@@ -63,8 +63,10 @@ Install the hooks once per clone (PowerShell):
   suite with native checks deferred (see below). It runs through `uv run`.
 - **pre-push** (opt-in): tests each pushed commit on a clean Windows in Windows Sandbox
   (`scripts/sandbox_test.py`, several minutes). Enable with `git config kinetic.prepushSandbox true`.
-  If the sandbox is unavailable or already running, the push continues with a warning. Commits that
-  already passed are skipped, so you can run `uv run python scripts/sandbox_test.py` before pushing.
+  Without Windows Sandbox (not every developer has it) the check is skipped with a warning and the
+  push continues. `KINETIC_PREPUSH_SANDBOX=0` skips it for one push even when enabled (`=1` runs it
+  once without enabling it). Commits that already passed are skipped, so you can run
+  `uv run python scripts/sandbox_test.py` before pushing.
 
 ### Native checks and enterprise endpoint security (Carbon Black and similar)
 

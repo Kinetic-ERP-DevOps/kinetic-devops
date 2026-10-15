@@ -82,9 +82,14 @@ $prePushContent = @'
 #
 # This file is managed by scripts/install-hook.ps1. Do not edit directly.
 
-if [ "$KINETIC_PREPUSH_SANDBOX" != "1" ] && [ "$(git config --bool kinetic.prepushSandbox 2>/dev/null)" != "true" ]; then
-    exit 0
-fi
+# KINETIC_PREPUSH_SANDBOX=0 skips this check for one push even when enabled;
+# =1 runs it once without enabling it. Without Windows Sandbox the check is
+# skipped with a warning (sandbox_test.py exit code 2).
+case "$KINETIC_PREPUSH_SANDBOX" in
+    0) exit 0 ;;
+    1) ;;
+    *) [ "$(git config --bool kinetic.prepushSandbox 2>/dev/null)" = "true" ] || exit 0 ;;
+esac
 
 export UV_LINK_MODE=copy
 export PYTHONUTF8=1
