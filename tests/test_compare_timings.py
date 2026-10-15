@@ -74,6 +74,13 @@ class TestCompareTimings(unittest.TestCase):
         self.assertEqual((status, message), ("failed", "AssertionError: real problem"))
         self.assertEqual(run.count("failed"), 1)
 
+    def test_skipped_repeats_do_not_shrink_a_passing_median(self):
+        _write_run(self.dir, "x-r1", "x", {"a": ("skipped", 0.0, "deferred")})
+        _write_run(self.dir, "x-r2", "x", {"a": ("skipped", 0.0, "deferred")})
+        _write_run(self.dir, "x-r3", "x", {"a": ("passed", 9.0)})
+        status, seconds, _ = compare_timings.collect([str(self.dir)])[0].tests["tests.test_mod.TestX.a"]
+        self.assertEqual((status, seconds), ("passed", 9.0))
+
     def test_busy_start_is_flagged(self):
         _write_run(self.dir, "quiet", "quiet", {"a": ("passed", 1.0)}, cpu_busy_start=5.0)
         _write_run(self.dir, "busy", "busy", {"a": ("passed", 1.0)}, cpu_busy_start=80.0)

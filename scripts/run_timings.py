@@ -230,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
         sha = sandbox_test.snapshot_working_tree(repo_root)
     else:
         sha = _git("rev-parse", "--verify", f"{args.commit}^{{commit}}", cwd=repo_root)
-    out_dir = args.out or repo_root / "temp" / "timings" / sha[:12]
+    # Absolute from the start: subprocesses (pytest, git bundle) run from the
+    # repo root, so a caller-relative --out must not be reinterpreted there.
+    out_dir = (args.out.resolve() if args.out else repo_root / "temp" / "timings" / sha[:12])
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"run_timings: commit {sha[:12]}; records in {out_dir}")
 
@@ -269,6 +271,17 @@ def main(argv: list[str] | None = None) -> int:
             runners["alpine"] = lambda xml, d=distro: run_alpine(repo_root, xml, sha, d)
         else:
             status["alpine"] = f"skipped: {note}"
+
+    # The report reads every record in the folder, so remove this tool's
+    # earlier records for the environments being rerun (e.g. an old -r3 series
+    # from a previous --repeat 3). Anything else -- e.g. downloaded CI
+    # records -- is kept.
+    for env in runners:
+        label = LABELS[env]
+        for old in list(out_dir.glob(f"{label}.*")) + list(out_dir.glob(f"{label}-r*.*")):
+            if old.suffix in (".xml", ".json", ".bundle") and re.fullmatch(
+                    rf"{re.escape(label)}(-r\d+)?", old.stem):
+                old.unlink(missing_ok=True)
 
     for n in range(1, args.repeat + 1):
         for env, runner in runners.items():

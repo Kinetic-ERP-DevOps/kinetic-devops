@@ -116,7 +116,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
     echo "pre-push: Windows Sandbox test of $local_ref ($local_sha)..."
-    run_python scripts/sandbox_test.py --commit "$local_sha" </dev/null
+    # Git exports GIT_DIR and friends to hooks; in a linked worktree GIT_DIR is
+    # absolute, so git commands the helper runs in its own clones would act on
+    # this worktree. Clear them for the helper (like the pre-commit runner does).
+    (
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+              GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+        run_python scripts/sandbox_test.py --commit "$local_sha" </dev/null
+    )
     status=$?
     if [ $status -eq 2 ]; then
         echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2

@@ -143,7 +143,11 @@ def combine(runs: list[Run]) -> list[Run]:
             # A failure's diagnostic beats a skip reason.
             message = next((m for st, _, m in results if st in ("failed", "error") and m), "") or next(
                 (m for st, _, m in results if st != "passed" and m), "")
-            merged.tests[test] = (status, statistics.median(t for _, t, _ in results), message)
+            # Time from executions only: a ~0 s skip says nothing about how long
+            # the test takes. Skipped durations count only if every repeat skipped.
+            executed = [t for st, t, _ in results if st != "skipped"]
+            seconds = statistics.median(executed or [t for _, t, _ in results])
+            merged.tests[test] = (status, seconds, message)
         combined.append(merged)
     return combined
 

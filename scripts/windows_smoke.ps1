@@ -74,7 +74,10 @@ try { . .\scripts\env_init.ps1 smoke-env *>&1 | ForEach-Object { "$_" } } catch 
 '@
 # -EncodedCommand: Windows PowerShell 5.1 mangles double quotes inside native-command arguments.
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
-$r = Run "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded)
+# Through cmd with `< NUL`, like the .bat probe: env_init.py prompts for an
+# environment, and from an interactive session an inherited stdin would wait
+# for the user instead of hitting end-of-input.
+$r = Run "cmd.exe" @("/c", "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded < NUL")
 Check "env_init.ps1 activates .venv" ($r.Text -match "VIRTUAL_ENV=.*\.venv") $r.Text
 Check "env_init.ps1 imports kinetic_devops" ($r.Text -match $importedSignal) $r.Text
 Check "env_init.ps1 leaves PYTHONPATH unset" ($r.Text -match "(?m)^PYTHONPATH=$") $r.Text

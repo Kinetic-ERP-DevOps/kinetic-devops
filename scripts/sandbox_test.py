@@ -51,8 +51,9 @@ from xml.sax.saxutils import escape
 
 SANDBOX_EXE = Path(r"C:\Windows\System32\WindowsSandbox.exe")
 UNAVAILABLE = 2
-# The suite's tests that execute generated launchers (deferred locally).
-NATIVE_TESTS = ["tests.test_cli"]
+# The suite's native checks (deferred locally): tests that execute generated
+# launchers or load newly installed native libraries.
+NATIVE_TESTS = ["tests.test_cli", "tests.test_auth_rename.TestEncryptedVault"]
 # Host folder shared read-write with the kept sandbox as C:\kd-jobs.
 BASE = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "kinetic-devops" / "sandbox"
 STATE = BASE / "sandbox.json"
