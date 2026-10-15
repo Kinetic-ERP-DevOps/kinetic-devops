@@ -20,10 +20,6 @@ import zipfile
 import base64
 import requests
 
-repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
-
 from kinetic_devops.auth import KineticConfigManager
 
 # Common keys used in Kinetic/Epicor for stringified payloads

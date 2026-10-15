@@ -7,11 +7,11 @@
 # 1. Activates a Python venv (if provided)
 # 2. Calls scripts/env_init.py to resolve stored Kinetic configuration
 # 3. Generates and dot-sources a randomized temp .ps1 file to set environment variables
-# 4. Sets PYTHONPATH so helper scripts can import the kinetic_devops package
+# The kinetic_devops package comes from the uv environment (`uv sync`), not PYTHONPATH.
 #
 param(
     [string]$EnvName = "",
-    [string]$VenvPath = "venv",
+    [string]$VenvPath = ".venv",
     [string]$TaxConfigDb = ""
 )
 
@@ -26,15 +26,7 @@ if (Test-Path "$VenvPath\Scripts\Activate.ps1") {
     Write-Host "Python venv: $VenvPath"
     & "$VenvPath\Scripts\Activate.ps1"
 } else {
-    Write-Host "No venv at '$VenvPath', using system Python."
-}
-
-# 3. Prepend repo root to PYTHONPATH so the helper scripts can import kinetic_devops,
-#    without discarding any existing entries.
-if ($env:PYTHONPATH) {
-    $env:PYTHONPATH = "$rootDir$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
-} else {
-    $env:PYTHONPATH = $rootDir
+    Write-Host "No venv at '$VenvPath' (run 'uv sync'), using system Python."
 }
 
 # Optional local AI settings live in a separate, ignored file.
@@ -96,4 +88,4 @@ if ($batEnvFile -and (Test-Path $batEnvFile)) {
     Remove-Item -Force $batEnvFile -ErrorAction SilentlyContinue | Out-Null
 }
 
-Write-Host "Environment initialized with PYTHONPATH set to $rootDir"
+Write-Host "Environment initialized."

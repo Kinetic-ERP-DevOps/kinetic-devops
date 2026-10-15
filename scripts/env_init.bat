@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 :: 1. SET DEFAULTS
 set "ENV_NAME=dev"
-set "VENV_PATH=venv"
+set "VENV_PATH=.venv"
 set "TAXCONFIG_DB="
 
 :: 2. EVALUATE ARGUMENT 1
@@ -35,7 +35,7 @@ if exist "!VENV_PATH!\Scripts\activate.bat" (
     echo 🐍 Venv: !VENV_PATH!
     call "!VENV_PATH!\Scripts\activate.bat"
 ) else (
-    echo ℹ️ No venv at "!VENV_PATH!", using system Python.
+    echo ℹ️ No venv at "!VENV_PATH!" ^(run uv sync^), using system Python.
 )
 
 :: 5. EXECUTION

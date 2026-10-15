@@ -1,18 +1,11 @@
 """
 kinetic_devops/cli/test_runner.py - Test runner entry point for the Kinetic SDK.
 
-Invokable as:
-    uv run kinetic-test
-    python -m kinetic_devops.cli.test_runner
-    python kinetic_devops/cli/test_runner.py
+Run from the repository root, so the ``tests`` package is importable:
+    uv run python -m kinetic_devops.cli.test_runner
 """
 import sys
 from pathlib import Path
-
-# Resolve repository root: cli/ -> kinetic_devops/ -> repo root.
-_repo_root = Path(__file__).resolve().parent.parent.parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
 
 try:
     from tests import test_runner as suite_runner
@@ -26,7 +19,8 @@ def run_tests() -> int:
     """Delegate to the canonical test runner implementation under tests/."""
     if suite_runner is None:
         print(
-            f"[FATAL] Unable to import tests.test_runner from repository root '{_repo_root}': {_runner_import_error}",
+            f"[FATAL] Unable to import tests.test_runner from '{Path.cwd()}' (run from the repository root): "
+            f"{_runner_import_error}",
             file=sys.stderr,
         )
         return 1

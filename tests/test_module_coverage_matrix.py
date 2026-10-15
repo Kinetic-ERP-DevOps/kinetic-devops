@@ -72,7 +72,7 @@ class TestModuleCoverageMatrix(unittest.TestCase):
         cls.repo_root = Path(__file__).resolve().parents[1]
 
     def test_package_matrix_matches_repo_modules(self):
-        package_dir = self.repo_root / "kinetic_devops"
+        package_dir = self.repo_root / "src" / "kinetic_devops"
         discovered = {
             path.stem
             for path in package_dir.glob("*.py")

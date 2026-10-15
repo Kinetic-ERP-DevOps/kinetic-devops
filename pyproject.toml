@@ -38,8 +38,8 @@ reposmith = "kinetic_devops.repomaker.reposmith:main"
 include-package-data = true
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["kinetic_devops*"]
-exclude = ["tests*", "Documents*", "exports*", "projects*", "temp*"]
 
 [dependency-groups]
 dev = [

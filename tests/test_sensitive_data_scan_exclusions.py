@@ -11,8 +11,6 @@ from unittest.mock import patch
 
 from kinetic_devops.find_sensitive_data import get_files_to_scan, scan_git_history, _should_report_generic_base64
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
 
 class _FakePopen:
     def __init__(self, lines):
@@ -131,9 +129,6 @@ class TestSensitiveDataScanExclusions(unittest.TestCase):
                 **os.environ,
                 "PYTHONUTF8": "1",
                 "PYTHONIOENCODING": "utf-8",
-                "PYTHONPATH": os.pathsep.join(
-                    filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH", "")])
-                ),
             },
             timeout=60,
         )

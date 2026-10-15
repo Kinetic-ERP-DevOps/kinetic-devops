@@ -1,6 +1,6 @@
 #!/bin/sh
 # --- ARGUMENT PARSING ---
-VENV_PATH="venv"
+VENV_PATH=".venv"
 FORCE_RUN_FLAG="${ENV_INIT_FORCE_RUN}"
 
 # POSIX-compliant flag and argument parsing

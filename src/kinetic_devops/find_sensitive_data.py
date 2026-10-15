@@ -234,7 +234,8 @@ SUPPRESS_MARKER = "kd-sensitive-scan-ignore-line"
 
 KNOWN_PATTERN_FALSE_POSITIVES: Dict[str, set] = {
     "PRIVATE_KEY_BLOCK": {
-        "kinetic_devops/find_sensitive_data.py",
+        "src/kinetic_devops/find_sensitive_data.py",
+        "kinetic_devops/find_sensitive_data.py",  # path before the src/ layout, still in history
         "tests/test_sensitive_data_scan_exclusions.py",
     },
 }

@@ -39,15 +39,16 @@ PY_ARGS="-X utf8"
 # Optional: KINETIC_HOOK_PYTHON names an existing interpreter (e.g. the main
 # checkout's .venv python) to use instead of `uv run`. In a worktree without
 # its own .venv, `uv run` builds a fresh environment, including new unsigned
-# launcher executables that endpoint security may block. The worktree root is
-# put first on PYTHONPATH so its own code is what gets checked.
+# launcher executables that endpoint security may block. The worktree's src/ is
+# put first on PYTHONPATH so its own package code is what gets checked (that
+# interpreter's installed copy points at the main checkout).
 if [ -n "$KINETIC_HOOK_PYTHON" ]; then
     REPO_ROOT="$(git rev-parse --show-toplevel)"
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) PATH_SEP=";" ;;
         *) PATH_SEP=":" ;;
     esac
-    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+$PATH_SEP$PYTHONPATH}" "$KINETIC_HOOK_PYTHON" $PY_ARGS scripts/hooks/pre-commit
+    PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+$PATH_SEP$PYTHONPATH}" "$KINETIC_HOOK_PYTHON" $PY_ARGS scripts/hooks/pre-commit
 # Otherwise run the python check script (prefer uv when available)
 elif command -v uv >/dev/null 2>&1; then
     uv run python $PY_ARGS scripts/hooks/pre-commit

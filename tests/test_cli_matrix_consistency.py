@@ -16,7 +16,7 @@ class TestCliMatrixConsistency(unittest.TestCase):
 
     def test_matrix_matches_root_cli_modules_with_main_guard(self):
         repo_root = Path(__file__).resolve().parents[1]
-        package_dir = repo_root / "kinetic_devops"
+        package_dir = repo_root / "src" / "kinetic_devops"
 
         discovered = {
             path.name
