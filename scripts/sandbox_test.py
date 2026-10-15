@@ -36,13 +36,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -269,31 +272,132 @@ def _ensure_sandbox(fresh: bool) -> str | None:
     return sandbox_id
 
 
+# --- MinGit for the kept sandbox ----------------------------------------------
+# Git-heavy tests run git many times; loading git.exe from the host's Git (a
+# mapped folder) each time made sandbox timings depend on host load and
+# scanning. So the sandbox gets MinGit on its own disk. The host keeps the zip
+# in a version-checked cache (downloaded only when missing, outdated, corrupt or
+# forced; SHA-256 checked against the release's published digest and on reuse);
+# the sandbox reinstalls whenever its installed version differs from the job's.
+
+MINGIT_CACHE = BASE / "cache"
+MINGIT_RELEASES = "https://api.github.com/repos/git-for-windows/git/releases/latest"
+_MINGIT_ASSET = re.compile(r"^MinGit-(\d+(?:\.\d+)+)-64-bit\.zip$")
+_USER_AGENT = "kinetic-devops-sandbox-test"
+
+
+def _http_json(url: str) -> dict:
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT,
+                                                   "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+def _http_download(url: str, dest: Path) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    with urllib.request.urlopen(request, timeout=300) as response, dest.open("wb") as fh:
+        shutil.copyfileobj(response, fh)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_mingit(refresh: bool = False, cache_dir: Path | None = None,
+                  fetch_json=_http_json, download=_http_download) -> dict | None:
+    """Return {"zip": Path, "version": str} for a verified MinGit zip in the
+    cache, or None (the sandbox then uses the host's Git). refresh=True ignores
+    the cache and downloads again."""
+    cache = cache_dir or MINGIT_CACHE
+    cache.mkdir(parents=True, exist_ok=True)
+    meta_path = cache / "mingit.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    cached = None
+    if meta.get("zip") and (cache / meta["zip"]).is_file():
+        cached_zip = cache / meta["zip"]
+        if _sha256(cached_zip) == meta.get("sha256"):
+            cached = {"zip": cached_zip, "version": meta.get("version", "")}
+        else:
+            print(f"sandbox_test: cached {cached_zip.name} failed its checksum; discarding it.")
+            cached_zip.unlink(missing_ok=True)
+
+    try:
+        release = fetch_json(MINGIT_RELEASES)
+        asset = next(a for a in release.get("assets", []) if _MINGIT_ASSET.match(a.get("name", "")))
+        version = _MINGIT_ASSET.match(asset["name"]).group(1)
+    except (OSError, ValueError, KeyError, StopIteration) as exc:
+        if cached:
+            print(f"sandbox_test: can't check for a newer MinGit ({exc.__class__.__name__}); "
+                  f"using cached {cached['version']}.")
+            return cached
+        print(f"sandbox_test: MinGit unavailable ({exc.__class__.__name__}: {exc}); "
+              "the sandbox uses the host's Git.")
+        return None
+
+    if cached and cached["version"] == version and not refresh:
+        return cached
+
+    part = cache / (asset["name"] + ".part")
+    try:
+        download(asset["browser_download_url"], part)
+        actual = _sha256(part)
+        expected = (asset.get("digest") or "").removeprefix("sha256:")
+        if expected and expected != actual:
+            raise ValueError(f"checksum mismatch for {asset['name']} (expected {expected[:12]}..., got {actual[:12]}...)")
+    except (OSError, ValueError) as exc:
+        part.unlink(missing_ok=True)
+        if cached:
+            print(f"sandbox_test: MinGit {version} download failed ({exc}); using cached {cached['version']}.")
+            return cached
+        print(f"sandbox_test: MinGit {version} download failed ({exc}); the sandbox uses the host's Git.")
+        return None
+
+    zip_path = cache / asset["name"]
+    part.replace(zip_path)
+    for old in cache.glob("MinGit-*.zip"):  # older versions, and the unversioned name used before
+        if old != zip_path:
+            old.unlink(missing_ok=True)
+    meta_path.write_text(json.dumps({"version": version, "zip": zip_path.name, "sha256": actual,
+                                     "source": asset["browser_download_url"]}, indent=2), encoding="utf-8")
+    print(f"sandbox_test: cached MinGit {version}.")
+    return {"zip": zip_path, "version": version}
+
+
 # Runs in the sandbox for each job (passed as -EncodedCommand, so no quoting
-# issues and no script file on the host). Git comes from MinGit installed on the
-# sandbox's own disk -- once per sandbox, from a zip cached in the shared job
-# folder -- so git-heavy tests don't load git.exe from the host for every call.
-# The host's Git (mapped read-only) stays as fallback and provides `sh` for hooks.
+# issues and no script file on the host). Installs the job's MinGit when the
+# sandbox has none, a different version, or a reinstall is forced; then clones
+# the job's bundle and runs sandbox_run.ps1. The host's Git (mapped read-only)
+# stays on PATH after MinGit, as fallback and for `sh` (git hooks).
 _JOB_BOOTSTRAP = r"""
 $ErrorActionPreference = 'Continue'
-$mingit = 'C:\tools\mingit\cmd\git.exe'
-if (-not (Test-Path $mingit)) {
-    try {
-        $zip = '__BASE__\cache\MinGit-64-bit.zip'
-        if (-not (Test-Path $zip)) {
-            New-Item -ItemType Directory -Force (Split-Path $zip) | Out-Null
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $release = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers @{ 'User-Agent' = 'kinetic-devops-sandbox-test' }
-            $asset = $release.assets | Where-Object { $_.name -match '^MinGit-[0-9.]+-64-bit\.zip$' } | Select-Object -First 1
-            Invoke-WebRequest $asset.browser_download_url -OutFile "$zip.part" -UseBasicParsing
-            Move-Item -Force "$zip.part" $zip
+$mingitDir = 'C:\tools\mingit'
+$marker = Join-Path $mingitDir 'kinetic-mingit-version.txt'
+$zip = '__MINGIT_ZIP__'
+$version = '__MINGIT_VERSION__'
+$useMingit = $false
+if ($zip) {
+    $installed = if (Test-Path $marker) { (Get-Content -Raw $marker).Trim() } else { '' }
+    if ('__MINGIT_FORCE__' -eq '1' -or $installed -ne $version -or -not (Test-Path "$mingitDir\cmd\git.exe")) {
+        try {
+            if (Test-Path $mingitDir) { Remove-Item -Recurse -Force $mingitDir }
+            Expand-Archive -Force $zip $mingitDir
+            Set-Content -Path $marker -Value $version
+            Write-Output "MinGit $version installed."
+        } catch {
+            Write-Output "MinGit install failed, using the host's Git: $_"
         }
-        Expand-Archive -Force $zip 'C:\tools\mingit'
-    } catch {
-        Write-Output "MinGit unavailable, using the host's Git: $_"
     }
+    $useMingit = Test-Path "$mingitDir\cmd\git.exe"
 }
-$env:PATH = 'C:\tools\mingit\cmd;C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin;' + $env:PATH
+$hostGit = 'C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin'
+$env:PATH = $(if ($useMingit) { "$mingitDir\cmd;$hostGit;" } else { "$hostGit;" }) + $env:PATH
 if (Test-Path 'C:\work\kd') { Remove-Item -Recurse -Force 'C:\work\kd' }
 git init -q 'C:\work\kd'
 git -C 'C:\work\kd' fetch -q '__JOB__\repo.bundle' '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
@@ -304,18 +408,25 @@ exit $LASTEXITCODE
 """
 
 
-def _job_command(guest_job: str, sha: str) -> str:
-    script = (_JOB_BOOTSTRAP.replace("__BASE__", GUEST_BASE).replace("__JOB__", guest_job)
-              .replace("__SHA__", sha))
+def _job_command(guest_job: str, sha: str, mingit: dict | None = None, force_mingit: bool = False) -> str:
+    """The `wsb exec` command for a job. mingit: ensure_mingit()'s result (its
+    zip must be in MINGIT_CACHE, which the sandbox sees under GUEST_BASE), or
+    None to use the host's Git."""
+    guest_zip = rf"{GUEST_BASE}\cache\{mingit['zip'].name}" if mingit else ""
+    script = (_JOB_BOOTSTRAP.replace("__JOB__", guest_job).replace("__SHA__", sha)
+              .replace("__MINGIT_ZIP__", guest_zip)
+              .replace("__MINGIT_VERSION__", mingit["version"] if mingit else "")
+              .replace("__MINGIT_FORCE__", "1" if force_mingit else "0"))
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     return f"powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
 
 
 def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min: int,
-             keep_files: bool) -> tuple[int, Path | None]:
+             keep_files: bool, mingit_mode: str = "auto") -> tuple[int, Path | None]:
     sandbox_id = _ensure_sandbox(fresh)
     if not sandbox_id:
         return UNAVAILABLE, None
+    mingit = None if mingit_mode == "off" else ensure_mingit(refresh=mingit_mode == "refresh")
     name = f"{time.strftime('%Y%m%d-%H%M%S')}-{sha[:10]}"
     job = JOBS / name
     job.mkdir(parents=True)
@@ -325,7 +436,7 @@ def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min:
     _bundle(repo_root, sha, job / "repo.bundle")
     (job / "options.json").write_text(json.dumps(options), encoding="utf-8")
     guest_job = rf"{GUEST_BASE}\jobs\{name}"
-    command = _job_command(guest_job, sha)
+    command = _job_command(guest_job, sha, mingit, force_mingit=mingit_mode == "refresh")
     try:
         _wsb("exec", "--id", sandbox_id, "-r", "System", "-c", command, timeout=timeout_min * 60)
     except subprocess.TimeoutExpired:
@@ -372,7 +483,7 @@ def _passed(out_dir: Path) -> bool:
 
 
 def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep_files: bool,
-        fresh: bool, one_shot: bool, junit_out: Path | None = None) -> int:
+        fresh: bool, one_shot: bool, junit_out: Path | None = None, mingit_mode: str = "auto") -> int:
     """Exit code as documented; with junit_out, the suite runs via pytest and
     its JUnit XML (per-test timings) is copied to junit_out."""
     if junit_out and suite == "full":
@@ -390,7 +501,7 @@ def run(commit: str, suite, smoke: bool, timeout_min: int, keep_open: bool, keep
 
     started = time.monotonic()
     if _wsb_path() and not one_shot:
-        code, work = run_kept(repo_root, sha, options, fresh, timeout_min, keep_files)
+        code, work = run_kept(repo_root, sha, options, fresh, timeout_min, keep_files, mingit_mode)
     else:
         code, work = run_one_shot(repo_root, sha, options, timeout_min)
     if code == UNAVAILABLE:
@@ -440,6 +551,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--junit-out", type=Path, metavar="FILE",
                         help="Full suite via pytest; copy its JUnit XML (per-test timings) here "
                              "(for scripts/compare_timings.py)")
+    git_source = parser.add_mutually_exclusive_group()
+    git_source.add_argument("--refresh-mingit", action="store_true",
+                            help="Ignore the cached MinGit: download it again and reinstall it in the sandbox")
+    git_source.add_argument("--no-mingit", action="store_true",
+                            help="Use the host's Git in the sandbox instead of MinGit")
     parser.add_argument("--fresh", action="store_true",
                         help="Stop the kept sandbox first and start a clean one")
     parser.add_argument("--stop", action="store_true", help="Stop the kept sandbox and exit")
@@ -473,7 +589,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.junit_out and suite != "full":
         parser.error("--junit-out needs the full suite (not --native-only/--tests/--smoke-only)")
     return run(WORKING_TREE if args.working_tree else args.commit, suite, smoke, args.timeout, args.keep_open, args.keep_files,
-               args.fresh, args.one_shot, args.junit_out)
+               args.fresh, args.one_shot, args.junit_out,
+               "refresh" if args.refresh_mingit else "off" if args.no_mingit else "auto")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/sandbox_test.py`: tests a commit on a clean Windows in Windows Sandbox: the full suite plus
   the Windows smoke checks, or `--native-only`, `--tests NAME ...`, `--smoke-only`. With `wsb` it
   keeps one sandbox running and reuses it (adopting a running sandbox it doesn't know via
-  `wsb share`), so later runs skip boot and uv setup. An optional
+  `wsb share`), so later runs skip boot and uv setup. Git there is MinGit on the sandbox's own disk,
+  from a version- and checksum-checked cache on the host (`--refresh-mingit` ignores the cache,
+  `--no-mingit` uses the host's Git). An optional
   pre-push hook runs the full check when enabled with `git config kinetic.prepushSandbox true`;
   commits that already passed are skipped.
 - Environment comparison (informative only): every CI test job records its run as JUnit XML plus

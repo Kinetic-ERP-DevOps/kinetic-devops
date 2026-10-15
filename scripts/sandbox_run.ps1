@@ -44,10 +44,12 @@ function Step([string]$name, [scriptblock]$body) {
 }
 
 Set-Content -Path $summary -Value ("Windows Sandbox run started " + (Get-Date -Format s))
-# Git: MinGit on the sandbox's own disk when sandbox_test.py installed it (kept
-# sandbox), else the host's Git -- C:\Git when mapped at start, C:\kd-git when
-# shared into an adopted sandbox. The host's usr\bin provides `sh` for git hooks.
-$env:PATH = "C:\tools\mingit\cmd;C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin;" + $env:PATH
+# Git: in job mode the bootstrap in sandbox_test.py already put the chosen git
+# first on PATH (MinGit on the sandbox's own disk, or the host's Git with
+# --no-mingit). Append the host's Git -- C:\Git when mapped at start, C:\kd-git
+# when shared into an adopted sandbox -- as fallback and for `sh` (git hooks);
+# in one-shot mode it is the only git.
+$env:PATH = $env:PATH + ";C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin"
 Add-Content -Path $summary -Value ("git: " + (Get-Command git -ErrorAction SilentlyContinue).Source)
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
