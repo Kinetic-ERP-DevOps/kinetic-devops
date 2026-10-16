@@ -28,9 +28,16 @@ function Check([string]$name, [bool]$ok, [string]$detail = "") {
 
 # Native commands write progress to stderr; with PowerShell 5.1 that must not
 # turn into terminating errors, so collect everything as text.
+# Exit code starts as a failure: if the program can't start at all (e.g.
+# access denied), PowerShell raises an error without setting LASTEXITCODE,
+# and a check must not pass when no process ran.
 function Run([string]$exe, [string[]]$arguments) {
-    $global:LASTEXITCODE = 0
-    $text = (& $exe @arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $global:LASTEXITCODE = -1
+    try {
+        $text = (& $exe @arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    } catch {
+        return @{ Code = -1; Text = "could not start ${exe}: $_" }
+    }
     return @{ Code = $LASTEXITCODE; Text = $text }
 }
 

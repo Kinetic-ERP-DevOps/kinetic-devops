@@ -94,11 +94,15 @@ def find_wsl_distro(requested: str | None, probe: str, what: str) -> tuple[str |
     return None, f"no WSL distro with {what} ({'; '.join(problems)})"
 
 
-def _stamp_vm(meta: Path, busy: float | None) -> None:
-    """Runs in WSL, a container or the sandbox use this machine's hardware."""
+def _stamp_vm(meta: Path, busy: float | None, end_to_end: float | None = None) -> None:
+    """Runs in WSL, a container or the sandbox use this machine's hardware.
+    end_to_end, measured on this machine around the whole run (setup included,
+    like the native and Sandbox runs), replaces any duration measured inside."""
     if meta.exists():
         data = json.loads(meta.read_text(encoding="utf-8"))
         data.update(hardware=compare_timings.hardware(), virtualized=True, cpu_busy_start=busy)
+        if end_to_end is not None:
+            data["end_to_end_seconds"] = round(end_to_end, 1)
         meta.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -140,55 +144,58 @@ def run_sandbox(xml: Path, sha: str) -> str:
 
 def run_wsl(repo_root: Path, xml: Path, sha: str, distro: str) -> str:
     busy = compare_timings.cpu_busy_percent()
+    started = time.monotonic()  # end-to-end on the host: bundle, checkout, sync, tests
     bundle = xml.with_suffix(".bundle")
     sandbox_test._bundle(repo_root, sha, bundle)
     meta = xml.with_suffix(".json")
-    # The checkout lives on the Linux filesystem (fast); results go back via /mnt.
+    q = _sh_quote
+    # The checkout lives on the Linux filesystem (fast), in a fresh temporary
+    # directory of its own; results go back via /mnt.
     script = f"""
 set -e
 export PATH="$HOME/.local/bin:$PATH" KINETIC_NATIVE_CHECKS=1
-D="$HOME/kd-timings"
-rm -rf "$D" && git init -q "$D" && cd "$D"
-git fetch -q '{_wsl_path(bundle)}' '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
-git checkout -q --detach {sha}
-start=$(date +%s)
+D=$(mktemp -d "${{TMPDIR:-/tmp}}/kd-timings.XXXXXX")
+trap 'rm -rf "$D"' EXIT
+git init -q "$D" && cd "$D"
+git fetch -q {q(_wsl_path(bundle))} '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
+git checkout -q --detach {q(sha)}
 uv sync --locked -q
-uv run python -m pytest -q -p no:cacheprovider --junitxml='{_wsl_path(xml)}' || true
-uv run python scripts/compare_timings.py meta --label {LABELS['wsl']} --out '{_wsl_path(meta)}' \\
-    --end-to-end $(( $(date +%s) - start )) --extra 'native checks' --commit {sha}
-cd && rm -rf "$D"
+uv run python -m pytest -q -p no:cacheprovider --junitxml={q(_wsl_path(xml))} || true
+uv run python scripts/compare_timings.py meta --label {q(LABELS['wsl'])} --out {q(_wsl_path(meta))} \
+    --extra 'native checks' --commit {q(sha)}
 """
     subprocess.run(["wsl", "-d", distro, "-e", "bash", "-lc", script])
     bundle.unlink(missing_ok=True)
-    _stamp_vm(meta, busy)
+    _stamp_vm(meta, busy, time.monotonic() - started)
     return "ok" if xml.exists() else "no JUnit XML produced"
 
 
 def run_alpine(repo_root: Path, xml: Path, sha: str, distro: str) -> str:
     busy = compare_timings.cpu_busy_percent()
+    started = time.monotonic()  # end-to-end on the host: incl. container start, image pull, installs
     bundle = xml.with_suffix(".bundle")
     sandbox_test._bundle(repo_root, sha, bundle)
     meta = xml.with_suffix(".json")
-    folder = _wsl_path(xml.parent)
+    q = _sh_quote
     # A throwaway container; the records folder is mounted at /out.
     inner = f"""
 set -e
 apk add --no-cache git >/dev/null
 pip install -q --root-user-action=ignore uv
 git init -q /w && cd /w
-git fetch -q /out/{bundle.name} '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
-git checkout -q --detach {sha}
+git fetch -q {q('/out/' + bundle.name)} '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
+git checkout -q --detach {q(sha)}
 export UV_PYTHON_DOWNLOADS=never KINETIC_NATIVE_CHECKS=1 UV_LINK_MODE=copy
-start=$(date +%s)
 uv sync --locked -q
-uv run python -m pytest -q -p no:cacheprovider --junitxml=/out/{xml.name} || true
-uv run python scripts/compare_timings.py meta --label {LABELS['alpine']} --out /out/{meta.name} \\
-    --end-to-end $(( $(date +%s) - start )) --extra 'native checks' --commit {sha}
+uv run python -m pytest -q -p no:cacheprovider --junitxml={q('/out/' + xml.name)} || true
+uv run python scripts/compare_timings.py meta --label {q(LABELS['alpine'])} --out {q('/out/' + meta.name)} \
+    --extra 'native checks' --commit {q(sha)}
 """
-    outer = f"podman run --rm -v '{folder}:/out' {ALPINE_IMAGE} sh -c {_sh_quote(inner)}"
+    mount = _wsl_path(xml.parent) + ":/out"
+    outer = f"podman run --rm -v {q(mount)} {ALPINE_IMAGE} sh -c {q(inner)}"
     subprocess.run(["wsl", "-d", distro, "-e", "sh", "-c", outer])
     bundle.unlink(missing_ok=True)
-    _stamp_vm(meta, busy)
+    _stamp_vm(meta, busy, time.monotonic() - started)
     return "ok" if xml.exists() else "no JUnit XML produced"
 
 

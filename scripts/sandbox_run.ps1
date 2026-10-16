@@ -4,7 +4,8 @@
 # Two modes:
 # - Job mode (-JobDir, used with a long-lived sandbox via `wsb exec`): the job
 #   folder holds repo.bundle, options.json and out\; sandbox_test.py clones the
-#   bundle to C:\work\kd and runs this script from there.
+#   bundle to a checkout of its own (C:\work\<job name>) and runs this script
+#   from there.
 # - One-shot mode (no -JobDir, started as the sandbox's logon command):
 #   C:\kd-in holds repo\ and options.json, C:\kd-out receives the logs.
 # C:\Git (C:\kd-git in an adopted sandbox) is the host's Git install (read-only). Installs uv if missing, syncs
@@ -63,16 +64,18 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Step "install uv" { powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex" }
 }
 
-# Fresh writable copy per run (uv sync creates .venv inside it); the uv cache
-# stays warm between runs in a long-lived sandbox.
-$repo = "C:\work\kd"
-if (Test-Path (Join-Path $in "repo")) {
+# Fresh writable checkout per run (uv sync creates .venv inside it); the uv
+# cache stays warm between runs in a long-lived sandbox.
+if ($JobDir) {
+    # Job mode: sandbox_test.py cloned the job's repo.bundle into a checkout of
+    # its own (C:\work\<job name>) and runs this script from it.
+    $repo = Split-Path -Parent $PSScriptRoot
+} else {
     # One-shot mode: the host provided a checkout; copy it.
+    $repo = "C:\work\kd"
     if (Test-Path $repo) { Remove-Item -Recurse -Force $repo }
     Step "copy checkout" { New-Item -ItemType Directory -Force C:\work | Out-Null; Copy-Item -Recurse -Force (Join-Path $in "repo") $repo }
 }
-# Job mode: sandbox_test.py already cloned the job's repo.bundle into $repo
-# (and is running this script from there).
 Set-Location $repo
 git config --global --add safe.directory '*'
 git config --global user.name "sandbox"

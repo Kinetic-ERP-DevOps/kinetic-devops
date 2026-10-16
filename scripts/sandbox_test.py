@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -399,13 +400,18 @@ if ($zip) {
 }
 $hostGit = 'C:\Git\cmd;C:\kd-git\cmd;C:\Git\usr\bin;C:\kd-git\usr\bin'
 $env:PATH = $(if ($useMingit) { "$mingitDir\cmd;$hostGit;" } else { "$hostGit;" }) + $env:PATH
-if (Test-Path 'C:\work\kd') { Remove-Item -Recurse -Force 'C:\work\kd' }
-git init -q 'C:\work\kd'
-git -C 'C:\work\kd' fetch -q '__JOB__\repo.bundle' '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
-git -C 'C:\work\kd' checkout -q --detach '__SHA__'
+# A checkout per job (C:\work\<job name>), so overlapping jobs -- e.g. a
+# pre-push check during a manual run -- never delete each other's files.
+$checkout = Join-Path 'C:\work' (Split-Path -Leaf '__JOB__')
+if (Test-Path $checkout) { Remove-Item -Recurse -Force $checkout }
+git init -q $checkout
+git -C $checkout fetch -q '__JOB__\repo.bundle' '+refs/kinetic-sandbox/*:refs/kinetic-sandbox/*'
+git -C $checkout checkout -q --detach '__SHA__'
 if ($LASTEXITCODE -ne 0) { exit 1 }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\work\kd\scripts\sandbox_run.ps1' -JobDir '__JOB__'
-exit $LASTEXITCODE
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$checkout\scripts\sandbox_run.ps1" -JobDir '__JOB__'
+$code = $LASTEXITCODE
+Remove-Item -Recurse -Force $checkout -ErrorAction SilentlyContinue
+exit $code
 """
 
 
@@ -428,7 +434,9 @@ def run_kept(repo_root: Path, sha: str, options: dict, fresh: bool, timeout_min:
     if not sandbox_id:
         return UNAVAILABLE, None
     mingit = None if mingit_mode == "off" else ensure_mingit(refresh=mingit_mode == "refresh")
-    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{sha[:10]}"
+    # Unique even for jobs started in the same second for the same commit
+    # (e.g. a pre-push check overlapping a manual run).
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{sha[:10]}-{os.getpid()}-{secrets.token_hex(2)}"
     job = JOBS / name
     job.mkdir(parents=True)
     # One bundle file instead of a checkout: writing ~1000 files here, where
