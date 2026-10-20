@@ -114,7 +114,9 @@ scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushCont
   Git in the kept sandbox is MinGit on the sandbox's own disk. This machine keeps the zip in a
   version-checked cache (`%LOCALAPPDATA%\kinetic-devops\sandbox\cache`): it checks the latest
   git-for-windows release, downloads only when the cache is missing, outdated or corrupt, and checks
-  the SHA-256 against the release's published digest; offline it uses the cached copy. The sandbox
+  the SHA-256 against the release's published digest; a release without a published digest is never
+  cached as verified (the cached copy or this machine's Git is used instead). Offline it uses the
+  cached copy. The sandbox
   reinstalls when its version differs. `--refresh-mingit` ignores the cache (download and reinstall);
   `--no-mingit` uses this machine's Git instead.
 

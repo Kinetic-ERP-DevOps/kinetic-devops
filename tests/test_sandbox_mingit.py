@@ -135,9 +135,18 @@ class TestEnsureMinGit(unittest.TestCase):
         self.assertIsNone(self.ensure(net))
         self.assertEqual(list(self.cache.iterdir()), [])
 
-    def test_release_without_digest_is_accepted(self):
+    def test_release_without_digest_is_rejected_and_nothing_cached(self):
         net = FakeNetwork("2.54.0", b"zip", digest=None)
-        self.assertEqual(self.ensure(net)["version"], "2.54.0")
+        self.assertIsNone(self.ensure(net))
+        self.assertIn("no verified SHA-256 digest", self.output)
+        self.assertEqual(list(self.cache.glob("MinGit-*")), [])
+        self.assertEqual(net.downloads, 0)  # rejected before downloading
+
+    def test_release_without_digest_keeps_working_cache(self):
+        self.ensure(FakeNetwork("2.54.0", b"good"))
+        nodigest = FakeNetwork("2.55.0", b"unverified", digest=None)
+        result = self.ensure(nodigest)
+        self.assertEqual(result["version"], "2.54.0")
 
 
 class TestJobCommand(unittest.TestCase):

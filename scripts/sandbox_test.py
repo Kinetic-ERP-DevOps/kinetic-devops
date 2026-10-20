@@ -279,7 +279,7 @@ def _ensure_sandbox(fresh: bool) -> str | None:
 # mapped folder) each time made sandbox timings depend on host load and
 # scanning. So the sandbox gets MinGit on its own disk. The host keeps the zip
 # in a version-checked cache (downloaded only when missing, outdated, corrupt or
-# forced; SHA-256 checked against the release's published digest and on reuse);
+# forced; the release must publish a SHA-256 digest, checked on download and on reuse);
 # the sandbox reinstalls whenever its installed version differs from the job's.
 
 MINGIT_CACHE = BASE / "cache"
@@ -348,10 +348,14 @@ def ensure_mingit(refresh: bool = False, cache_dir: Path | None = None,
 
     part = cache / (asset["name"] + ".part")
     try:
+        expected = (asset.get("digest") or "").removeprefix("sha256:")
+        # No published SHA-256 means nothing to verify against; caching an
+        # unverified archive would break the checksum-checked cache guarantee.
+        if not expected:
+            raise ValueError(f"release asset {asset['name']} has no verified SHA-256 digest")
         download(asset["browser_download_url"], part)
         actual = _sha256(part)
-        expected = (asset.get("digest") or "").removeprefix("sha256:")
-        if expected and expected != actual:
+        if expected != actual:
             raise ValueError(f"checksum mismatch for {asset['name']} (expected {expected[:12]}..., got {actual[:12]}...)")
     except (OSError, ValueError) as exc:
         part.unlink(missing_ok=True)
