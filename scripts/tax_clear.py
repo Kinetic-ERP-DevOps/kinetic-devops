@@ -27,10 +27,6 @@ import logging
 import argparse
 from pathlib import Path
 
-# Add parent scripts directory to path for imports
-scripts_dir = Path(__file__).parent
-sys.path.insert(0, str(scripts_dir.parent))
-
 from kinetic_devops.auth import KineticConfigManager
 from kinetic_devops.tax_service import TaxService
 

@@ -2,6 +2,24 @@
 
 import os
 
+_TRUE = {"1", "true", "yes", "on"}
+
+
+def native_checks_enabled() -> bool:
+    """Whether to run checks that execute or load newly built/installed native code:
+    the console-script .exe launchers uv writes, and native extension libraries
+    such as cryptography's (encrypted vault). On managed machines, enterprise endpoint security
+    may block such newly built, unsigned files, so local runs
+    defer these checks by default. They run in CI (CI=true), in Windows Sandbox
+    (scripts/sandbox_test.py), or when asked for: `tests.test_runner --native`
+    or KINETIC_NATIVE_CHECKS=1. KINETIC_SKIP_CONSOLE_SCRIPT_TESTS=1 always skips."""
+    def flag(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in _TRUE
+
+    if flag("KINETIC_SKIP_CONSOLE_SCRIPT_TESTS"):
+        return False
+    return flag("KINETIC_NATIVE_CHECKS") or flag("CI")
+
 
 def scaled_timeout(seconds: float) -> float:
     """Subprocess timeout for CLI --help tests, multiplied by the optional

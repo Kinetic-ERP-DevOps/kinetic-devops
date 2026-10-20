@@ -216,8 +216,8 @@ __metadata__ = {
 ## Support
 
 See the kinetic-devops documentation for:
-- How to use BAQ client: [kinetic_devops/baq.py](../../kinetic_devops/baq.py)
-- How to use auth: [kinetic_devops/auth.py](../../kinetic_devops/auth.py)
-- Base client details: [kinetic_devops/base_client.py](../../kinetic_devops/base_client.py)
+- How to use BAQ client: [src/kinetic_devops/baq.py](../../src/kinetic_devops/baq.py)
+- How to use auth: [src/kinetic_devops/auth.py](../../src/kinetic_devops/auth.py)
+- Base client details: [src/kinetic_devops/base_client.py](../../src/kinetic_devops/base_client.py)
 
 Happy coding! 🚀

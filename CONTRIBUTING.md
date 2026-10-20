@@ -28,10 +28,10 @@ guaranteed test failure, by design, so nothing silently ships without at least a
 
 | If you add/remove... | Update this file | Enforced by |
 |---|---|---|
-| a `kinetic_devops/*.py` module | `PACKAGE_MODULE_MATRIX` in `tests/test_module_coverage_matrix.py` | `test_package_matrix_matches_repo_modules` |
+| a `src/kinetic_devops/*.py` module | `PACKAGE_MODULE_MATRIX` in `tests/test_module_coverage_matrix.py` | `test_package_matrix_matches_repo_modules` |
 | a `scripts/*.py` script | `SCRIPT_MODULE_MATRIX` in `tests/test_module_coverage_matrix.py` | `test_script_matrix_matches_repo_modules` |
-| a `kinetic_devops/*.py` module with a `if __name__ == "__main__":` guard (i.e. it's directly CLI-runnable) | `CLI_MODULES` in `tests/cli_matrix.py` | `test_cli_matrix_consistency.py` |
-| a tool exposed through the `kinetic_devops.__main__` router | the matching entry's `"router"` key in `tests/cli_matrix.py`, and `kinetic_devops/__main__.py`'s `TOOLS` dict | `test_router_tool_mapping_matches_router_module` |
+| a `src/kinetic_devops/*.py` module with a `if __name__ == "__main__":` guard (i.e. it's directly CLI-runnable) | `CLI_MODULES` in `tests/cli_matrix.py` | `test_cli_matrix_consistency.py` |
+| a tool exposed through the `kinetic_devops.__main__` router | the matching entry's `"router"` key in `tests/cli_matrix.py`, and `src/kinetic_devops/__main__.py`'s `TOOLS` dict | `test_router_tool_mapping_matches_router_module` |
 
 If you forget, the failure message tells you exactly which registry to update -- but doing it up front
 saves a round trip.
@@ -39,8 +39,8 @@ saves a round trip.
 ## Service Module Pattern
 
 Every current service module follows the same shape: subclass `KineticBaseClient` directly, rather
-than wrapping a separate standalone class. See `kinetic_devops/efx_library.py` or
-`kinetic_devops/boreader.py` for the current reference pattern:
+than wrapping a separate standalone class. See `src/kinetic_devops/efx_library.py` or
+`src/kinetic_devops/boreader.py` for the current reference pattern:
 
 ```python
 from kinetic_devops.base_client import KineticBaseClient
@@ -59,7 +59,7 @@ class KineticMyThingService(KineticBaseClient):
 - One file per service, one class per file, one method per endpoint.
 - Accept/return `dict`/`list`, not rigid parameter objects.
 - `Documents/ARCHITECTURE.md` has more background, but defer to the actual code in
-  `kinetic_devops/*.py` over that document's diagrams/examples if they ever disagree --
+  `src/kinetic_devops/*.py` over that document's diagrams/examples if they ever disagree --
   architecture docs drift faster than tests do.
 
 ## Verify Before You Document or Ship

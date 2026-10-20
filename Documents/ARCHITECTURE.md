@@ -4,7 +4,7 @@
 
 These three modules form the foundation. No other layers should exist without compelling reason.
 
-### 1. `kinetic_devops/KineticCore.py`
+### 1. `src/kinetic_devops/KineticCore.py`
 - **Purpose**: Base class for all SDK clients
 - **Responsibility**: 
   - Security infrastructure (salt derivation, redaction, wire logging)
@@ -13,7 +13,7 @@ These three modules form the foundation. No other layers should exist without co
   - Config hashing and integrity verification
 - **No service logic**: Does not know about BOReader, tax, etc.
 
-### 2. `kinetic_devops/auth.py`
+### 2. `src/kinetic_devops/auth.py`
 - **Purpose**: Server config and token lifecycle management (keyring-backed)
 - **Responsibility**:
   - Session storage and validation
@@ -23,7 +23,7 @@ These three modules form the foundation. No other layers should exist without co
   - Session cleanup
 - **No API calls beyond token endpoint**
 
-### 3. `kinetic_devops/base_client.py`
+### 3. `src/kinetic_devops/base_client.py`
 - **Purpose**: Initialize a connected session
 - **Responsibility**:
   - Inherit from KineticCore (get security/logging)
@@ -40,7 +40,7 @@ One dedicated file per service, one class per file, subclassing `KineticBaseClie
 than wrapping a separate standalone class -- every current service module (`boreader.py`,
 `efx_library.py`, `baq.py`, etc.) follows this shape.
 
-### `kinetic_devops/boreader.py`
+### `src/kinetic_devops/boreader.py`
 - **Class**: `KineticBOReaderService(KineticBaseClient)`
 - **Single Responsibility**: `Ice.Lib.BOReaderSvc/GetList` endpoint
 - **Defensive Design**: Accepts `request_dict` (flexible, not parameter list)
@@ -140,7 +140,7 @@ for rec in records:
 
 ## When to Add New Services
 
-1. **Create new file**: `kinetic_devops/my_service.py`
+1. **Create new file**: `src/kinetic_devops/my_service.py`
 2. **Define class**: `KineticMyThingService(KineticBaseClient)` -- subclass it directly
 3. **One method per endpoint**: `get_data(company, request_dict)`
 4. **Defensive design**: Accept `dict`, return `dict`
@@ -153,7 +153,7 @@ for rec in records:
 
 Example:
 ```python
-# kinetic_devops/my_service.py
+# src/kinetic_devops/my_service.py
 from kinetic_devops.base_client import KineticBaseClient
 
 class KineticMyThingService(KineticBaseClient):

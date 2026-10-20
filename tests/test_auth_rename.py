@@ -10,6 +10,7 @@ from unittest import mock
 
 from kinetic_devops import auth, crypto
 from kinetic_devops.auth import SERVICE_SERVERS, KineticConfigManager
+from tests.cli_matrix import native_checks_enabled
 
 
 class FakeKeyring:
@@ -120,9 +121,15 @@ class TestCaseOnlyRenameOnCaseInsensitiveStore(RenameTestBase):
 class TestEncryptedVault(RenameTestBase):
     def setUp(self):
         super().setUp()
+        # Vault encryption loads cryptography's native library, which endpoint
+        # security may block on a development machine: a native check, so it
+        # runs in CI, Windows Sandbox or on request, and isn't even attempted otherwise.
+        if not native_checks_enabled():
+            self.skipTest("native check deferred (loads cryptography's native library; runs in CI, "
+                          "scripts/sandbox_test.py, or tests.test_runner --native)")
         try:
             blob = crypto.encrypt_json(self.servers, "pass-1")
-        except Exception as exc:  # cryptography not installed
+        except Exception as exc:  # cryptography not installed, or not loadable
             self.skipTest(f"vault encryption unavailable: {exc}")
         self.kr.set_password(SERVICE_SERVERS, "config", blob)
 

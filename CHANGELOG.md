@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The package now lives in `src/kinetic_devops/` (src layout; moved with `git mv`, so `git log --follow`
+  keeps each file's history). Packaging finds it via `where = ["src"]`.
+- No more `sys.path` / `PYTHONPATH` tweaks in scripts, tests or `env_init`: the package is imported from
+  the environment `uv sync` installs, so run things with `uv run`. The `env_init` wrappers default to
+  uv's `.venv`; a worktree hook run with `KINETIC_HOOK_PYTHON` puts that worktree's `src/` first.
+- CI (GitHub and Forgejo) installs with `uv sync --locked` and runs everything through `uv run`.
+- This completes the src-layout migration; its roadmap and tracker documents are removed.
+
+### Added
+- Native checks (tests that execute uv's generated console-script `.exe` launchers) are deferred in
+  local runs and the pre-commit hook, because enterprise endpoint security may
+  block newly built unsigned files. They run in CI, in Windows Sandbox, or on request with
+  `tests.test_runner --native` / `KINETIC_NATIVE_CHECKS=1`.
+- GitHub CI job "Windows Test Gate" on `windows-latest`: the test suite plus
+  `scripts/windows_smoke.ps1` (console-script launchers, `env_init.ps1` / `env_init.bat`,
+  `install-hook.ps1`) under Windows PowerShell 5.1.
+- `scripts/sandbox_test.py`: tests a commit on a clean Windows in Windows Sandbox: the full suite plus
+  the Windows smoke checks, or `--native-only`, `--tests NAME ...`, `--smoke-only`. With `wsb` it
+  keeps one sandbox running and reuses it (adopting a running sandbox it doesn't know via
+  `wsb share`), so later runs skip boot and uv setup. Git there is MinGit on the sandbox's own disk,
+  from a version- and checksum-checked cache on the host (`--refresh-mingit` ignores the cache,
+  `--no-mingit` uses the host's Git). An optional
+  pre-push hook runs the full check when enabled with `git config kinetic.prepushSandbox true`;
+  commits that already passed are skipped.
+- Environment comparison (informative only): every CI test job records its run as JUnit XML plus
+  metadata and uploads it; `scripts/run_timings.py` records this machine, the kept Windows Sandbox,
+  WSL (newest Ubuntu with uv) and a `python:3.14-alpine` container via Podman, with `--repeat N` for
+  medians, flaky-test detection and a busy-machine flag; `scripts/compare_timings.py report` shows totals (suite and end-to-end, with each run's scope
+  and where scopes differ), tests not run everywhere with skip reasons, environment-only failures,
+  and like-for-like per-module/per-test times. CI now runs the suite via `python -m pytest` (same
+  tests as `tests.test_runner`).
+- CI job "Built Wheel Smoke Test": builds the sdist and wheel, checks the wheel contains only
+  `kinetic_devops/`, installs it into a clean environment and, from outside the checkout, imports every
+  module and starts each console script and module CLI.
+
+### Fixed
+- Encrypted-vault tests never ran on Windows: `cryptography` was only present where `keyring` pulls
+  it in (Linux). It is now a dev dependency and a user-facing extra (`kinetic-devops[vault]`). When
+  it is installed but can't load -- e.g. endpoint security blocks its native library -- the error
+  says so (with the cause) instead of claiming it is missing. The vault test is a native check
+  (it loads a native library): deferred in local runs, run in CI, Windows Sandbox and on request.
+- Removed `[tool.uv] compile-bytecode` (added in 0.1.0a7): it made every `uv run` recompile all
+  installed packages (~4 s each time), and on machines with endpoint security those cache writes
+  intermittently failed ("user-mapped section open", os error 1224). Python caches bytecode on first
+  import anyway.
+- `scripts/env_init.bat` was stored with LF-only line endings, which `cmd.exe` misparses;
+  `.gitattributes` now checks out `*.bat` / `*.cmd` with CRLF.
+- The branch-protection dry-run test no longer depends on the checkout's `origin` remote.
+- `auth ai-set` accepts only absolute http(s) AI base URLs with a host; embedded credentials, query
+  strings and fragments are rejected. A failed `--ai-profile` selection keeps the previous profile.
+
 ## [0.1.0a7] - 2026-10-13
 
 ### Added

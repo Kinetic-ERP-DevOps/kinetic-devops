@@ -31,6 +31,26 @@ class TestFsOpsRiskMatrix(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.td, ignore_errors=True)
 
+    @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows feature")
+    def test_tracked_file_via_short_8dot3_path_is_still_tracked(self):
+        # GitHub's Windows runners (and some user profiles) put TEMP under an
+        # 8.3 short path such as C:\Users\RUNNER~1, while git reports the
+        # repository root in long form.
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(1024)
+        ctypes.windll.kernel32.GetShortPathNameW(self.td, buffer, 1024)
+        short_dir = buffer.value
+        if not short_dir or short_dir.lower() == self.td.lower():
+            self.skipTest("this filesystem doesn't generate 8.3 short names")
+        with open(os.path.join(self.td, "tracked.txt"), "w", encoding="utf-8") as f:
+            f.write("x")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=self.td, check=True, capture_output=True)
+
+        info = describe_overwrite_risk(os.path.join(short_dir, "tracked.txt"))
+        self.assertTrue(info["in_repo"], info)
+        self.assertTrue(info["tracked"], info)
+
     def test_new_path_is_none_and_proceed(self):
         path = os.path.join(self.td, "new_file.txt")
         info = describe_overwrite_risk(path)

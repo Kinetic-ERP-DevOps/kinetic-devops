@@ -1,9 +1,4 @@
 import unittest
-import sys
-import os
-
-# Add project root to path to allow importing kinetic_devops
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from kinetic_devops.KineticCore import KineticCore
 

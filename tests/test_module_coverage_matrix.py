@@ -44,6 +44,7 @@ SCRIPT_MODULE_MATRIX = {
     "build_kinetic_app.py",
     "build_kinetic_custom_layer.py",
     "build_kinetic_reports.py",
+    "compare_timings.py",
     "env_init.py",
     "extract_and_format_content.py",
     "find_sensitive_data.py",
@@ -57,7 +58,9 @@ SCRIPT_MODULE_MATRIX = {
     "pull_tax_configs.py",
     "refresh_post_db.py",
     "repo_maker.py",
+    "sandbox_test.py",
     "rename_MetaUis.py",
+    "run_timings.py",
     "stash_dangling_commit.py",
     "stash_dangling_objects.py",
     "tax_clear.py",
@@ -72,7 +75,7 @@ class TestModuleCoverageMatrix(unittest.TestCase):
         cls.repo_root = Path(__file__).resolve().parents[1]
 
     def test_package_matrix_matches_repo_modules(self):
-        package_dir = self.repo_root / "kinetic_devops"
+        package_dir = self.repo_root / "src" / "kinetic_devops"
         discovered = {
             path.stem
             for path in package_dir.glob("*.py")

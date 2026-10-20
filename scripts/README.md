@@ -1,8 +1,8 @@
 # Scripts & Developer Tooling
 
-## Environment Setup (PYTHONPATH & Kinetic Config)
+## Environment Setup (Kinetic Config)
 
-Before running helper scripts, initialize the environment to set `PYTHONPATH` and Kinetic configuration variables.
+Run `uv sync` once: it installs `kinetic_devops` (from `src/`) into `.venv`, so helper scripts import it without any `PYTHONPATH`. Then initialize the Kinetic configuration variables:
 
 ### Windows (Command Prompt / batch):
 
@@ -10,10 +10,9 @@ Before running helper scripts, initialize the environment to set `PYTHONPATH` an
 scripts\env_init.bat [env-name]
 ```
 
-This activates a Python venv (if present) and sets:
+This activates the uv venv (`.venv`, if present) and sets:
 - `KIN_COMPANY`, `KIN_ENV_NAME` (script context vars)
 - `KINETIC_TAXCONFIG_DB` (SQLite config location)
-- `PYTHONPATH` (points to repo root so scripts can import `kinetic_devops`)
 
 The script generates and executes a randomized temp `.bat` file under your OS temp directory, then securely erases it.
 
@@ -48,21 +47,105 @@ uv run python tests/test_runner.py
 ```
 
 - The test runner validates the environment, discovers tests under `tests/`, and writes results to `tests/test_results.log`.
-- CI invokes the test runner via `python -m tests.test_runner`.
+- CI runs the same tests via `uv run python -m pytest` (Linux on GitHub and Forgejo, plus `windows-latest` on GitHub), which also records per-test timings (see "Comparing Environments").
 
 ---
 
-## Pre-commit Hooks
+## Git Hooks
 
-Install the repo-tracked pre-commit hook locally (PowerShell):
+Install the hooks once per clone (PowerShell):
 
 ```powershell
-Copy-Item scripts\hooks\pre-commit .git\hooks\pre-commit
-# or configure Git to use the repo hooks directory
-git config core.hooksPath scripts/hooks
+.\scripts\install-hook.ps1
 ```
 
-The hook runs a blocking sensitive-data scan on staged content and then `python -m tests.test_runner` before each commit.
+- **pre-commit** (always on): a blocking sensitive-data scan of the staged content, then the test
+  suite with native checks deferred (see below). It runs through `uv run`.
+- **pre-push** (opt-in): tests each pushed commit on a clean Windows in Windows Sandbox
+  (`scripts/sandbox_test.py`, several minutes). Enable with `git config kinetic.prepushSandbox true`.
+  Without Windows Sandbox (not every developer has it) the check is skipped with a warning and the
+  push continues. `KINETIC_PREPUSH_SANDBOX=0` skips it for one push even when enabled (`=1` runs it
+  once without enabling it). Commits that already passed are skipped, so you can run
+  `uv run python scripts/sandbox_test.py` before pushing.
+
+### Native checks and enterprise endpoint security
+
+Managed Windows machines may block or kill **newly built or edited unsigned code**: the console-script
+launchers uv writes (`.venv\Scripts\kinetic-devops.exe` and friends), native extension libraries
+of newly installed packages (e.g. `cryptography`'s, used by the encrypted vault) and new or recently
+edited `.ps1` files. Symptoms: "Access denied" when running a script, `DLL load failed ... Access is
+denied` on import, a launcher killed mid-run, or a file briefly locked right after it is written. `uv run` itself is fine and remains the way to run everything.
+
+So the checks that execute that native code are **deferred** on a development machine, never dropped:
+
+- Local test runs and the pre-commit hook skip them (the same commands are still covered via
+  `python -m`), so development is never blocked.
+- CI always runs them (`CI=true`), including GitHub's `windows-latest` job.
+- Windows Sandbox runs them on demand: `uv run python scripts/sandbox_test.py` (full suite plus smoke
+  checks), `--native-only` (just the deferred checks), `--tests NAME ...` (a subset), `--smoke-only`.
+- Run them on this machine intentionally, e.g. while getting the files approved by your security
+  team: `uv run python -m tests.test_runner --native` and `.\scripts\windows_smoke.ps1`
+  (or `KINETIC_NATIVE_CHECKS=1` for any run).
+
+Endpoint security also costs time. On one managed machine (freshly rebooted, nothing else running)
+the same suite, same commit and hardware, took 67 s natively, 21 s in the kept Windows Sandbox and
+9 s in WSL; over the tests that ran everywhere, native was 4x slower than the sandbox, most of all in
+tests that start Python processes (5-7x) and git/file-heavy tests (about 3x). Machine state matters
+too: before a reboot every environment there ran 2-4x slower. On such machines, prefer the kept
+sandbox for full local runs: `uv run python scripts/sandbox_test.py --working-tree`, and compare with
+`scripts/run_timings.py`.
+
+If running `install-hook.ps1` is blocked, the hooks can still be installed: they are the two `sh`
+scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushContent` ->
+`.git/hooks/pre-push`).
+
+## Windows Checks
+
+- `scripts/windows_smoke.ps1`: the Windows-only checks (console-script launchers, `env_init.ps1` and
+  `env_init.bat`, `install-hook.ps1`). Run it from the repo root of a throwaway checkout after
+  `uv sync`. GitHub's `windows-latest` CI job runs it on every pull request.
+- `scripts/sandbox_test.py`: runs the test suite and the smoke checks for a commit on Windows in
+  Windows Sandbox (no endpoint-security agent). With the Windows Sandbox CLI (`wsb`, Windows 11 24H2+)
+  one sandbox is kept running and reused: each run checks what is running first, reuses its sandbox,
+  adopts a running one it doesn't know (stale id, earlier session, opened by hand -- the job folder is
+  shared into it with `wsb share`), or starts one. Each job gets a fresh checkout and `.venv`; uv and
+  its cache stay warm. `--fresh` restarts it clean, `--stop` stops it, `--one-shot` uses a self-closing
+  sandbox (the fallback without `wsb`). Exit 0 pass, 1 fail, 2 sandbox unavailable.
+  Git in the kept sandbox is MinGit on the sandbox's own disk. This machine keeps the zip in a
+  version-checked cache (`%LOCALAPPDATA%\kinetic-devops\sandbox\cache`): it checks the latest
+  git-for-windows release, downloads only when the cache is missing, outdated or corrupt, and checks
+  the SHA-256 against the release's published digest; a release without a published digest is never
+  cached as verified (the cached copy or this machine's Git is used instead). Offline it uses the
+  cached copy. The sandbox
+  reinstalls when its version differs. `--refresh-mingit` ignores the cache (download and reinstall);
+  `--no-mingit` uses this machine's Git instead.
+
+## Comparing Environments (timings)
+
+Informative only -- nothing here fails a build. Each environment records a run as JUnit XML from
+`python -m pytest --junitxml` (per-test time, outcome and skip reason) plus a small metadata file
+(label, commit, Python, OS, CPUs, end-to-end time, extra checks included).
+
+- `uv run python scripts/run_timings.py [--working-tree] [--envs native,sandbox,wsl,alpine] [--repeat N]`
+  runs the suite on this machine, in the kept Windows Sandbox, in WSL (default: the newest
+  `Ubuntu-NN.NN` distro with uv; `--wsl-distro` to choose) and in a throwaway `python:3.14-alpine`
+  container via Podman in a WSL distro that has it (musl coverage; `--podman-distro`), each skipped
+  with the reason if unavailable, and writes the records to `temp/timings/<commit>/`. With
+  `--repeat N` each environment runs N times and the report compares medians (with the min-max
+  range, and tests that passed in some repeats and failed in others marked flaky). Each record notes
+  how busy this machine's CPU was when the run started; runs that started 50% busy or more are
+  flagged as unreliable.
+- CI records every run too: download the `timings-*` artifacts of a CI run (GitHub Linux/Windows,
+  Forgejo Linux) into the same folder to compare with the local environments.
+- `uv run python scripts/compare_timings.py report temp/timings/<commit>/ [--baseline windows-native]`
+  prints: totals per environment (suite time and end-to-end time, with each run's scope -- tests run,
+  skipped, failed, extra checks -- and where scopes differ, what differs, so apples-to-oranges totals
+  are labelled as such); tests not run in every environment, with the skip reasons; failures that
+  happen in only some environments; and per-module/per-test times over the tests that passed
+  everywhere (the like-for-like comparison).
+
+Always invoke pytest as `python -m pytest`: endpoint security may block the generated `pytest.exe`
+launcher.
 
 ## Branch Protection Automation (GitHub + Forgejo)
 
@@ -244,8 +327,8 @@ python -m kinetic_devops meta --env <ENV> --user <USER> layers dump5.json dump6.
 python -m kinetic_devops meta --env <ENV> --user <USER> layers dump5.json dump6.json --dry-run
 
 # Trim trace files and generate a delta sidecar for review
-python kinetic_devops/trim_trace_paths.py trace.json --drop "*.request.headers.Authorization" --delta-mode summary --delta-format jsonc
-python kinetic_devops/trim_trace_paths.py trace.json --drop "*.request.headers.Authorization" --delta-mode annotated --delta-format both --no-delta-redact-values
+uv run python -m kinetic_devops.trim_trace_paths trace.json --drop "*.request.headers.Authorization" --delta-mode summary --delta-format jsonc
+uv run python -m kinetic_devops.trim_trace_paths trace.json --drop "*.request.headers.Authorization" --delta-mode annotated --delta-format both --no-delta-redact-values
 
 # Migrate API key access scope from one instance to another (direct remap)
 python -m kinetic_devops scope --source-env SourceEnv --target-env TargetEnv --from-scope LEGACY_SCOPE --to-scope NEW_SCOPE

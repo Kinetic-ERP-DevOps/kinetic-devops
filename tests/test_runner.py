@@ -16,8 +16,7 @@ from pathlib import Path
 
 
 # Resolve repository root (parent of tests/)
-_repo_root = Path(__file__).parent.parent
-sys.path.insert(0, str(_repo_root))
+_repo_root = Path(__file__).resolve().parent.parent
 os.chdir(str(_repo_root))
 
 
@@ -51,7 +50,7 @@ def validate_environment():
 
     # Check basic repo structure
     required_dirs = [
-        'kinetic_devops',
+        'src/kinetic_devops',
         'tests',
         'scripts'
     ]
@@ -64,12 +63,12 @@ def validate_environment():
 
     # Check a few key files that the tests expect
     required_files = [
-        'kinetic_devops/__init__.py',
-        'kinetic_devops/auth.py',
-        'kinetic_devops/base_client.py',
-        'kinetic_devops/baq.py',
-        'kinetic_devops/boreader.py',
-        'kinetic_devops/file_service.py',
+        'src/kinetic_devops/__init__.py',
+        'src/kinetic_devops/auth.py',
+        'src/kinetic_devops/base_client.py',
+        'src/kinetic_devops/baq.py',
+        'src/kinetic_devops/boreader.py',
+        'src/kinetic_devops/file_service.py',
     ]
     for file_name in required_files:
         if (_repo_root / file_name).exists():
@@ -78,11 +77,15 @@ def validate_environment():
             errors.append(f"Missing file: {file_name}")
 
     # Try importing the SDK package
+    # The package is installed into the environment (`uv sync`), not found via sys.path.
     try:
-        import kinetic_devops  # noqa: F401
+        import kinetic_devops
         logger.info(f"[OK] kinetic_devops module imports successfully")
+        package_dir = Path(kinetic_devops.__file__).resolve().parent
+        if package_dir != (_repo_root / "src" / "kinetic_devops").resolve():
+            warnings.append(f"kinetic_devops is imported from {package_dir}, not this checkout's src/")
     except Exception as e:
-        errors.append(f"Cannot import kinetic_devops: {e}")
+        errors.append(f"Cannot import kinetic_devops (run `uv sync`, then use `uv run`): {e}")
 
     # Optional dependency check
     try:
@@ -126,7 +129,7 @@ def run_tests(validate_only: bool = False):
     logger.info("=" * 70)
 
     loader = unittest.TestLoader()
-    suite = loader.discover(str(_repo_root / "tests"), pattern='test_*.py')
+    suite = loader.discover(str(_repo_root / "tests"), pattern='test_*.py', top_level_dir=str(_repo_root))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
@@ -159,5 +162,16 @@ if __name__ == '__main__':
         action="store_true",
         help="Run environment validation only"
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help=(
+            "Also run the checks that execute generated native code (console-script .exe "
+            "launchers). Local runs defer them by default because endpoint security may "
+            "block newly built unsigned files; CI and scripts/sandbox_test.py always run them."
+        ),
+    )
     args = parser.parse_args()
+    if args.native:
+        os.environ["KINETIC_NATIVE_CHECKS"] = "1"
     sys.exit(run_tests(validate_only=args.validate))

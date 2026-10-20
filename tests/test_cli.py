@@ -7,7 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from tests.cli_matrix import CLI_MODULES, ROUTER_TOOLS, scaled_timeout
+from tests.cli_matrix import CLI_MODULES, ROUTER_TOOLS, native_checks_enabled, scaled_timeout
 
 
 class TestServiceCLI(unittest.TestCase):
@@ -75,12 +75,12 @@ class TestServiceCLI(unittest.TestCase):
                 self._assert_help(result, entry_name)
 
     def test_console_script_help_for_all_router_tools(self):
-        # Opt-out for machines where endpoint security blocks or kills the
-        # generated console-script launcher (an unsigned .exe on Windows).
-        # The same help paths are covered via `python -m` above, and CI
-        # runners still exercise the launcher.
-        if os.environ.get("KINETIC_SKIP_CONSOLE_SCRIPT_TESTS", "").strip().lower() in {"1", "true", "yes"}:
-            self.skipTest("KINETIC_SKIP_CONSOLE_SCRIPT_TESTS is set")
+        # Runs the generated console-script launcher (an unsigned .exe on
+        # Windows), which endpoint security may block when freshly built, so
+        # local runs defer it; CI, Windows Sandbox and `--native` runs execute it.
+        # The same help paths are covered via `python -m` above.
+        if not native_checks_enabled():
+            self.skipTest("native check deferred (runs in CI, scripts/sandbox_test.py, or tests.test_runner --native)")
         script = self._resolve_console_script()
         if not script:
             self.skipTest("kinetic-devops console script was not found in PATH or .venv")

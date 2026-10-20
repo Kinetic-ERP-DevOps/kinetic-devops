@@ -4,6 +4,8 @@ bin/
 obj/
 exports/
 temp/
+# CI timing records (scripts/compare_timings.py)
+/timings/
 tmp/
 exports/
 projects/

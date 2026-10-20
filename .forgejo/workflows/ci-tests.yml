@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # Use the interpreter from setup-python; never download another one.
+  # UV_PYTHON overrides the repo's .python-version (3.14, for local work) for
+  # every uv command; jobs that set up a different Python override it.
+  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON: "3.12"
+
 jobs:
   sensitive-data-gate:
     name: Sensitive Data Gate
@@ -26,13 +33,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install uv and sync the locked environment
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install uv
+          uv sync --locked
 
       - name: Run sensitive data gate
-        run: python scripts/hooks/pre-commit --remote-scan-only
+        run: uv run python scripts/hooks/pre-commit --remote-scan-only
 
   required-test:
     name: Python Test Gate (required, py${{ matrix.python-version }})
@@ -42,6 +49,8 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
 
     steps:
       - name: Checkout
@@ -54,13 +63,86 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install uv and sync the locked environment
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install uv
+          uv sync --locked
 
+      # Same tests as tests.test_runner, via pytest for per-test timings and skip
+      # reasons (JUnit XML); scripts/compare_timings.py compares environments.
       - name: Run regression suite
-        run: python -m tests.test_runner
+        run: uv run python -m pytest -q -p no:cacheprovider --junitxml="timings/forgejo-linux-py${{ matrix.python-version }}.xml"
+
+      - name: Record timing metadata
+        if: always()
+        run: uv run python scripts/compare_timings.py meta --label "forgejo-linux-py${{ matrix.python-version }}" --out "timings/forgejo-linux-py${{ matrix.python-version }}.json" --extra "native checks"
+
+      - name: Upload timing record
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: timings-forgejo-linux-py${{ matrix.python-version }}
+          path: timings/
+
+  wheel-smoke-test:
+    name: Built Wheel Smoke Test
+    runs-on: ubuntu-latest
+    needs: sensitive-data-gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install uv
+
+      - name: Build sdist and wheel
+        run: uv build --out-dir "$RUNNER_TEMP/dist"
+
+      - name: Wheel contains only the package
+        run: |
+          python - "$RUNNER_TEMP"/dist/*.whl <<'EOF'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          stray = sorted({n.split("/")[0] for n in names
+                          if not n.startswith(("kinetic_devops/", "kinetic_devops-"))})
+          if stray:
+              sys.exit(f"Unexpected top-level entries in the wheel: {stray}")
+          print(f"{len(names)} files, all under kinetic_devops/")
+          EOF
+
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" "$RUNNER_TEMP"/dist/*.whl
+
+      # Run outside the checkout so nothing can be imported from the source tree.
+      - name: Smoke-test the installed package
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -e
+          BIN="$RUNNER_TEMP/smoke/bin"
+          "$BIN/python" - <<'EOF'
+          import importlib, pkgutil, kinetic_devops
+          location = kinetic_devops.__file__
+          assert "site-packages" in location, f"imported from {location}"
+          modules = [m.name for m in pkgutil.walk_packages(kinetic_devops.__path__, "kinetic_devops.")]
+          for name in modules:
+              importlib.import_module(name)
+          print(f"imported {len(modules)} modules from {location}")
+          EOF
+          "$BIN/kinetic-devops" --help > /dev/null
+          "$BIN/repomaker" --help > /dev/null
+          "$BIN/reposmith" --help > /dev/null
+          "$BIN/repo-maker" --help > /dev/null
+          "$BIN/python" -m kinetic_devops.auth --help > /dev/null
+          "$BIN/python" -m kinetic_devops.efx_library --help > /dev/null
+          echo "console scripts and module CLIs start"
 
   efx-syntax-check-tool-build:
     name: EFx Syntax Check Tool Build

@@ -18,14 +18,11 @@ if sys.platform == 'win32':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# Ensure the parent directory is in the path so we can find the kinetic_devops package
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 # Import the manager from your library
 try:
     from kinetic_devops import KineticConfigManager
 except ImportError:
-    print("Error: Could not find 'kinetic_devops'. Ensure you are running from the project root.", file=sys.stderr)
+    print("Error: Could not import 'kinetic_devops'. Run `uv sync` once, then `uv run python scripts/env_init.py`.", file=sys.stderr)
     sys.exit(1)
 
 class KineticEnvManager:
@@ -87,10 +84,6 @@ class KineticEnvManager:
         # Only emit values consumed by downstream scripts.
         commands.append(f"{prefix}KIN_COMPANY={base_cfg['companies']}")
         commands.append(f"{prefix}KIN_ENV_NAME={base_cfg['nickname']}")
-
-        # Ensure PYTHONPATH points to repo root so helper scripts can import the SDK
-        repo_root = str(self.root_dir).replace('\\', '/') if os.name != 'nt' else str(self.root_dir)
-        commands.append(f"{prefix}PYTHONPATH={repo_root}")
 
         # Set KINETIC_TAXCONFIG_DB for SQLite config location
         commands.append(f"{prefix}KINETIC_TAXCONFIG_DB={self.db_path}")
