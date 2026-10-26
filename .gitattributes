@@ -1,3 +1,7 @@
 # cmd.exe misparses batch files with LF-only line endings.
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# sh reads CR as part of each command: shell scripts and git hook templates stay LF.
+*.sh text eol=lf
+scripts/hooks/templates/* text eol=lf

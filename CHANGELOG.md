@@ -9,6 +9,14 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 
 ## [Unreleased]
 
+### Added
+- Local branch guard in the git hooks: no commits (merge commits included) on `main`; `main` is pushed
+  only as exactly `public/main` and never to `public`; the scratch `dev` branch is never pushed.
+  `KINETIC_ALLOW_MAIN=1` skips it once. See CONTRIBUTING.md, "Local branch guard".
+- `scripts/install-hook.sh` installs the hooks from Git Bash, with no PowerShell script execution.
+  The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
+  installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
+
 ## [0.2.0.0a8] - 2026-11-01
 
 The 8th alpha, and the first release under the versioning rule in the README (*Versioning*): this

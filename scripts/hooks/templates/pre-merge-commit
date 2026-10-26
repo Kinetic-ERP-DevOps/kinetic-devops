@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# This file is managed by scripts/install-hook.sh (source: scripts/hooks/templates/). Do not edit directly.
+
+# Local branch guard: no merge commits on main (merge into dev to try branches together).
+GUARD="$(git rev-parse --git-path hooks)/branch-guard.sh"
+if [ -f "$GUARD" ]; then
+    exec sh "$GUARD" commit
+fi
+exit 0

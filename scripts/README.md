@@ -53,15 +53,23 @@ uv run python tests/test_runner.py
 
 ## Git Hooks
 
-Install the hooks once per clone (PowerShell):
+Install the hooks once per clone, and again after `scripts/hooks/templates/` changes. From Git Bash
+(no PowerShell script execution needed, so endpoint security doesn't get in the way):
 
-```powershell
-.\scripts\install-hook.ps1
+```sh
+sh scripts/install-hook.sh
 ```
 
-- **pre-commit** (always on): a blocking sensitive-data scan of the staged content, then the test
-  suite with native checks deferred (see below). It runs through `uv run`.
-- **pre-push** (opt-in): tests each pushed commit on a clean Windows in Windows Sandbox
+`.\scripts\install-hook.ps1` installs the same files. Both copy `scripts/hooks/templates/` into the
+real hooks directory (shared by all worktrees of the clone).
+
+- **branch guard** (always on, in all three hooks): no commits on `main`, `main` pushed only as
+  exactly `public/main` and never to `public`, `dev` never pushed. See CONTRIBUTING.md, "Local branch
+  guard". `KINETIC_ALLOW_MAIN=1` skips it for one command.
+- **pre-commit** (always on): the branch guard, then a blocking sensitive-data scan of the staged
+  content, then the test suite with native checks deferred (see below). It runs through `uv run`.
+- **pre-merge-commit** (always on): the branch guard.
+- **pre-push**: the branch guard (always on), then (opt-in) tests each pushed commit on a clean Windows in Windows Sandbox
   (`scripts/sandbox_test.py`, several minutes). Enable with `git config kinetic.prepushSandbox true`.
   Without Windows Sandbox (not every developer has it) the check is skipped with a warning and the
   push continues. `KINETIC_PREPUSH_SANDBOX=0` skips it for one push even when enabled (`=1` runs it
@@ -95,9 +103,8 @@ too: before a reboot every environment there ran 2-4x slower. On such machines, 
 sandbox for full local runs: `uv run python scripts/sandbox_test.py --working-tree`, and compare with
 `scripts/run_timings.py`.
 
-If running `install-hook.ps1` is blocked, the hooks can still be installed: they are the two `sh`
-scripts embedded in it (`$hookContent` -> `.git/hooks/pre-commit`, `$prePushContent` ->
-`.git/hooks/pre-push`).
+If running `install-hook.ps1` is blocked, use `sh scripts/install-hook.sh` (above), or copy the files
+in `scripts/hooks/templates/` into the hooks directory by hand.
 
 ## Windows Checks
 
