@@ -1,0 +1,118 @@
+# Infrastructure as Code (IaC)
+
+## Deliverables
+
+## 1\) Executive Summary
+
+* **Maturity Level: Alpha / Operational Prototype.** The framework is currently in an alpha stage with a roadmap focused on expanding artifact coverage.
+* **Deterministic Isolation:** Uses `uv` and `uv.lock` to ensure absolute dependency parity and prevent "it works on my machine" syndromes.
+* **Zero-Knowledge Security:** Implements a sophisticated local encryption model using AES-256 and PBKDF2 to protect API secrets.
+* **Intent/Expectation/Reality (IER) Model:** Explicitly separates what should exist (Git) from what is claimed (Manifests) and what actually exists (Observed state).
+* **Hot Reload Workflow:** Enables rapid prototyping for SaaS ERP tasks, reducing cycle times from minutes to seconds.
+* **Configuration as Code (CaC):** Moves ERP management from proprietary UIs into Git-native workflows.
+* **Critical Gap - Partial Artifact Coverage:** Full mirroring of all Kinetic artifacts (BPMs, Functions) is still a future roadmap item.
+* **Critical Gap - Documentation for Regulated Orgs:** While SOX-compliant in theory, formal documentation for auditors remains "Unknown" in the current source material.
+* **Critical Gap - Implementation of ETL Strategy:** The Ephemeral Triad Lifecycle is defined as a strategy but lacks evidence of full integration in the core SDK.
+* **Critical Gap - Secrets Scanning:** There is no explicit evidence of pre-commit hooks or automated secrets scanning in the repo structure.
+
+## 2\) Auditor Report (Controls + Evidence)
+
+### Security \& Secrets
+
+* **Secret Storage Model (Pass):** Implements `auth.py` for zero-knowledge storage, utilizing AES-256 encryption with keys derived from user passphrases via PBKDF2.
+* **Least Privilege Guidance (Partial):** The framework mandates environment-specific "Triple-Locked" identities to scope bearer tokens, but specific guidance on Kinetic-side user permissions is **Unknown**.
+* **Rotation Story (Partial):** The "Ephemeral Triad Lifecycle" strategy defines SHA-linked, self-destructing identities for CI/CD, though its deployment status across all modules is **Unknown**.
+* **Secrets Scanning (Unknown):** No specific file paths or config names for pre-commit hooks or CI-based secrets scanning were found in the sources.
+
+### Change Control / Traceability
+
+* **Traceability (Pass):** Deployments are linked to Git history, peer reviews, and "Environment Manifests" that act as contracts for state.
+* **Immutable Releases (Partial):** While the framework aims for 1:1 Git-to-Prod consistency, evidence of signed tags or SBOM generation is **Unknown**.
+* **Environment Protection (Pass):** Promotions to Training or Production are restricted to the protected `/projects` master fork.
+
+### Drift Detection \& Forensics
+
+* **Snapshot Mechanism (Partial):** The framework utilizes "Pull" and "Export" operations to observe "Reality," though the `ExportAllTheThings` automation is a future roadmap item.
+* **Snapshot Storage (Pass):** Reality states are intended to be stored in "Backup Forks" or "Snapshot Branches".
+* **Drift Reporting (Pass):** Unexpected mutations in "Reality" are identified and treated as evidence for forensics rather than being silently overwritten.
+
+### Operational Safety
+
+* **Idempotency (Pass):** Deterministic state management is a core design principle enforced by `uv run` and the CaC paradigm.
+* **Rollback Strategy (Pass):** Rollbacks are achieved via `git revert` followed by a re-run of the Python deployer.
+* **Dry-run Support (Unknown):** Specific CLI flags for dry-runs are not explicitly detailed in the provided architectural excerpts.
+* **Logging \& Redaction (Unknown):** While robust logging is mentioned for troubleshooting, evidence of structured logs or automatic credential redaction in output is **Unknown**.
+
+## 3\) Architect Review (System Design + Alignment)
+
+### Current Architecture \& Responsibilities
+
+The framework is a **Configuration as Code (CaC)** infrastructure built on Python. It utilizes **Scoop** for toolchain management and **uv** for deterministic environment isolation. A **PowerShell bootstrap** script orchestrates the local developer stack and enforces habits through a "shunt" system. The **Kinetic SDK** provides Pythonic wrappers (`BAQClient`, `BOReader`) that abstract the ERP's REST API.
+
+### Implied Sources of Truth
+
+* **Authoritative Intent:** The `/projects` master fork in Git.
+* **Contractual Expectation:** Environment Manifests.
+* **Observed Reality:** Snapshots exported directly from the Kinetic database.
+
+### Target Architecture Options
+
+1. **Minimal Change:** Stabilize existing `BAQClient` and `BOReader` wrappers; formalize the manual manifest update process.
+2. **Moderate Refactor:** Implement the full `ExportAllTheThings` logic to automate "Reality" snapshots into Git branches.
+3. **Full IER Model:** Integrate the **Agency-Resolution Protocol** for AI-driven drift remediation and implement the **Ephemeral Triad Lifecycle** for all CI/CD workflows.
+
+## 4\) Integrator Evaluation
+
+### Prerequisites Checklist
+
+* **OS:** Windows (preferred for Kinetic local tools) or Linux/WSL for CI/CD.
+* **Tooling:** Scoop (for Windows installs) and `uv` (for Python package management).
+* **Language:** Python interpreter (managed via `uv`).
+* **Network:** Access to Kinetic REST API endpoints via TLS 1.2+.
+
+### "First Successful Run" Plan
+
+1. Execute `bootstrap-dev.ps1` to set up the isolated environment and PowerShell shunts.
+2. Run `uv run python auth.py` to initialize the zero-knowledge secret store and encrypt API keys.
+3. Execute a "Pull" command to extract a Kinetic artifact (e.g., a BAQ) into the `/projects` folder.
+4. Modify the artifact locally and run the Python deployer to "Push" changes to the Dev environment.
+
+### CI/CD Integration
+
+* **Runners:** Support for GitHub Actions and Azure DevOps.
+* **Secret Handling:** Implementation of the **Ephemeral Triad Lifecycle (ETL)** to use transient, SHA-linked credentials that are wiped after the run.
+
+### Gaps Blocking Regulated Adoption
+
+* **Formal Validation:** Lack of explicit documentation regarding SOX audit procedures for "Reality" snapshot verification.
+* **Artifact Completeness:** Missing support for complex artifacts like BPMs and Functions prevents a full audit trail of all ERP changes.
+
+## 5\) User Experience Review
+
+### Developer/Operator Workflow
+
+* **Onboarding (Pass):** Fast setup via automated bootstrap script.
+* **Local Workflow (Pass):** "Hot Reload" allows editing in modern IDEs like VS Code with immediate verification via script execution.
+* **Testing Story (Partial):** Framework supports `pytest`, but specific Kinetic-integrated integration test examples are **Unknown**.
+* **Debuggability (Pass):** Deterministic environments eliminate library version conflicts.
+
+### Top 10 UX Improvements
+
+1. Implement a CLI "help" command for all sub-scripts.
+2. Add a `dry-run` flag to the deployment tool.
+3. Automate the generation of "Environment Manifests" post-deployment.
+4. Provide built-in logging redaction for API tokens.
+5. Create a "Scaffolding" command to quickly add new `/projects` artifacts.
+6. Integrate `Playwright` for automated UI verification of report styles.
+7. Improve error messaging when `uv run` fails due to lockfile mismatches.
+8. Add a "Health Check" command for the `auth.py` keyring status.
+9. Develop a GUI dashboard for visualizing drift between "Intent" and "Reality".
+10. Streamline the "Pull" process to automatically strip environment-specific metadata.
+
+## 6\) Backlog Recommendations
+
+|Priority|Task|Description|Evidence of Completion|
+|-|-|-|-|
+|**P0**|**ExportAllTheThings**|Automate extraction of all Kinetic artifacts (BPMs, Functions, etc.).|New `scripts/export\\\\\\\\\\\\\\\_all.py` file.|
+|**P1**|**ETL Implementation**|Fully integrate the Ephemeral Triad Lifecycle into CI/CD pipelines.|GitHub Actions YAML with `TRIAD\\\\\\\\\\\\\\\_<SHA>` logic.|
+|**P2**|**AI Monitoring**|Integrate AI-driven monitoring and automated testing via Playwright.|`tests/ui\\\\\\\\\\\\\\\_verification.py` script.|
