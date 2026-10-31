@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Python 3.11 is now the minimum** (`requires-python = ">=3.11"`); 3.10 reached end of life in
+  October 2026 and no longer gets security fixes. New support policy: every CPython version that still
+  receives security fixes, and only those (README, *Supported Python versions*). The 3.10 CI job is now a
+  3.11 job, so a branch-protection rule requiring `Python Test Gate (required, py3.10)` must switch to
+  `py3.11`. Dependencies: three backports only 3.10 needed (`exceptiongroup`, `tomli`, `typing-extensions`)
+  drop out of the lock; every other locked version is unchanged and has no known vulnerabilities (pip-audit).
 - The package now lives in `src/kinetic_devops/` (src layout; moved with `git mv`, so `git log --follow`
   keeps each file's history). Packaging finds it via `where = ["src"]`.
 - No more `sys.path` / `PYTHONPATH` tweaks in scripts, tests or `env_init`: the package is imported from

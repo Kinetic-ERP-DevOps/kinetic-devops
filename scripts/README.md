@@ -225,7 +225,7 @@ CI workflow mirrors:
 - Forgejo Actions: `.forgejo/workflows/ci-tests.yml`
 
 Use branch protection rules on both platforms to require only these blocking checks before merge:
-- `Python Test Gate (required, py3.10)`
+- `Python Test Gate (required, py3.11)`
 - `Python Test Gate (required, py3.12)`
 
 Keep advisory checks non-required so merges can proceed while still flagging version compatibility issues.
