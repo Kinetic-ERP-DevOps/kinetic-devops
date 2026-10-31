@@ -270,9 +270,16 @@ Users extend this core by adding private Git submodules for their custom impleme
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+ (every CPython version that still gets security fixes; see [Supported Python versions](#supported-python-versions))
 - `keyring` — Secure credential storage
 - `requests` — HTTP client
+
+## Supported Python versions
+
+Kinetic-DevOps supports exactly the CPython versions that still receive security fixes upstream
+(see <https://devguide.python.org/versions/>). When a version reaches end of life, the next release drops
+it: `requires-python`, the classifiers and the CI matrix move up together, and the changelog says so.
+Older releases stay on PyPI for anyone who can't upgrade yet. Currently: 3.11, 3.12, 3.13 and 3.14.
 
 ## Installation
 

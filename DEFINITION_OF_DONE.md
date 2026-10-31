@@ -51,7 +51,7 @@ Every PR that changes runtime behavior should include:
 These are high-value and low-friction additions:
 
 1. CI matrix smoke tests
-- Run core test suite on Python 3.10, 3.12, and latest.
+- Run core test suite on the oldest supported Python (3.11), 3.12, and latest (see README, Supported Python versions).
 
 2. PR quality gates
 - Require one approving review on release-impacting changes.

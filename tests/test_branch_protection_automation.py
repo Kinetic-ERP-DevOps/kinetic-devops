@@ -40,7 +40,7 @@ class TestBranchProtectionAutomation(unittest.TestCase):
         self.assertEqual(
             targets[0].required_checks,
             [
-                "Python Test Gate (required, py3.10)",
+                "Python Test Gate (required, py3.11)",
                 "Python Test Gate (required, py3.12)",
             ],
         )

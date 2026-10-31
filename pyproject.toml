@@ -7,7 +7,7 @@ name = "kinetic-devops"
 version = "0.1.0a7"
 description = "Python toolkit for Epicor Kinetic environment management, CI/CD automation, and data migration workflows."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "keyring",
     "requests",
@@ -20,7 +20,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
