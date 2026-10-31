@@ -2,8 +2,11 @@
   "defaults": {
     "branch": "main",
     "required_checks": [
+      "Sensitive Data Gate",
       "Python Test Gate (required, py3.11)",
-      "Python Test Gate (required, py3.12)"
+      "Python Test Gate (required, py3.12)",
+      "Python Test Gate (required, py3.13)",
+      "Python Test Gate (required, py3.14)"
     ],
     "required_approvals": 1,
     "enforce_admins": true,
@@ -14,14 +17,26 @@
       "provider": "github",
       "owner": "example",
       "repo": "kinetic-devops",
-      "token_env": "GITHUB_TOKEN"
+      "token_env": "GITHUB_TOKEN",
+      "github_mode": "ruleset",
+      "enforcement": "active",
+      "allowed_merge_methods": ["squash"],
+      "protect_tags": ["v*"],
+      "checks_integration_id": 15368
     },
     {
       "provider": "forgejo",
       "token_env": "FORGEJO_TOKEN",
       "owner": "",
       "repo": "",
-      "forgejo_api_base": ""
+      "forgejo_api_base": "",
+      "required_checks": [
+        "CI Tests / Sensitive Data Gate *",
+        "CI Tests / Python Test Gate (required, py3.11) *",
+        "CI Tests / Python Test Gate (required, py3.12) *",
+        "CI Tests / Python Test Gate (required, py3.13) *",
+        "CI Tests / Python Test Gate (required, py3.14) *"
+      ]
     }
   ]
 }

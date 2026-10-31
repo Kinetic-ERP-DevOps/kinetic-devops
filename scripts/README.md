@@ -211,7 +211,11 @@ uv run python scripts/apply_branch_protection.py --config scripts/branch_protect
 ```
 
 The script supports:
-- GitHub branch protection via `https://api.github.com`
+- GitHub **repository rulesets** via `https://api.github.com` (default; `"github_mode": "classic"` writes the legacy
+  branch protection rule instead). Rulesets are created or updated by name (`protect-<branch>`, plus
+  `protect-<branch>-tags` when `protect_tags` is set), so re-running is safe. `"enforcement": "evaluate"` reports
+  what a ruleset would block without blocking. A classic rule left on the branch keeps applying (the stricter
+  wins); the script notes it, and you delete it under Settings > Branches once the ruleset is verified.
 - Forgejo branch protection via a configured `forgejo_api_base` (for example `https://forgejo.example.com/api/v1`)
 - Multiple repositories/hosts in one run
 
@@ -224,11 +228,20 @@ CI workflow mirrors:
 - GitHub Actions: `.github/workflows/ci-tests.yml`
 - Forgejo Actions: `.forgejo/workflows/ci-tests.yml`
 
-Use branch protection rules on both platforms to require only these blocking checks before merge:
-- `Python Test Gate (required, py3.11)`
-- `Python Test Gate (required, py3.12)`
+Require these blocking checks before merge on both platforms (one Python gate per supported version, see the
+README's *Supported Python versions*; a test keeps this list equal to both CI matrices):
+- `Sensitive Data Gate`
+- `Python Test Gate (required, py3.11)` ... `(required, py3.14)`
 
-Keep advisory checks non-required so merges can proceed while still flagging version compatibility issues.
+Forgejo names checks `<workflow> / <job> (<event>)`, so the example's Forgejo target lists them as globs
+(`CI Tests / Python Test Gate (required, py3.11) *`). Keep advisory checks (Windows, wheel smoke, EFx build)
+non-required so merges can proceed while still flagging problems.
+
+The same GitHub rulesets as JSON for the web UI (Settings > Rules > Rulesets > New ruleset > Import):
+`scripts/github-rulesets/protect-main.json` (main: PR with 1 approval, resolved conversations, squash only, the
+checks above from GitHub Actions, up to date with main, no force push or deletion, no bypass) and
+`protect-main-tags.json` (only repository admins create, move or delete `v*` release tags). A test keeps them
+equal to what the script applies.
 
 ### Full-Stack Forgejo Smoke (API)
 
