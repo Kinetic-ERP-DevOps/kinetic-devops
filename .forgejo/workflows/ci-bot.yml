@@ -1,0 +1,36 @@
+# ci-bot on demand: request a review from ci-bot on a PR, or comment "@ci-bot" (AI review) /
+# "@ci-bot test" (re-run the test workflow on the PR's branch). Comments only count from users with
+# write access. Settings -> Actions (repo or org):
+#   Secrets:   LLM_API_KEY   LiteLLM key (forgejo-ci); review skipped without it
+#              CI_BOT_TOKEN  optional, so comments come from ci-bot instead of the Actions bot
+#   Variables: LLM_BASE_URL  OpenAI-compatible base URL (required for reviews), e.g. https://<litellm-host>/v1
+#              LLM_MODEL     default local/fast
+#              CI_TEST_WORKFLOW  default ci-tests.yml (this repo)
+name: ci-bot
+
+on:
+  pull_request:
+    types: [review_requested]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  ci-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.forgejo/actions/ci-bot
+        with:
+          api-key: ${{ secrets.LLM_API_KEY }}
+          base-url: ${{ vars.LLM_BASE_URL }}
+          model: ${{ vars.LLM_MODEL || 'local/fast' }}
+          test-workflow: ${{ vars.CI_TEST_WORKFLOW || 'ci-tests.yml' }}
+          bot-token: ${{ secrets.CI_BOT_TOKEN }}

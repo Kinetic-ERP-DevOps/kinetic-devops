@@ -1,0 +1,35 @@
+name: ci-bot
+description: >
+  On-demand PR actions for ci-bot: an AI review when a review is requested from ci-bot or a comment
+  mentions @ci-bot, and "@ci-bot test" re-runs the test workflow on the PR's branch. Only users with
+  write access to the repo can trigger it from a comment.
+inputs:
+  api-key:
+    description: LiteLLM key for the review (review skipped if empty)
+    default: ""
+  base-url:
+    description: OpenAI-compatible base URL; from the LLM_BASE_URL variable
+    default: ""
+  model:
+    default: local/fast
+  test-workflow:
+    description: Workflow file "@ci-bot test" dispatches
+    default: gate.yml
+  bot-token:
+    description: Token to post as ci-bot (falls back to the job token)
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        LLM_BASE_URL: ${{ inputs.base-url }}
+        LLM_API_KEY: ${{ inputs.api-key }}
+        LLM_MODEL: ${{ inputs.model }}
+        TEST_WORKFLOW: ${{ inputs.test-workflow }}
+        FORGEJO_API: ${{ github.api_url }}
+        FORGEJO_TOKEN: ${{ inputs.bot-token || github.token }}
+        REPO: ${{ github.repository }}
+        EVENT_NAME: ${{ github.event_name }}
+        REVIEW_SCRIPT: ${{ github.action_path }}/../ai-review/ai_review.py
+      run: python3 "${{ github.action_path }}/ci_bot.py"

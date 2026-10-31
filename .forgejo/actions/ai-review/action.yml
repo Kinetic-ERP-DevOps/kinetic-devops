@@ -1,0 +1,34 @@
+name: Local AI review
+description: >
+  Advisory (non-blocking) review of the branch diff by the local LLM stack.
+  Prints the review to the log and, on pull requests, posts it as a comment.
+inputs:
+  base-url:
+    description: OpenAI-compatible base URL (e.g. LiteLLM .../v1); from the LLM_BASE_URL variable
+    default: ""
+  api-key:
+    description: API key for that endpoint
+    required: true
+  model:
+    default: local/fast
+  base-ref:
+    description: Branch to diff against
+    default: main
+  max-diff-chars:
+    default: "60000"
+runs:
+  using: composite
+  steps:
+    - name: Review diff
+      shell: bash
+      env:
+        LLM_BASE_URL: ${{ inputs.base-url }}
+        LLM_API_KEY: ${{ inputs.api-key }}
+        LLM_MODEL: ${{ inputs.model }}
+        BASE_REF: ${{ inputs.base-ref }}
+        MAX_DIFF: ${{ inputs.max-diff-chars }}
+        FORGEJO_API: ${{ github.api_url }}
+        FORGEJO_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: python3 "${{ github.action_path }}/ai_review.py"

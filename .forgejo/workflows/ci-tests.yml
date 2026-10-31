@@ -2,6 +2,8 @@ name: CI Tests
 
 on:
   pull_request:
+  # "Run workflow" button in the Actions tab (pick a branch); handy after runner or config changes
+  workflow_dispatch:
   push:
     branches:
       - main

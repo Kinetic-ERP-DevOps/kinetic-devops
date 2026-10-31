@@ -1,0 +1,41 @@
+# Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can).
+# sync/dry-run/<name> runs every check without pushing. See .forgejo/actions/sync/sync.py for the steps.
+# Settings -> Actions (repo or org):
+#   Secrets:   GH_PUSH_TOKEN   GitHub fine-grained token for this repo only: Contents RW, Pull requests RW;
+#                              Issues, Commit statuses, Checks, Dependabot alerts, Secret scanning alerts,
+#                              Repository security advisories R; never Workflows
+#   Variables: GH_REPO         owner/name on GitHub (required)
+#              SYNC_TEST_CMD   tests to run before promoting (default: uv sync --locked && pytest)
+#              SYNC_PRIVATE_PATTERNS  extra comma-separated regexes that must never go upstream
+#              SYNC_ALLOWED_EMAILS    commit e-mails allowed besides GitHub noreply addresses
+name: Sync to upstream
+
+on:
+  push:
+    tags: ["sync/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: vars.GH_REPO != ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Rebase, check, test, promote
+        env:
+          GH_REPO: ${{ vars.GH_REPO }}
+          GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          FORGEJO_URL: ${{ github.server_url }}
+          SYNC_PRIVATE_PATTERNS: ${{ vars.SYNC_PRIVATE_PATTERNS }}
+          SYNC_ALLOWED_EMAILS: ${{ vars.SYNC_ALLOWED_EMAILS }}
+        run: uv run --no-project --python 3.12 python .forgejo/actions/sync/sync.py   # needs 3.11+ (tomllib); the image has 3.10
