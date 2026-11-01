@@ -14,10 +14,8 @@ on:
   issue_comment:
     types: [created]
 
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
+# No `permissions:` block: Forgejo ignores it (and warns on every job); the automatic token's access is set
+# by Forgejo, and extra API access comes from secrets (or Forgejo's Authorized Integrations).
   actions: write
 
 jobs:

@@ -1,5 +1,6 @@
 # Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
-# Actions -> Sync to upstream -> Run workflow, pick the branch (dry run is ticked by default). The button
+# Actions -> Sync to upstream -> Run workflow on main and type the branch to promote (dry run is ticked by
+# default; the dialog's branch picker also works, leaving the field blank). The button
 # works only for users listed in the SYNC_ACTORS variable (empty = button disabled). sync/dry-run/<name> runs
 # every check without pushing. Steps: .forgejo/actions/sync/sync.py.
 # SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
@@ -22,6 +23,10 @@ on:
     tags: ["sync/**"]
   workflow_dispatch:
     inputs:
+      branch:
+        description: "Branch to promote (start the run on main and type the branch here)"
+        required: false
+        default: ""
       name:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
         required: false
@@ -31,8 +36,8 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
+# No `permissions:` block: Forgejo ignores it (and warns on every job); the automatic token's access is set
+# by Forgejo, and extra API access comes from secrets (or Forgejo's Authorized Integrations).
 
 jobs:
   sync:
@@ -54,6 +59,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           SYNC_EVENT: ${{ github.event_name }}
           SYNC_BRANCH: ${{ github.ref_name }}
+          SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
           SYNC_DRY: ${{ inputs.dry_run }}
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}

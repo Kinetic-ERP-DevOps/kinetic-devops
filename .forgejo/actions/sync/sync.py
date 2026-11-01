@@ -25,10 +25,18 @@ API = "https://api.github.com"
 problems, notes = [], []
 
 
+def redact(text):  # the token, raw or base64 (as in git_auth's header), never reaches the log
+    for secret in filter(None, (TOKEN, __import__("base64").b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+                                if TOKEN else "")):
+        text = text.replace(secret, "***")
+    return text
+
+
 def sh(*cmd, check=True, env=None, input=None):
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, input=input)
     if check and r.returncode:
-        raise SystemExit(f"command failed: {' '.join(cmd[:3])}...: {r.stderr.strip()[-800:]}")
+        shown = [a for a in cmd if not a.startswith("http.") and a != "-c"][:3]   # skip git_auth's -c header
+        raise SystemExit(redact(f"command failed: {' '.join(shown)}...: {r.stderr.strip()[-800:]}"))
     return r.stdout
 
 
@@ -80,10 +88,22 @@ def audit(lock_text):
 
 
 if E.get("SYNC_EVENT") == "workflow_dispatch":
-    # "Run workflow" button: the branch picked in the dialog; name and dry run from the inputs.
-    src = E.get("SYNC_BRANCH", "")
+    # "Run workflow" button: the branch typed into the dialog (run started on main, so these checks come
+    # from main, not from the branch being promoted), else the branch the run was started on.
+    ref, typed = E.get("SYNC_BRANCH", ""), (E.get("SYNC_INPUT_BRANCH") or "").strip()
+    if typed and ref not in ("main", "master", typed):
+        sys.exit(f"sync: branch '{typed}' typed, but the run was started on '{ref}': start it on main, or leave "
+                 "the branch field blank")
+    src = typed or ref
     if src in ("", "main", "master"):
-        sys.exit(f"sync: pick the branch to promote in the Run workflow dialog (got '{src or '?'}')")
+        sys.exit("sync: type the branch to promote into the Run workflow dialog's branch field "
+                 f"(got '{src or '?'}')")
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", src) or ".." in src or src.startswith(("-", "/")):
+        sys.exit(f"sync: bad branch name {src!r}")
+    if typed and typed != ref:
+        sh("git", "fetch", "--no-tags", "-q", "origin", f"refs/heads/{src}:refs/remotes/origin/{src}")
+        sh("git", "checkout", "-q", "--detach", f"refs/remotes/origin/{src}")
+        print(f"sync: checked out {src} at {sh('git', 'rev-parse', '--short', 'HEAD').strip()} (checks from {ref})")
     name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
     dry = E.get("SYNC_DRY", "true").lower() != "false"
     TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
