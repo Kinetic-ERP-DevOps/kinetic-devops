@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -271,7 +272,7 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.15,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
         }
     else:
         url = f"{normalize_base_url(base_url)}/v1/completions"
@@ -280,7 +281,7 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
             "prompt": prompt,
             "temperature": 0.15,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
         }
     req = request.Request(
         url=url,
@@ -288,8 +289,53 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
         headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
+    # Streamed so that giving up actually stops the work: closing the connection frees the server
+    # slot within seconds, while an abandoned non-streaming request runs on until it finishes.
+    # `timeout` is a deadline for the whole answer (urlopen's own timeout is per socket read).
+    deadline = time.monotonic() + timeout
     with request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+        return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"))
+
+
+def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
+    """Collect a server-sent-events answer into the non-streaming response shape.
+
+    A server that ignores ``stream`` and returns plain JSON is accepted as-is.
+    """
+    first = resp.readline()
+    while first and not first.strip():
+        first = resp.readline()
+    if not first.lstrip().startswith(b"data:"):
+        return json.loads((first + resp.read()).decode("utf-8", errors="replace"))
+    parts: list[str] = []
+    finish_reason = None
+    usage = None
+    line = first
+    while line:
+        if time.monotonic() > deadline:
+            raise TimeoutError("AI response exceeded the request deadline")
+        text = line.decode("utf-8", errors="replace").strip()
+        if text.startswith("data:"):
+            data = text[5:].strip()
+            if data == "[DONE]":
+                break
+            event = json.loads(data)
+            if event.get("error"):
+                raise RuntimeError(f"AI stream error: {event['error']}")
+            usage = event.get("usage") or usage
+            for choice in event.get("choices") or []:
+                piece = (choice.get("delta") or {}).get("content") if chat else choice.get("text")
+                if isinstance(piece, str):
+                    parts.append(piece)
+                finish_reason = choice.get("finish_reason") or finish_reason
+        line = resp.readline()
+    content = "".join(parts)
+    choice = {"message": {"role": "assistant", "content": content}} if chat else {"text": content}
+    choice["finish_reason"] = finish_reason
+    result: dict[str, Any] = {"choices": [choice]}
+    if usage:
+        result["usage"] = usage
+    return result
 
 
 def extract_text(ai_response: dict[str, Any]) -> str:

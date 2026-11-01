@@ -407,6 +407,45 @@ class TestReviewBudget(AIProfileTestBase):
         self.assertNotIn("prompt", body)
         self.assertEqual(analysis.extract_text(response), "ok")
 
+    def _sse(self, *events):
+        return _Response("".join(f"data: {e}\n\n" for e in [*map(json.dumps, events), "[DONE]"]).encode())
+
+    def test_requests_stream_and_chat_stream_is_assembled(self):
+        auth.set_ai_profile(self.URL, "openai-chat")
+        stream = self._sse({"choices": [{"delta": {"role": "assistant"}}]},
+                           {"choices": [{"delta": {"content": "VERDICT: "}}]},
+                           {"choices": [{"delta": {"content": "GO"}, "finish_reason": "stop"}]},
+                           {"choices": [], "usage": {"completion_tokens": 2}})
+        calls = []
+        with mock.patch.object(analysis.request, "urlopen", side_effect=lambda req, timeout=None: calls.append(req) or stream):
+            response = analysis.call_ai(self.URL, 5, "m1", "review this")
+        self.assertIs(json.loads(calls[0].data)["stream"], True)
+        self.assertEqual(analysis.extract_text(response), "VERDICT: GO")
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(response["usage"], {"completion_tokens": 2})
+
+    def test_completions_stream_is_assembled(self):
+        stream = self._sse({"choices": [{"text": " o"}]}, {"choices": [{"text": "k ", "finish_reason": "length"}]})
+        with mock.patch.object(analysis.request, "urlopen", return_value=stream):
+            response = analysis.call_ai("http://plain:1234", 5, "m1", "p")
+        self.assertEqual(analysis.extract_text(response), "ok")
+        self.assertEqual(response["choices"][0]["finish_reason"], "length")
+
+    def test_stream_past_the_deadline_is_abandoned(self):
+        auth.set_ai_profile(self.URL, "openai-chat")
+        stream = self._sse({"choices": [{"delta": {"content": "slow"}}]})
+        clock = iter([0.0, 0.0, 10.0])  # deadline set at 0 s; the second line arrives after 10 s
+        with mock.patch.object(analysis.request, "urlopen", return_value=stream), \
+                mock.patch.object(analysis.time, "monotonic", side_effect=lambda: next(clock, 10.0)):
+            with self.assertRaises(TimeoutError):
+                analysis.call_ai(self.URL, 5, "m1", "review this")
+
+    def test_stream_error_event_raises(self):
+        auth.set_ai_profile(self.URL, "openai-chat")
+        with mock.patch.object(analysis.request, "urlopen", return_value=self._sse({"error": {"message": "boom"}})):
+            with self.assertRaises(RuntimeError):
+                analysis.call_ai(self.URL, 5, "m1", "review this")
+
     def test_truncation_uses_the_budget(self):
         text = "x" * 10000
         self.assertEqual(analysis.truncate_text(text), "x" * 4500 + "\n...[truncated]")

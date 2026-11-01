@@ -60,6 +60,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - Review prompts ask for a leading `VERDICT: GO|NO-GO` line, so the verdict survives an answer cut off by
   the token limit (at 360 tokens, answers often ended before the final GO/NO-GO section). A line naming
   both (`VERDICT: GO or VERDICT: NO-GO`, the instruction echoed back) is ignored.
+- AI requests are **streamed** (`stream: true`), so a review that gives up actually stops the work: the
+  server slot frees within seconds instead of running until the answer ends (llama.cpp keeps generating
+  for a non-streaming request whose client disconnected). `--ai-timeout` is now a deadline for the whole
+  answer. A server that ignores `stream` and replies with plain JSON still works.
 - The review prompt's policy line names the active root (`KINETIC_ACTIVE_ROOT`) instead of a fixed
   `D:/Kinetic_SDK` (unchanged by default).
 - `scripts/generate-commit.py` uses the stored AI profile and its budget instead of the `ollama` package
