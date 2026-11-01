@@ -1,6 +1,6 @@
 # Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
-# Actions -> Sync to upstream -> Run workflow on main and type the branch to promote (dry run is ticked by
-# default; the dialog's branch picker also works, leaving the field blank). The button
+# Actions -> Sync to upstream -> Run workflow on main and type the branch to promote; it is a dry run unless
+# you type push into the confirm field (the dialog's branch picker also works, leaving the field blank). The button
 # works only for users listed in the SYNC_ACTORS variable (empty = button disabled). sync/dry-run/<name> runs
 # every check without pushing. Steps: .forgejo/actions/sync/sync.py.
 # SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
@@ -31,10 +31,15 @@ on:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
         required: false
         default: ""
-      dry_run:
-        description: "Dry run: check and test everything, push nothing"
-        type: boolean
-        default: true
+      confirm:
+        description: "Type push to promote for real; anything else (blank) is a dry run"
+        required: false
+        default: ""
+
+# One sync at a time: a second run (e.g. the dialog submitted twice, 2026-11-01) waits instead of racing.
+concurrency:
+  group: sync-to-upstream
+  cancel-in-progress: false
 
 # No `permissions:` block: Forgejo ignores it (and warns on every job); the automatic token's access is set
 # by Forgejo, and extra API access comes from secrets (or Forgejo's Authorized Integrations).
@@ -62,7 +67,7 @@ jobs:
           SYNC_BRANCH: ${{ github.ref_name }}
           SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
-          SYNC_DRY: ${{ inputs.dry_run }}
+          SYNC_CONFIRM: ${{ inputs.confirm }}
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
           FORGEJO_URL: ${{ github.server_url }}

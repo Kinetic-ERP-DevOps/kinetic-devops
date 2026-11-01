@@ -105,7 +105,9 @@ if E.get("SYNC_EVENT") == "workflow_dispatch":
         sh("git", "checkout", "-q", "--detach", f"refs/remotes/origin/{src}")
         print(f"sync: checked out {src} at {sh('git', 'rev-parse', '--short', 'HEAD').strip()} (checks from {ref})")
     name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
-    dry = E.get("SYNC_DRY", "true").lower() != "false"
+    # A real push needs "push" typed: a checkbox that was ticked arrived as false (2026-11-01, the dialog
+    # submitted twice), so nothing but an explicit word turns the dry run off.
+    dry = (E.get("SYNC_CONFIRM") or "").strip().lower() != "push"
     TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
 else:
     name = TAG[len("sync/"):]
