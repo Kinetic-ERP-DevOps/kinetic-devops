@@ -15,7 +15,7 @@ permissions:
 
 # Linux coverage on real distros, no Ubuntu: every job runs directly on a fresh VM of the distro in runs-on
 # (the home runner's native labels: alpine = musl/OpenRC, fedora-coreos = rpm-ostree/SELinux, arch = rolling
-# glibc). The required Python gates keep their names (branch protection) and are spread over the distros.
+# glibc). Every supported Python is tested on every distro (one VM per job; the distro is in the job name).
 # Python comes from uv (managed builds, musl included): the setup-python action only has Ubuntu builds.
 # UV_PYTHON overrides the repo's .python-version (3.14, for local work); jobs set their own.
 env:
@@ -45,23 +45,15 @@ jobs:
         run: uv run python scripts/hooks/pre-commit --remote-scan-only
 
   required-test:
-    name: Python Test Gate (required, py${{ matrix.python-version }})
+    name: Python Test Gate (required, py${{ matrix.python-version }}, ${{ matrix.distro }})
     runs-on: ${{ matrix.distro }}
     needs: sensitive-data-gate
     strategy:
       fail-fast: false
       matrix:
-        # Every supported Python, each on a different distro (a test keeps branch protection equal to this list).
+        # Every supported Python (a test keeps branch protection equal to this list) on every host OS.
         python-version: ["3.11", "3.12", "3.13", "3.14"]
-        include:
-          - python-version: "3.11"
-            distro: fedora-coreos
-          - python-version: "3.12"
-            distro: arch
-          - python-version: "3.13"
-            distro: alpine
-          - python-version: "3.14"
-            distro: arch
+        distro: [alpine, fedora-coreos, arch]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
 
@@ -166,6 +158,8 @@ jobs:
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet   # native jobs run unprivileged: not /usr/share/dotnet
         with:
           dotnet-version: "9.0.x"
 
