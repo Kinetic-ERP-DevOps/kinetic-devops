@@ -83,6 +83,27 @@ class TestVersioning(unittest.TestCase):
         self.assertTrue(checked, "no release under the versioning rule found")
         print("versioning: checked " + "; ".join(checked))
 
+    def test_readme_pins_do_what_they_say(self):
+        # The README's pins, checked with the PEP 440 implementation pip uses (packaging, locked via pytest).
+        from packaging.specifiers import SpecifierSet
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        pins = dict(re.findall(r"`kinetic-devops(~=[^`]+)`[^`]*?(features and fixes|fixes only)", readme))
+        self.assertEqual(sorted(pins.values()), ["features and fixes", "fixes only"],
+                         "README must show one 'features and fixes' pin and one 'fixes only' pin")
+        report = []
+        for spec, claim in pins.items():
+            base = spec[2:]   # each pin is checked against the releases that would follow its own version
+            stage = parse(base)[1]
+            nxt = {kind: expected_next(base, f"### {kind}\n", stage)[0] for kind in ("Added", "Fixed", "Breaking")}
+            allowed = {kind for kind, v in nxt.items() if SpecifierSet(spec).contains(v, prereleases=True)}
+            want = {"Added", "Fixed"} if claim == "features and fixes" else {"Fixed"}
+            self.assertEqual(allowed, want, f"README pin {spec} claims '{claim}' but accepts the next "
+                                            f"{sorted(allowed)} releases of {nxt}")
+            report.append(f"{spec} ({claim}): accepts {', '.join(nxt[k] for k in sorted(want))}, rejects "
+                          + ", ".join(v for k, v in nxt.items() if k not in want))
+        print("versioning: README pins hold: " + "; ".join(report))
+
     def test_rule_examples(self):
         self.assertEqual(expected_next("0.1.0a7", "### Breaking\n", "a")[0], "0.2.0.0a8")
         self.assertEqual(expected_next("0.2.0.0a8", "### Added\n### Fixed\n", "a")[0], "0.2.1.0a9")

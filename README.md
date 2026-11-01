@@ -270,8 +270,10 @@ checked by `tests/test_versioning.py`:
 - The sequence number goes up by exactly 1 with every release, whatever else changes, so it is the
   release's place in the line: `a8` follows `a7`. The stage moves forward only, alpha (`a`) -> beta
   (`b`) -> release candidate (`rc`), and the number restarts at 1 when it does (`b1`).
-- Breaking changes we know of always bump BREAKING, so `kinetic-devops~=0.2.0.0a8` gets new features
-  and fixes without them. Alpha still means any release may change behaviour.
+- Breaking changes we know of always bump BREAKING, so pin to two numbers after the 0:
+  `kinetic-devops~=0.2.0a8` gets new features and fixes without them (it means `>=0.2.0.0a8, <0.3`).
+  Pinning all four numbers (`kinetic-devops~=0.2.0.0a8`) gets fixes only. Alpha still means any
+  release may change behaviour.
 - Every release before 1.0.0 is a pre-release: install with a version pin or `--pre`.
 - From 1.0.0 on, versions are [Semantic Versioning](https://semver.org/) `MAJOR.MINOR.PATCH`.
 - 0.1.0a1-a7 were published before this rule; their alpha numbers carry on (`a8`).
