@@ -54,9 +54,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   everything after 4500 characters was dropped). Chunks split at file, then hunk boundaries and keep
   their file header; each gets a GO/NO-GO and the item's verdict combines them (any NO-GO -> NO-GO,
   unreadable -> UNKNOWN, over the chunk cap `--ai-max-chunks` / `KINETIC_AI_MAX_CHUNKS` (20) ->
-  INCOMPLETE). Per-item reports and `run_summary.md` show the verdict and chunk counts.
+  INCOMPLETE). Per-item reports and `run_summary.md` show the verdict and chunk counts. A chunk answered
+  only by the compact retry prompt (which carries no diff) is UNKNOWN, never GO. The diff budget must be
+  at least 200 characters. `legacy-intake` uses the same profile / env / built-in budget for every repo.
 - Review prompts ask for a leading `VERDICT: GO|NO-GO` line, so the verdict survives an answer cut off by
-  the token limit (at 360 tokens, answers often ended before the final GO/NO-GO section).
+  the token limit (at 360 tokens, answers often ended before the final GO/NO-GO section). A line naming
+  both (`VERDICT: GO or VERDICT: NO-GO`, the instruction echoed back) is ignored.
 - The review prompt's policy line names the active root (`KINETIC_ACTIVE_ROOT`) instead of a fixed
   `D:/Kinetic_SDK` (unchanged by default).
 - `scripts/generate-commit.py` uses the stored AI profile and its budget instead of the `ollama` package

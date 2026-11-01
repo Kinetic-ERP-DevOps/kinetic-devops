@@ -172,6 +172,7 @@ DEFAULT_MAX_DIFF_CHARS = 4500
 DEFAULT_MAX_OUTPUT_TOKENS = 360
 DEFAULT_RETRY_OUTPUT_TOKENS = 220
 DEFAULT_MAX_CHUNKS = 20  # per reviewed item; beyond this the item is INCOMPLETE, never GO
+MIN_DIFF_CHARS = 200  # smaller chunks can't hold a file header plus any diff
 
 
 def _positive_int(value: Any, source: str) -> int | None:
@@ -202,7 +203,9 @@ def resolve_ai_budget(
              or _positive_int(budget.get("max_diff_chars"), "profile max_diff_chars")
              or _positive_int(os.getenv("KINETIC_AI_MAX_DIFF_CHARS"), "KINETIC_AI_MAX_DIFF_CHARS")
              or DEFAULT_MAX_DIFF_CHARS)
-    tokens = (_positive_int(max_output_tokens, "--ai-max-tokens")
+    if chars < MIN_DIFF_CHARS:
+        raise ValueError(f"The review diff budget must be at least {MIN_DIFF_CHARS} characters, got {chars}")
+    tokens =(_positive_int(max_output_tokens, "--ai-max-tokens")
               or _positive_int(budget.get("max_output_tokens"), "profile max_output_tokens")
               or _positive_int(os.getenv("KINETIC_AI_MAX_TOKENS"), "KINETIC_AI_MAX_TOKENS")
               or DEFAULT_MAX_OUTPUT_TOKENS)
@@ -311,6 +314,8 @@ def truncate_text(text: str, max_chars: int = 4500) -> str:
 
 def _hard_split(text: str, max_chars: int) -> list[str]:
     """Split text into pieces of at most max_chars, at line ends where possible."""
+    if max_chars < 1:
+        raise ValueError(f"max_chars must be positive, got {max_chars}")
     pieces: list[str] = []
     current = ""
     for line in text.splitlines(keepends=True):
@@ -371,13 +376,21 @@ def split_diff_chunks(patch_text: str, max_chars: int = DEFAULT_MAX_DIFF_CHARS) 
 VERDICTS = ("GO", "NO-GO", "UNKNOWN", "INCOMPLETE")
 
 
+_VERDICT_LINE = re.compile(r"^[\s*#>_`]*VERDICT[\s*_`]*:[\s*_`]*(NO[- ]GO|GO)\b(.*)$", re.IGNORECASE | re.MULTILINE)
+_VERDICT_WORD = re.compile(r"\bNO[- ]GO\b|\bGO\b", re.IGNORECASE)
+
+
 def parse_verdict(review_text: str) -> str:
     """GO / NO-GO from the leading "VERDICT:" line the prompt asks for; else from the final
-    GO/NO-GO section (NO-GO wins); else UNKNOWN (e.g. an answer cut off before any verdict)."""
+    GO/NO-GO section (NO-GO wins); else UNKNOWN (e.g. an answer cut off before any verdict).
+    A VERDICT line naming both ("VERDICT: GO or VERDICT: NO-GO") is the instruction echoed back,
+    not a decision: it is ignored, including by the fallback."""
     text = review_text or ""
-    lead = re.search(r"^[\s*#>_`]*VERDICT[\s*_`]*:[\s*_`]*(NO[- ]GO|GO)\b", text[:400], re.IGNORECASE | re.MULTILINE)
-    if lead:
-        return "NO-GO" if lead.group(1).upper().startswith("NO") else "GO"
+    for lead in _VERDICT_LINE.finditer(text[:400]):
+        if not _VERDICT_WORD.search(lead.group(2)):
+            return "NO-GO" if lead.group(1).upper().startswith("NO") else "GO"
+    text = "\n".join(line for line in text.splitlines()
+                     if not (_VERDICT_LINE.match(line) and len(_VERDICT_WORD.findall(line)) > 1))
     idx = text.upper().rfind("GO/NO-GO")
     tail = text[idx + len("GO/NO-GO"):] if idx >= 0 else text[-600:]
     if re.search(r"\bNO[- ]GO\b", tail, re.IGNORECASE):
@@ -839,7 +852,8 @@ def _render_markdown(summary: dict[str, Any]) -> str:
 
 def _review_chunk(base_url: str, timeout: int, model: str, budget: dict[str, int], repo: str,
                   base_ref: str, item: dict[str, Any]) -> dict[str, Any]:
-    """Review one chunk (retrying once with the compact prompt): prompt, response, text, error, verdict."""
+    """Review one chunk (retrying once with the compact prompt): prompt, response, text, error, verdict.
+    The compact retry prompt carries no diff, so a retried chunk's verdict is UNKNOWN whatever it says."""
     prompt = build_prompt(repo, base_ref, item)
     try:
         ai_resp = call_ai(base_url, timeout, model, prompt, max_tokens=budget["max_output_tokens"])
@@ -857,7 +871,7 @@ def _review_chunk(base_url: str, timeout: int, model: str, budget: dict[str, int
             ai_resp = {"error": str(retry_exc)}
             ai_text = "(AI call failed for this item)"
             error = f"initial: {exc}; retry: {retry_exc}"
-    verdict = parse_verdict(ai_text) if not error.startswith("initial:") else "UNKNOWN"
+    verdict = parse_verdict(ai_text) if not error else "UNKNOWN"
     return {"chunk_index": item.get("chunk_index", 1), "prompt": prompt, "response": ai_resp,
             "text": ai_text, "error": error, "verdict": verdict}
 
@@ -1113,6 +1127,10 @@ def _run_legacy_intake(args: argparse.Namespace) -> int:
             ai_base_url=ai_base_url,
             ai_timeout=args.ai_timeout,
             out_dir=str(repo_out),
+            # legacy-intake has no budget flags: the profile / env / built-in budget applies
+            ai_max_diff_chars=getattr(args, "ai_max_diff_chars", None),
+            ai_max_tokens=getattr(args, "ai_max_tokens", None),
+            ai_max_chunks=getattr(args, "ai_max_chunks", None),
         )
 
         try:

@@ -384,6 +384,14 @@ class TestReviewBudget(AIProfileTestBase):
         with mock.patch.dict(os.environ, {"KINETIC_AI_MAX_TOKENS": "zero"}), self.assertRaises(ValueError):
             analysis.resolve_ai_budget(self.URL)
 
+    def test_diff_budget_below_the_minimum_is_rejected(self):
+        # 1-2 characters used to make split_diff_chunks loop forever
+        for chars in (1, 2, analysis.MIN_DIFF_CHARS - 1):
+            with self.subTest(chars=chars), self.assertRaises(ValueError):
+                analysis.resolve_ai_budget(self.URL, max_diff_chars=chars)
+        self.assertEqual(analysis.resolve_ai_budget(self.URL, max_diff_chars=analysis.MIN_DIFF_CHARS)
+                         ["max_diff_chars"], analysis.MIN_DIFF_CHARS)
+
     def test_openai_chat_style_uses_chat_completions(self):
         auth.set_ai_profile(self.URL, "openai-chat", api_key="sk-2")
         calls, patch = self._capture({"data": [{"id": "m1"}], "choices": [{"message": {"content": " ok "}}]})
@@ -466,6 +474,10 @@ class TestDiffChunking(unittest.TestCase):
             "**VERDICT: GO**\n1) Change Classification ...": "GO",
             "1) Change Classification\n2) Functionality Loss Risk: the answer was cut off here": "UNKNOWN",
             "": "UNKNOWN",
+            # the instruction echoed back is not a decision
+            "VERDICT: GO or VERDICT: NO-GO\n6) GO/NO-GO\n**NO-GO**: drops a check": "NO-GO",
+            "VERDICT: GO or VERDICT: NO-GO\nVERDICT: GO\n...": "GO",
+            "VERDICT: GO or VERDICT: NO-GO\n1) Change Classification: cut off": "UNKNOWN",
         }
         for text, expected in cases.items():
             with self.subTest(text=text):
@@ -511,13 +523,15 @@ class TestChunkedDiffReview(AIProfileTestBase):
         git("add", "."); git("commit", "-q", "-m", "feat: add modules")
         self.repo = repo
 
-    def _run(self, replies, **budget):
+    def _run(self, replies, fail_first_call=False, **budget):
         calls = []
 
         def fake_urlopen(req, timeout=None):
             calls.append(req)
             if req.full_url.endswith("/models"):
                 return _Response(json.dumps({"data": [{"id": "m"}]}).encode())
+            if fail_first_call and "Diff payload:" in json.loads(req.data)["messages"][0]["content"]:
+                raise TimeoutError("timed out")
             text = replies[min(len(calls) - 2, len(replies) - 1)]
             return _Response(json.dumps({"choices": [{"message": {"content": text}}]}).encode())
 
@@ -559,6 +573,30 @@ class TestChunkedDiffReview(AIProfileTestBase):
         self.assertGreater(commit["chunk_count"], 1)
         self.assertEqual(commit["chunks_reviewed"], 1)
         self.assertEqual(commit["verdict"], "INCOMPLETE")
+
+    def test_retry_without_the_diff_never_counts_as_go(self):
+        _, commit = self._run(["VERDICT: GO\nlooks fine"], fail_first_call=True)
+        self.assertIn("retry_used_after", commit["ai_error"])
+        self.assertEqual(commit["verdict"], "UNKNOWN")
+
+    def test_legacy_intake_reviews_each_repo(self):
+        # legacy-intake builds its own args for each repo; it used to lack the budget settings
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/models"):
+                return _Response(json.dumps({"data": [{"id": "m"}]}).encode())
+            return _Response(json.dumps({"choices": [{"message": {"content": "VERDICT: GO"}}]}).encode())
+
+        out_dir = Path(self.tmp.name) / "legacy"
+        args = argparse.Namespace(
+            repo=[str(self.repo)], inventory_file="", out_dir=str(out_dir), active_root=str(Path(self.tmp.name) / "x"),
+            ignore=[], base_ref="HEAD~1", max_commits=5, ai_base_url="http://ai-host:3000", ai_timeout=5,
+        )
+        auth.set_ai_profile("http://ai-host:3000", "openai-chat")
+        with mock.patch.object(analysis.request, "urlopen", side_effect=fake_urlopen), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(analysis._run_legacy_intake(args), 0)
+        summary = json.loads((out_dir / "legacy_intake_run_summary.json").read_text())
+        self.assertEqual([r["status"] for r in summary["repos"]], ["ok"], summary["repos"])
 
 
 if __name__ == "__main__":
