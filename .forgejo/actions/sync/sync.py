@@ -1,7 +1,8 @@
 """sync: promote a tagged branch from this Forgejo fork to its GitHub upstream as a PR.
 
 Triggered by pushing a tag sync/<name> (only allowed users can; protect sync/* in Forgejo).
-sync/dry-run/<name> runs every step except the push and the PR. Steps:
+sync/dry-run/<name> runs every step except the push and the PR. The same runs from the Actions tab
+(Run workflow on the branch to promote; inputs: name, dry run). Steps:
   1. fetch GitHub main; rebase the tagged commits onto it (conflict -> stop, list files)
   2. guards: .github/workflows changes (push those from a workstation); "Closes/Fixes #N" must be open
      GitHub issues; mentions of a *draft* security advisory (undisclosed fix -> use its private fork);
@@ -78,10 +79,19 @@ def audit(lock_text):
     return {v["id"]: f"{d['name']} {d['version']}" for d in deps for v in d.get("vulns", [])}
 
 
-name = TAG[len("sync/"):]
-dry = name.startswith("dry-run/")
-if dry:
-    name = name[len("dry-run/"):]
+if E.get("SYNC_EVENT") == "workflow_dispatch":
+    # "Run workflow" button: the branch picked in the dialog; name and dry run from the inputs.
+    src = E.get("SYNC_BRANCH", "")
+    if src in ("", "main", "master"):
+        sys.exit(f"sync: pick the branch to promote in the Run workflow dialog (got '{src or '?'}')")
+    name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
+    dry = E.get("SYNC_DRY", "true").lower() != "false"
+    TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
+else:
+    name = TAG[len("sync/"):]
+    dry = name.startswith("dry-run/")
+    if dry:
+        name = name[len("dry-run/"):]
 if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or name in ("main", "master") or ".." in name:
     raise SystemExit(f"bad sync name: {name!r}")
 branch = f"sync/{name}"
