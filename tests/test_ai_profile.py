@@ -45,7 +45,7 @@ class AIProfileTestBase(unittest.TestCase):
         patcher = mock.patch.object(auth, "keyring", self.kr)
         patcher.start()
         self.addCleanup(patcher.stop)
-        env = mock.patch.dict(os.environ, {"KINETIC_AI_BASE_URL": ""})
+        env = mock.patch.dict(os.environ, {"KINETIC_AI_BASE_URL": "", "KINETIC_AI_PROFILE": ""})
         env.start()
         self.addCleanup(env.stop)
         analysis.set_active_ai_profile(None)
@@ -223,6 +223,78 @@ class TestNamedProfiles(AIProfileTestBase):
         auth.set_ai_profile(self.URL, "openwebui", name="deep")
         auth.set_ai_profile("http://other:1234", "openai", name="other")
         self.assertEqual(analysis._ai_client_settings(self.URL)[0], "openwebui")
+
+
+class TestProfilePackage(AIProfileTestBase):
+    """One self-contained JSON entry per profile, and the KINETIC_AI_PROFILE equivalent."""
+
+    URL = "http://ai-host:3000"
+
+    def entry(self, name):
+        return json.loads(self.kr.get_password(auth.SERVICE_AI, "profile:" + name))
+
+    def test_profile_entry_is_self_contained(self):
+        auth.set_ai_profile(self.URL, "openwebui", "local/deep", api_key=FAKE_KEY, name="deep")
+        self.assertEqual(self.entry("deep"), {"v": 1, "base_url": self.URL, "api_style": "openwebui",
+                                              "model": "local/deep", "api_key": FAKE_KEY})
+        index = json.loads(self.kr.get_password(auth.SERVICE_AI, "profiles"))
+        self.assertEqual(index, {"v": 2, "default": "deep", "names": ["deep"]})
+        self.assertNotIn(FAKE_KEY, json.dumps(index))
+        self.assertNotIn("api_key", auth.list_ai_profiles()[1]["deep"])
+        self.assertNotIn("api_key", auth.get_ai_profile("deep"))
+
+    def test_new_key_rotates_every_profile_on_that_server(self):
+        auth.set_ai_profile(self.URL, "openwebui", name="deep", api_key="old")
+        auth.set_ai_profile(self.URL, "openwebui", name="fast")
+        self.assertEqual(self.entry("fast")["api_key"], "old")
+        auth.set_ai_profile(self.URL, "openwebui", name="fast", api_key="new")
+        self.assertEqual(self.entry("deep")["api_key"], "new")
+
+    def test_previous_layout_is_migrated_and_cleaned_up(self):
+        old = {"default": "deep", "profiles": {"deep": {"base_url": self.URL, "api_style": "openwebui", "model": "m"}}}
+        self.kr.set_password(auth.SERVICE_AI, "profiles", json.dumps(old))
+        self.kr.set_password(auth.SERVICE_AI, self.URL, FAKE_KEY)
+        self.assertEqual(auth.get_ai_api_key(self.URL), FAKE_KEY)
+        auth.set_default_ai_profile("deep")  # any change writes the new layout
+        self.assertEqual(self.entry("deep")["api_key"], FAKE_KEY)
+        self.assertIsNone(self.kr.get_password(auth.SERVICE_AI, self.URL))
+
+    def test_clear_removes_the_profile_entry(self):
+        auth.set_ai_profile(self.URL, "openwebui", name="a", api_key=FAKE_KEY)
+        auth.set_ai_profile(self.URL, "openwebui", name="b")
+        auth.clear_ai_profile("a")
+        self.assertIsNone(self.kr.get_password(auth.SERVICE_AI, "profile:a"))
+        auth.clear_ai_profile()
+        self.assertEqual(self.kr.store, {})
+
+    def test_env_profile_inline_supplies_url_style_model_and_key(self):
+        package = {"v": 1, "base_url": "http://runner-ai:4000/", "api_style": "openai", "model": "m", "api_key": FAKE_KEY}
+        with mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: json.dumps(package)}):
+            self.assertEqual(analysis._resolve_ai_base_url(""), "http://runner-ai:4000")
+            style, headers = analysis._ai_client_settings("http://runner-ai:4000")
+            self.assertEqual((style, headers), ("openai", {"Authorization": f"Bearer {FAKE_KEY}"}))
+            self.assertEqual(analysis.select_model(["x", "m"], "http://runner-ai:4000"), "m")
+            self.assertNotIn("api_key", auth.get_ai_profile())
+
+    def test_env_profile_from_file_and_named_profile_wins(self):
+        import tempfile
+        auth.set_ai_profile(self.URL, "openwebui", "local/deep", name="deep")
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "ai.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"base_url": "https://gw.example/v1", "api_key": FAKE_KEY}, fh)
+            with mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: path}):
+                self.assertEqual(auth.get_ai_profile()["base_url"], "https://gw.example/v1")
+                self.assertEqual(auth.get_ai_profile()["api_style"], "openai")
+                self.assertEqual(auth.get_ai_api_key("https://gw.example/v1/"), FAKE_KEY)
+                analysis.set_active_ai_profile("deep")
+                self.assertEqual(analysis._resolve_ai_base_url(""), self.URL)
+
+    def test_bad_env_profile_fails_loudly(self):
+        for bad in ("{not json", '{"base_url": "ftp://x"}', '{"base_url": "http://x", "api_style": "bogus"}', "/no/such/file.json"):
+            with self.subTest(bad=bad), mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: bad}):
+                with self.assertRaises(ValueError):
+                    analysis._resolve_ai_base_url("")
 
 
 if __name__ == "__main__":

@@ -82,12 +82,17 @@ uv run python -m kinetic_devops analysis legacy-intake
 
 Common environment variables:
 - `KINETIC_ACTIVE_ROOT` (default: `D:\Kinetic_SDK`)
-- `KINETIC_AI_BASE_URL` (fallback only, e.g. for runners without a keyring; normally the AI server is
-  stored in the keyring with `uv run python -m kinetic_devops.auth ai-set`, which also stores its API
-  key, API style (`openwebui` or `openai`) and default model. Profiles are named (`ai-set --name fast`,
-  `--name deep`), share one stored key per server, and are chosen with `analysis --ai-profile NAME`
-  (default: `auth ai-default NAME`); see `auth ai-show` / `auth ai-clear`.
-  Order: `--ai-base-url`, then the selected/default profile, then this variable)
+- `KINETIC_AI_PROFILE`: one AI profile for runners without a keyring, as JSON or the path to a JSON
+  file (for example a mounted secret): `{"v": 1, "base_url": "https://ai.example/v1", "api_style":
+  "openai", "model": "my-model", "api_key": "..."}` (only `base_url` is required). Normally profiles are
+  stored in the keyring with `uv run python -m kinetic_devops.auth ai-set`, each as one entry in the same
+  format (server, API style, model and key together). Profiles are named (`ai-set --name fast`,
+  `--name deep`), share one key per server (setting it updates them all), and are chosen with
+  `analysis --ai-profile NAME` (default: `auth ai-default NAME`); see `auth ai-show` / `auth ai-clear`.
+  Order: `--ai-base-url` (its key and style come from a matching profile), then `--ai-profile`, then
+  `KINETIC_AI_PROFILE`, then the default stored profile, then `KINETIC_AI_BASE_URL`. A malformed
+  `KINETIC_AI_PROFILE` is an error, not silently ignored.
+- `KINETIC_AI_BASE_URL` (URL-only fallback, without key or style)
 - `KINETIC_AI_TIMEOUT` (default: `180`)
 - `KINETIC_ANALYSIS_MAX_COMMITS` (default: `20`)
 - `KINETIC_ANALYSIS_LEGACY_OUT_DIR` (default: `D:\Kinetic_SDK\temp\legacy_intake_reviews`)

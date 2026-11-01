@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`KINETIC_AI_PROFILE`**: a complete AI profile (server URL, API style, model, key) as JSON or a JSON
+  file path, for headless runners without a keyring. Previously a runner could set only the URL
+  (`KINETIC_AI_BASE_URL`), so it had no way to send a key or choose the API style.
+
 ### Changed
+- **AI profiles are self-contained keyring entries**: each profile is one JSON entry (`profile:<name>`:
+  `{"v": 1, base_url, api_style, model, api_key}`) instead of shared settings plus a key per URL. The
+  versioned format leaves room for more fields. Existing profiles and keys are read as before and moved to
+  the new layout on the next `auth ai-set` / `ai-default` / `ai-clear`; older versions of the tool won't
+  see profiles stored after that. Profiles on the same server still share a key: setting it updates all.
 - **Branch protection uses GitHub repository rulesets.** `repomaker apply` / `scripts/apply_branch_protection.py`
   now create or update a ruleset (`protect-<branch>`; optional `protect_tags` ruleset for release tags) instead
   of the classic branch protection rule; `"github_mode": "classic"` keeps the old behaviour. New target options:

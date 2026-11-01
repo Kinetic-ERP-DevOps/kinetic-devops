@@ -95,9 +95,9 @@ def set_active_ai_profile(name: str | None) -> None:
 
 
 def _resolve_ai_base_url(raw_value: str | None) -> str:
-    """--ai-base-url, else the selected (or default) profile stored with
-    'auth ai-set' (keyring), else the KINETIC_AI_BASE_URL fallback for
-    users/runners without a stored profile."""
+    """--ai-base-url, else the selected profile (--ai-profile; otherwise
+    KINETIC_AI_PROFILE, then the default stored with 'auth ai-set'), else the
+    KINETIC_AI_BASE_URL fallback."""
     value = str(raw_value or "").strip()
     if value:
         return value
@@ -117,11 +117,15 @@ def _resolve_ai_base_url(raw_value: str | None) -> str:
 
 
 def _stored_ai_profile() -> dict[str, Any]:
-    """The selected (or default) AI profile stored by 'auth ai-set', or {}."""
+    """The selected AI profile; without --ai-profile, KINETIC_AI_PROFILE if set,
+    else the default one stored by 'auth ai-set'; {} if none. A malformed
+    KINETIC_AI_PROFILE raises ValueError rather than silently using no key."""
     try:
         from kinetic_devops.auth import get_ai_profile
 
         return get_ai_profile(_ACTIVE_AI_PROFILE)
+    except ValueError:
+        raise
     except Exception:
         return {}
 
@@ -154,6 +158,8 @@ def _ai_client_settings(base_url: str) -> tuple[str, dict[str, str]]:
         from kinetic_devops.auth import get_ai_api_key
 
         key = get_ai_api_key(url)
+    except ValueError:
+        raise
     except Exception:
         key = ""
     if key:
