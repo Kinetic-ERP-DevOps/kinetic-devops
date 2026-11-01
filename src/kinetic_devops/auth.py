@@ -40,6 +40,7 @@ import time
 import hashlib
 import re
 import os
+from pathlib import Path
 from datetime import timedelta
 
 # Ensure UTF-8 encoding for Windows terminals to support emojis
@@ -62,13 +63,21 @@ else:
 
 SERVICE_API_KEY = "epicor-kinetic-apikey"
 SERVICE_SERVERS = "epicor-kinetic-servers"
-# Named AI server profiles for kinetic_devops.analysis. Non-secret settings
-# for all profiles live under "profiles" ({"default": name, "profiles":
-# {name: {base_url, api_style, model}}}); each server's API key lives under its
-# own normalized base URL, so profiles on the same server share one key.
+# Named AI server profiles for kinetic_devops.analysis. Each profile is one
+# self-contained keyring entry, "profile:<name>" -> {"v": 1, "base_url",
+# "api_style", "model", "api_key"}, so a profile carries its server, API style,
+# model and key together. A non-secret index under "profiles" ({"v": 2,
+# "default": name, "names": [...]}) lists them. Profiles on the same server share
+# its key: setting a key updates every profile for that URL. KINETIC_AI_PROFILE
+# supplies one profile in the same JSON format (inline, or a path to a JSON file)
+# for runners without a keyring; it is used when no profile is selected by name.
 SERVICE_AI = "kinetic-devops-ai"
 AI_API_STYLES = ("openai", "openwebui")
 AI_DEFAULT_PROFILE = "default"
+AI_PROFILE_ENV = "KINETIC_AI_PROFILE"
+AI_PROFILE_VERSION = 1
+_AI_INDEX_USER = "profiles"
+_AI_PROFILE_PREFIX = "profile:"
 _AI_LEGACY_USER = "profile"  # single-profile format from before named profiles
 
 
@@ -96,51 +105,137 @@ def _validate_ai_url(url: str) -> str:
     return url
 
 
+def _json_dict(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    try:
+        value = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _clean_profile(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """The stored shape of a profile: settings plus api_key (omitted when empty)."""
+    profile = {
+        "base_url": str(raw.get("base_url") or ""),
+        "api_style": str(raw.get("api_style") or "openai"),
+        "model": str(raw.get("model") or "").strip(),
+    }
+    key = str(raw.get("api_key") or "").strip()
+    if key:
+        profile["api_key"] = key
+    return profile
+
+
+def _public(profile: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in profile.items() if k != "api_key"}
+
+
 def _read_ai_store() -> Dict[str, Any]:
-    raw = keyring.get_password(SERVICE_AI, "profiles")
-    try:
-        store = json.loads(raw) if raw else None
-    except (TypeError, ValueError):
-        store = None
-    if isinstance(store, dict) and isinstance(store.get("profiles"), dict):
-        return store
-    # Migrate the earlier single-profile record on read (written back on the next change).
-    raw_legacy = keyring.get_password(SERVICE_AI, _AI_LEGACY_USER)
-    try:
-        legacy = json.loads(raw_legacy) if raw_legacy else None
-    except (TypeError, ValueError):
-        legacy = None
-    if isinstance(legacy, dict) and legacy.get("base_url"):
-        return {"default": AI_DEFAULT_PROFILE, "profiles": {AI_DEFAULT_PROFILE: legacy}}
+    """{"default": name, "profiles": {name: profile incl. api_key}}, from the
+    current layout or migrated (in memory) from the two earlier ones."""
+    index = _json_dict(keyring.get_password(SERVICE_AI, _AI_INDEX_USER))
+    if index and index.get("v") == 2 and isinstance(index.get("names"), list):
+        profiles: Dict[str, Dict[str, Any]] = {}
+        for name in index["names"]:
+            entry = _json_dict(keyring.get_password(SERVICE_AI, _AI_PROFILE_PREFIX + str(name)))
+            if entry and entry.get("base_url"):
+                profiles[str(name)] = _clean_profile(entry)
+        return {"default": index.get("default") or "", "profiles": profiles}
+    if index and isinstance(index.get("profiles"), dict):
+        # Previous layout: settings in the index, keys under each normalized URL.
+        profiles = {}
+        for name, entry in index["profiles"].items():
+            if isinstance(entry, dict) and entry.get("base_url"):
+                url = _normalize_ai_url(entry["base_url"])
+                profiles[str(name)] = _clean_profile({**entry, "api_key": keyring.get_password(SERVICE_AI, url) or ""})
+        return {"default": index.get("default") or "", "profiles": profiles}
+    legacy = _json_dict(keyring.get_password(SERVICE_AI, _AI_LEGACY_USER))
+    if legacy and legacy.get("base_url"):
+        url = _normalize_ai_url(legacy["base_url"])
+        key = keyring.get_password(SERVICE_AI, url) or ""
+        return {"default": AI_DEFAULT_PROFILE, "profiles": {AI_DEFAULT_PROFILE: _clean_profile({**legacy, "api_key": key})}}
     return {"default": "", "profiles": {}}
 
 
-def _write_ai_store(store: Dict[str, Any]) -> None:
-    keyring.set_password(SERVICE_AI, "profiles", json.dumps(store))
+def _forget(user: str) -> None:
     try:
-        keyring.delete_password(SERVICE_AI, _AI_LEGACY_USER)
+        keyring.delete_password(SERVICE_AI, user)
     except Exception:
         pass
 
 
+def _write_ai_store(store: Dict[str, Any], removed: Tuple[str, ...] = ()) -> None:
+    """Write every profile entry, then the index; drop removed profiles and the
+    earlier layouts' entries (legacy record, per-URL keys)."""
+    profiles = store["profiles"]
+    for name, profile in profiles.items():
+        keyring.set_password(SERVICE_AI, _AI_PROFILE_PREFIX + name,
+                             json.dumps({"v": AI_PROFILE_VERSION, **_clean_profile(profile)}))
+    keyring.set_password(SERVICE_AI, _AI_INDEX_USER,
+                         json.dumps({"v": 2, "default": store.get("default") or "", "names": list(profiles)}))
+    for name in removed:
+        _forget(_AI_PROFILE_PREFIX + name)
+    _forget(_AI_LEGACY_USER)
+    for profile in profiles.values():
+        _forget(_normalize_ai_url(profile.get("base_url", "")))
+
+
+def _env_ai_profile() -> Dict[str, Any]:
+    """The profile from KINETIC_AI_PROFILE (inline JSON or a JSON file path), or {}.
+    Raises ValueError when it is set but unusable, so a runner misconfiguration
+    fails loudly instead of silently using no key."""
+    raw = str(os.environ.get(AI_PROFILE_ENV, "")).strip()
+    if not raw:
+        return {}
+    if not raw.startswith("{"):
+        try:
+            raw = Path(raw).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"{AI_PROFILE_ENV}: can't read profile file: {exc}") from None
+    data = _json_dict(raw)
+    if data is None:
+        raise ValueError(f"{AI_PROFILE_ENV} must be a JSON object (or the path to one)")
+    profile = _clean_profile(data)
+    profile["base_url"] = _validate_ai_url(_normalize_ai_url(profile["base_url"]))
+    if profile["api_style"] not in AI_API_STYLES:
+        raise ValueError(f"{AI_PROFILE_ENV}: api_style must be one of {AI_API_STYLES}")
+    return profile
+
+
 def list_ai_profiles() -> Tuple[str, Dict[str, Dict[str, Any]]]:
-    """(default profile name, {name: profile}). Profiles never include keys."""
+    """(default profile name, {name: profile}) of the stored profiles. Profiles never include keys."""
     store = _read_ai_store()
-    return store.get("default") or "", dict(store.get("profiles") or {})
+    return store.get("default") or "", {name: _public(p) for name, p in store["profiles"].items()}
 
 
 def get_ai_profile(name: Optional[str] = None) -> Dict[str, Any]:
-    """Settings of the named profile (or the default one): base_url, api_style,
-    model. {} if there is no such profile. Never includes the key."""
+    """Settings of the named profile; without a name, the KINETIC_AI_PROFILE
+    profile if set, else the default one: base_url, api_style, model. {} if
+    there is no such profile. Never includes the key."""
+    if not name:
+        env = _env_ai_profile()
+        if env:
+            return _public(env)
     default, profiles = list_ai_profiles()
     profile = profiles.get(name or default) or {}
     return dict(profile) if isinstance(profile, dict) else {}
 
 
 def get_ai_api_key(base_url: str) -> str:
-    """API key stored for this AI server URL, or "" if none."""
+    """API key for this AI server URL (KINETIC_AI_PROFILE first, then the stored
+    profiles, default first), or "" if none."""
     url = _normalize_ai_url(base_url)
-    return (keyring.get_password(SERVICE_AI, url) or "") if url else ""
+    if not url:
+        return ""
+    env = _env_ai_profile()
+    if env and env["base_url"] == url and env.get("api_key"):
+        return env["api_key"]
+    store = _read_ai_store()
+    ordered = sorted(store["profiles"].items(), key=lambda item: item[0] != store.get("default"))
+    for _, profile in ordered:
+        if _normalize_ai_url(profile.get("base_url", "")) == url and profile.get("api_key"):
+            return profile["api_key"]
+    return ""
 
 
 def set_ai_profile(
@@ -162,12 +257,19 @@ def set_ai_profile(
         raise ValueError(f"api_style must be one of {AI_API_STYLES}")
     profile = {"base_url": url, "api_style": api_style, "model": str(model or "").strip()}
     store = _read_ai_store()
-    store["profiles"][name] = profile
-    if make_default or not store.get("default") or store["default"] not in store["profiles"]:
+    profiles = store["profiles"]
+    same_server = [p for p in profiles.values() if _normalize_ai_url(p.get("base_url", "")) == url]
+    if api_key:
+        key = api_key.strip()
+        for other in same_server:  # one key per server: rotate it everywhere
+            other["api_key"] = key
+    else:
+        key = (profiles.get(name) or {}).get("api_key") if _normalize_ai_url((profiles.get(name) or {}).get("base_url", "")) == url else ""
+        key = key or next((p["api_key"] for p in same_server if p.get("api_key")), "")
+    profiles[name] = _clean_profile({**profile, "api_key": key})
+    if make_default or not store.get("default") or store["default"] not in profiles:
         store["default"] = name
     _write_ai_store(store)
-    if api_key:
-        keyring.set_password(SERVICE_AI, url, api_key)
     return profile
 
 
@@ -180,33 +282,25 @@ def set_default_ai_profile(name: str) -> None:
 
 
 def clear_ai_profile(name: Optional[str] = None) -> bool:
-    """Delete one named profile, or every profile when name is None. A server's
-    key is deleted only when no remaining profile uses that URL. Returns True if
-    anything was removed."""
+    """Delete one named profile (with its key), or every profile when name is
+    None. Other profiles for the same server keep their copy of the key.
+    Returns True if anything was removed."""
     store = _read_ai_store()
     profiles = store["profiles"]
     targets = list(profiles) if name is None else ([name] if name in profiles else [])
-    removed = False
     for target in targets:
-        url = _normalize_ai_url(profiles.pop(target).get("base_url", ""))
-        removed = True
-        if url and not any(_normalize_ai_url(p.get("base_url", "")) == url for p in profiles.values()):
-            try:
-                keyring.delete_password(SERVICE_AI, url)
-            except Exception:
-                pass
+        profiles.pop(target)
     if store.get("default") not in profiles:
         store["default"] = next(iter(profiles), "")
     if profiles:
-        _write_ai_store(store)
-    else:
-        for user in ("profiles", _AI_LEGACY_USER):
-            try:
-                keyring.delete_password(SERVICE_AI, user)
-                removed = True
-            except Exception:
-                pass
-    return removed
+        _write_ai_store(store, removed=tuple(targets))
+        return bool(targets)
+    # Nothing left: remove every entry of every layout.
+    old_urls = [_normalize_ai_url(p.get("base_url", "")) for p in _read_ai_store()["profiles"].values()]
+    present = any(keyring.get_password(SERVICE_AI, u) is not None for u in (_AI_INDEX_USER, _AI_LEGACY_USER))
+    for user in [_AI_INDEX_USER, _AI_LEGACY_USER, *(_AI_PROFILE_PREFIX + t for t in targets), *old_urls]:
+        _forget(user)
+    return bool(targets) or present
 DEFAULT_TTL_SEC = 1200
 
 
@@ -2460,8 +2554,8 @@ def main():
     ai_clear_p = subparsers.add_parser(
         "ai-clear",
         help="DESTRUCTIVE: delete one AI profile (--name) or all of them, with their API keys.",
-        description="DESTRUCTIVE: removes the named AI profile, or every profile when --name is omitted. A "
-        "server's API key is removed once no remaining profile uses that URL.",
+        description="DESTRUCTIVE: removes the named AI profile with its API key, or every profile when --name "
+        "is omitted. Other profiles for the same server keep their copy of the key.",
     )
     ai_clear_p.add_argument("--name", default=None, metavar="NAME", help="Profile to delete (default: all profiles).")
 
@@ -2595,11 +2689,16 @@ def main():
                   f"model={profile['model'] or '<first available>'}, key {stored}.")
         elif args.command == "ai-show":
             default_name, profiles = list_ai_profiles()
-            if not profiles:
+            env_profile = get_ai_profile() if os.environ.get(AI_PROFILE_ENV, "").strip() else {}
+            if env_profile:
+                has_key = "yes" if get_ai_api_key(env_profile["base_url"]) else "no"
+                print(f"* {AI_PROFILE_ENV} (used when no --ai-profile is given): {env_profile['base_url']} "
+                      f"({env_profile['api_style']}), model={env_profile['model'] or '<first available>'}, api key: {has_key}")
+            if not profiles and not env_profile:
                 print("No AI profile stored. Run: uv run python -m kinetic_devops.auth ai-set")
             for pname, profile in profiles.items():
                 has_key = "yes" if get_ai_api_key(profile.get("base_url", "")) else "no"
-                print(f"{'*' if pname == default_name else ' '} {pname}: {profile.get('base_url')} "
+                print(f"{'*' if pname == default_name and not env_profile else ' '} {pname}: {profile.get('base_url')} "
                       f"({profile.get('api_style')}), model={profile.get('model') or '<first available>'}, api key: {has_key}")
         elif args.command == "ai-default":
             set_default_ai_profile(args.name)
