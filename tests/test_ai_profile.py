@@ -3,10 +3,15 @@
 Uses an in-memory fake keyring and a fake urlopen; no real keyring or network.
 """
 
+import argparse
 import io
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from kinetic_devops import analysis, auth
@@ -290,11 +295,270 @@ class TestProfilePackage(AIProfileTestBase):
                 analysis.set_active_ai_profile("deep")
                 self.assertEqual(analysis._resolve_ai_base_url(""), self.URL)
 
+    def test_budget_is_part_of_the_profile_package(self):
+        auth.set_ai_profile(self.URL, "openai-chat", "m", api_key=FAKE_KEY, name="big",
+                            budget={"max_diff_chars": 120000, "max_output_tokens": 1500})
+        self.assertEqual(self.entry("big")["budget"], {"max_diff_chars": 120000, "max_output_tokens": 1500})
+        self.assertEqual(auth.get_ai_profile("big")["budget"]["max_output_tokens"], 1500)
+        auth.set_ai_profile(self.URL, "openai-chat", "m", name="big")  # editing without a budget drops it
+        self.assertNotIn("budget", self.entry("big"))
+
+    def test_env_profile_carries_budget_and_rejects_bad_ones(self):
+        package = {"base_url": "http://runner-ai:4000", "api_style": "openai-chat", "budget": {"max_diff_chars": 24000}}
+        with mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: json.dumps(package)}):
+            self.assertEqual(auth.get_ai_profile()["budget"], {"max_diff_chars": 24000})
+        for bad in ({"max_diff_chars": 0}, {"bogus": 1}, [1]):
+            with self.subTest(bad=bad), mock.patch.dict(
+                os.environ, {auth.AI_PROFILE_ENV: json.dumps({"base_url": "http://x:1", "budget": bad})}
+            ):
+                with self.assertRaises(ValueError):
+                    auth.get_ai_profile()
+
     def test_bad_env_profile_fails_loudly(self):
         for bad in ("{not json", '{"base_url": "ftp://x"}', '{"base_url": "http://x", "api_style": "bogus"}', "/no/such/file.json"):
             with self.subTest(bad=bad), mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: bad}):
                 with self.assertRaises(ValueError):
                     analysis._resolve_ai_base_url("")
+
+
+class TestReviewBudget(AIProfileTestBase):
+    """Review budget (diff size, answer length) per AI profile; defaults unchanged."""
+
+    URL = "http://gpu-host:4000"
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"KINETIC_AI_MAX_DIFF_CHARS": "", "KINETIC_AI_MAX_TOKENS": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _capture(self, payload):
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            return _Response(json.dumps(payload).encode())
+
+        return calls, mock.patch.object(analysis.request, "urlopen", side_effect=fake_urlopen)
+
+    def test_defaults_match_the_small_preset_and_previous_hard_coded_values(self):
+        self.assertEqual(
+            analysis.resolve_ai_budget(self.URL),
+            {"max_diff_chars": 4500, "max_output_tokens": 360, "retry_output_tokens": 220, "max_chunks": 20},
+        )
+        small = auth.AI_BUDGET_PRESETS["small"]
+        self.assertEqual(small["max_diff_chars"], analysis.DEFAULT_MAX_DIFF_CHARS)
+        self.assertEqual(small["max_output_tokens"], analysis.DEFAULT_MAX_OUTPUT_TOKENS)
+
+    def test_profile_without_budget_is_stored_exactly_as_before(self):
+        profile = auth.set_ai_profile(self.URL, "openai", "m")
+        self.assertEqual(profile, {"base_url": self.URL, "api_style": "openai", "model": "m"})
+        self.assertNotIn("budget", auth.get_ai_profile())
+
+    def test_preset_budget_is_stored_and_used(self):
+        auth.set_ai_profile(self.URL, "openai-chat", "local/deep", budget=auth.AI_BUDGET_PRESETS["large"])
+        self.assertEqual(auth.get_ai_profile()["budget"], {"max_diff_chars": 120000, "max_output_tokens": 1500})
+        budget = analysis.resolve_ai_budget(self.URL)
+        self.assertEqual((budget["max_diff_chars"], budget["max_output_tokens"]), (120000, 1500))
+        self.assertEqual(budget["retry_output_tokens"], round(1500 * 220 / 360))
+
+    def test_budget_precedence_explicit_then_profile_then_env_then_default(self):
+        with mock.patch.dict(os.environ, {"KINETIC_AI_MAX_DIFF_CHARS": "9000", "KINETIC_AI_MAX_TOKENS": "500"}):
+            self.assertEqual(analysis.resolve_ai_budget(self.URL)["max_diff_chars"], 9000)
+            auth.set_ai_profile(self.URL, "openai", budget={"max_diff_chars": 24000})
+            budget = analysis.resolve_ai_budget(self.URL)
+            self.assertEqual(budget["max_diff_chars"], 24000)   # profile beats env
+            self.assertEqual(budget["max_output_tokens"], 500)  # not in profile -> env
+            budget = analysis.resolve_ai_budget(self.URL, max_diff_chars=1000, max_output_tokens=50)
+            self.assertEqual((budget["max_diff_chars"], budget["max_output_tokens"]), (1000, 50))
+
+    def test_budget_of_another_server_is_not_applied(self):
+        auth.set_ai_profile(self.URL, "openai", budget=auth.AI_BUDGET_PRESETS["large"])
+        self.assertEqual(analysis.resolve_ai_budget("http://other:1")["max_diff_chars"], 4500)
+
+    def test_invalid_budgets_are_rejected(self):
+        for bad in ({"max_diff_chars": 0}, {"max_output_tokens": -5}, {"max_diff_chars": "big"},
+                    {"max_diff_chars": True}, {"context": 4096}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                auth.set_ai_profile(self.URL, "openai", budget=bad)
+        with mock.patch.dict(os.environ, {"KINETIC_AI_MAX_TOKENS": "zero"}), self.assertRaises(ValueError):
+            analysis.resolve_ai_budget(self.URL)
+
+    def test_openai_chat_style_uses_chat_completions(self):
+        auth.set_ai_profile(self.URL, "openai-chat", api_key="sk-2")
+        calls, patch = self._capture({"data": [{"id": "m1"}], "choices": [{"message": {"content": " ok "}}]})
+        with patch:
+            self.assertEqual(analysis.fetch_models(self.URL, 5), ["m1"])
+            response = analysis.call_ai(self.URL, 5, "m1", "review this", max_tokens=1500)
+        self.assertEqual(calls[0].full_url, f"{self.URL}/v1/models")
+        self.assertEqual(calls[1].full_url, f"{self.URL}/v1/chat/completions")
+        self.assertEqual(calls[1].get_header("Authorization"), "Bearer sk-2")
+        body = json.loads(calls[1].data)
+        self.assertEqual(body["messages"], [{"role": "user", "content": "review this"}])
+        self.assertEqual(body["max_tokens"], 1500)
+        self.assertNotIn("prompt", body)
+        self.assertEqual(analysis.extract_text(response), "ok")
+
+    def test_truncation_uses_the_budget(self):
+        text = "x" * 10000
+        self.assertEqual(analysis.truncate_text(text), "x" * 4500 + "\n...[truncated]")
+        self.assertEqual(analysis.truncate_text(text, 20000), text)
+
+    def test_prompt_policy_root_follows_active_root(self):
+        item = {"id": "abc", "type": "commit", "payload": "diff"}
+        with mock.patch.dict(os.environ, {"KINETIC_ACTIVE_ROOT": ""}):
+            os.environ.pop("KINETIC_ACTIVE_ROOT")
+            self.assertIn("Policy context: D:/Kinetic_SDK is active", analysis.build_prompt("r", "HEAD~1", item))
+        with mock.patch.dict(os.environ, {"KINETIC_ACTIVE_ROOT": "/srv/kinetic"}):
+            self.assertIn("Policy context: /srv/kinetic is active", analysis.build_prompt("r", "HEAD~1", item))
+
+
+def _file_diff(name: str, hunks: int, lines_per_hunk: int = 5) -> str:
+    out = [f"diff --git a/{name} b/{name}\n", f"--- a/{name}\n", f"+++ b/{name}\n"]
+    for h in range(hunks):
+        out.append(f"@@ -{h * 10 + 1},{lines_per_hunk} +{h * 10 + 1},{lines_per_hunk} @@\n")
+        out += [f"+{name} hunk {h} line {i}\n" for i in range(lines_per_hunk)]
+    return "".join(out)
+
+
+class TestDiffChunking(unittest.TestCase):
+    """Small budgets review the whole diff in chunks instead of truncating it."""
+
+    def _content_lines(self, text):
+        return [l for l in text.splitlines() if l.startswith("+") and not l.startswith("+++")]
+
+    def test_patch_that_fits_is_one_unchanged_chunk(self):
+        patch = _file_diff("a.py", 2)
+        self.assertEqual(analysis.split_diff_chunks(patch, 10000), [patch])
+
+    def test_splits_at_file_boundaries_and_loses_nothing(self):
+        patch = "".join(_file_diff(f"f{i}.py", 3) for i in range(6))
+        chunks = analysis.split_diff_chunks(patch, 1200)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 1200 for c in chunks))
+        self.assertTrue(all(c.startswith("diff --git ") for c in chunks))
+        self.assertEqual(sum((self._content_lines(c) for c in chunks), []), self._content_lines(patch))
+
+    def test_large_file_splits_at_hunks_and_keeps_its_header(self):
+        patch = _file_diff("big.py", 20)
+        chunks = analysis.split_diff_chunks(patch, 800)
+        self.assertGreater(len(chunks), 2)
+        for c in chunks:
+            self.assertLessEqual(len(c), 800)
+            self.assertTrue(c.startswith("diff --git a/big.py b/big.py\n"), c[:60])
+            self.assertIn("@@ ", c)
+        self.assertEqual(sum((self._content_lines(c) for c in chunks), []), self._content_lines(patch))
+
+    def test_overlong_hunk_and_line_are_hard_split(self):
+        patch = _file_diff("min.js", 1, 0) + "+" + "x" * 5000 + "\n"
+        chunks = analysis.split_diff_chunks(patch, 1000)
+        self.assertTrue(all(len(c) <= 1000 for c in chunks))
+        self.assertEqual(sum(c.count("x") for c in chunks), 5000)
+
+    def test_verdict_parsing(self):
+        cases = {
+            "...\n6) GO/NO-GO for further promotion\n**GO**. Safe.": "GO",
+            "6) GO/NO-GO\n**NO-GO** (Conditional): fix first": "NO-GO",
+            "## GO/NO-GO\nNo go until tests pass": "NO-GO",
+            "6) GO/NO-GO\nUndecided.": "UNKNOWN",
+            "short answer without sections: GO": "GO",
+            "VERDICT: NO-GO\n1) Change Classification\n... 3) Regression Risk: cut off mid-sent": "NO-GO",
+            "**VERDICT: GO**\n1) Change Classification ...": "GO",
+            "1) Change Classification\n2) Functionality Loss Risk: the answer was cut off here": "UNKNOWN",
+            "": "UNKNOWN",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(analysis.parse_verdict(text), expected)
+
+    def test_combined_verdict(self):
+        self.assertEqual(analysis.combine_verdicts(["GO", "GO"]), "GO")
+        self.assertEqual(analysis.combine_verdicts(["GO", "NO-GO", "UNKNOWN"]), "NO-GO")
+        self.assertEqual(analysis.combine_verdicts(["GO", "UNKNOWN"]), "UNKNOWN")
+        self.assertEqual(analysis.combine_verdicts(["GO", "GO"], unreviewed_chunks=3), "INCOMPLETE")
+        self.assertEqual(analysis.combine_verdicts([]), "UNKNOWN")
+
+    def test_prompt_mentions_the_chunk_only_when_there_are_several(self):
+        one = analysis.build_prompt("r", "b", {"id": "x", "type": "commit", "payload": "d"})
+        self.assertNotIn("chunk", one.lower())
+        two = analysis.build_prompt("r", "b", {"id": "x", "type": "commit", "payload": "d",
+                                               "chunk_index": 2, "chunk_count": 3})
+        self.assertIn("This is chunk 2 of 3", two)
+        self.assertIn("VERDICT: GO or VERDICT: NO-GO", two)
+        self.assertIn('"chunk": "2/3"', two)
+
+
+@unittest.skipUnless(shutil.which("git"), "git not available")
+class TestChunkedDiffReview(AIProfileTestBase):
+    """analysis diff reviews every chunk of a large commit and combines the verdicts."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        def git(*args):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        (repo / "seed.txt").write_text("seed\n")
+        git("add", "."); git("commit", "-q", "-m", "chore: seed")
+        for i in range(4):
+            (repo / f"mod{i}.py").write_text("".join(f"value_{i}_{n} = {n}\n" for n in range(60)))
+        git("add", "."); git("commit", "-q", "-m", "feat: add modules")
+        self.repo = repo
+
+    def _run(self, replies, **budget):
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            if req.full_url.endswith("/models"):
+                return _Response(json.dumps({"data": [{"id": "m"}]}).encode())
+            text = replies[min(len(calls) - 2, len(replies) - 1)]
+            return _Response(json.dumps({"choices": [{"message": {"content": text}}]}).encode())
+
+        args = argparse.Namespace(
+            repo=str(self.repo), out_dir=str(Path(self.tmp.name) / "out"), base_ref="HEAD~1", max_commits=5,
+            ai_base_url="http://ai-host:3000", ai_timeout=5, ai_max_diff_chars=budget.get("chars", 1000),
+            ai_max_tokens=None, ai_max_chunks=budget.get("chunks"),
+        )
+        auth.set_ai_profile("http://ai-host:3000", "openai-chat")
+        with mock.patch.object(analysis.request, "urlopen", side_effect=fake_urlopen), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(analysis._run_diff_review(args), 0)
+        report = json.loads((Path(args.out_dir) / "run_report.json").read_text())
+        commit = [i for i in report["items"] if i["type"] == "commit"][0]
+        return calls, commit
+
+    def test_every_chunk_is_reviewed_and_verdicts_combine(self):
+        calls, commit = self._run(["6) GO/NO-GO\n**GO**"])
+        chunk_calls = [c for c in calls if c.full_url.endswith("/chat/completions")]
+        self.assertGreater(commit["chunk_count"], 1)
+        self.assertEqual(commit["chunks_reviewed"], commit["chunk_count"])
+        self.assertEqual(commit["verdict"], "GO")
+        self.assertNotIn("chunks", commit)  # full chunk text stays in the per-item JSON only
+        bodies = [json.loads(c.data)["messages"][0]["content"] for c in chunk_calls]
+        self.assertTrue(any(f"chunk 1 of {commit['chunk_count']}" in b for b in bodies))
+        for i in range(4):  # every file reached the model
+            self.assertTrue(any(f"mod{i}.py" in b for b in bodies), f"mod{i}.py never reviewed")
+        md = Path(commit["output_md"]).read_text()
+        self.assertIn("## Overall", md)
+        self.assertIn(f"## Chunk {commit['chunk_count']} of {commit['chunk_count']}", md)
+
+    def test_one_no_go_chunk_makes_the_item_no_go(self):
+        replies = ["6) GO/NO-GO\n**GO**"] * 2 + ["6) GO/NO-GO\n**NO-GO**: removes a check"] + ["6) GO/NO-GO\n**GO**"] * 20
+        _, commit = self._run(replies)
+        self.assertEqual(commit["verdict"], "NO-GO")
+
+    def test_chunk_cap_makes_the_item_incomplete_not_go(self):
+        _, commit = self._run(["6) GO/NO-GO\n**GO**"], chunks=1)
+        self.assertGreater(commit["chunk_count"], 1)
+        self.assertEqual(commit["chunks_reviewed"], 1)
+        self.assertEqual(commit["verdict"], "INCOMPLETE")
 
 
 if __name__ == "__main__":

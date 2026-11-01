@@ -41,6 +41,26 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   the ID token's `iss`, `aud`/`azp`, `exp` and `nonce` are checked, and the IdP identity is stored (`idp-login`
   warns if it doesn't look like `--user`); refresh locks live in a per-user 0700 directory and can't spin; a
   refresh token the IdP rejects is dropped.
+- AI review budget per AI profile: `auth ai-set --preset small|medium|large` or `--max-diff-chars` /
+  `--max-tokens`, stored with the profile and shown by `ai-show`; `analysis diff --ai-max-diff-chars` /
+  `--ai-max-tokens` and `KINETIC_AI_MAX_DIFF_CHARS` / `KINETIC_AI_MAX_TOKENS` override it. Defaults are
+  unchanged (4500 diff characters, 360 answer tokens, 220 on retry), so small local models keep working;
+  larger hardware can review whole diffs.
+- `openai-chat` AI API style: `/v1/models` + `/v1/chat/completions`, for chat-tuned models on any
+  OpenAI-compatible server (LiteLLM, vLLM, llama.cpp server).
+
+### Changed
+- `analysis diff` reviews a diff larger than the budget **in chunks** instead of truncating it (before:
+  everything after 4500 characters was dropped). Chunks split at file, then hunk boundaries and keep
+  their file header; each gets a GO/NO-GO and the item's verdict combines them (any NO-GO -> NO-GO,
+  unreadable -> UNKNOWN, over the chunk cap `--ai-max-chunks` / `KINETIC_AI_MAX_CHUNKS` (20) ->
+  INCOMPLETE). Per-item reports and `run_summary.md` show the verdict and chunk counts.
+- Review prompts ask for a leading `VERDICT: GO|NO-GO` line, so the verdict survives an answer cut off by
+  the token limit (at 360 tokens, answers often ended before the final GO/NO-GO section).
+- The review prompt's policy line names the active root (`KINETIC_ACTIVE_ROOT`) instead of a fixed
+  `D:/Kinetic_SDK` (unchanged by default).
+- `scripts/generate-commit.py` uses the stored AI profile and its budget instead of the `ollama` package
+  and a fixed phi3.5-mini model.
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
@@ -66,6 +86,7 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
+
 
 ## [0.2.0.0a8] - 2026-11-01
 

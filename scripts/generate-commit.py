@@ -1,48 +1,58 @@
-import subprocess
-import ollama  # Ensure the `ollama` Python package is installed via `pip install ollama`
+"""Suggest a commit message for the staged changes using the stored AI profile.
 
-def get_staged_changes():
+Uses the same AI server settings as `kinetic_devops.analysis` (`auth ai-set`: URL, API style,
+model, API key, review budget), so any local model the profile points at works; the staged
+diff is cut to the profile's max_diff_chars (default sized for small models).
+
+    uv run python scripts/generate-commit.py [--ai-base-url URL]
+"""
+import argparse
+import subprocess
+
+from kinetic_devops import analysis
+
+
+def get_staged_changes() -> str:
     """Retrieve staged changes using `git diff --cached`."""
     try:
-        result = subprocess.run(
-            ["git", "diff", "--cached"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        return result.stdout.strip()  # Return the diff output
+        result = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True, check=True)
+        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         print("Error retrieving staged changes:", e)
         return ""
 
-def generate_commit_message(changes_description):
-    """Generate a commit message using ikamen/phi3.5mini:Q4KM via Ollama."""
-    # Create an Ollama client instance
-    client = ollama.Client()
 
-    # Craft the prompt with best practices
-    prompt = (
-        "Generate a concise commit message for these changes: "
-        f"{changes_description}. Follow these rules:\n"
+def build_prompt(changes: str) -> str:
+    return (
+        "Generate a concise commit message for these changes. Follow these rules:\n"
         "- Imperative mood (e.g., 'Fix bug')\n"
+        "- Conventional prefix: type(scope): summary\n"
         "- Max 50 characters for title\n"
         "- Reference related issues (if applicable)\n"
-        "- Keep the scope focused"
+        "- Keep the scope focused\n"
+        "Reply with the commit message only.\n\n"
+        f"Staged diff:\n{changes}"
     )
 
-    # Generate the message (streaming)
-    response = client.generate(
-        model="ikamen/phi3.5mini:Q4KM",
-        prompt=prompt,
-        stream=False,  # Set to `True` if you want streaming output
-    )
 
-    return response["response"]
+def generate_commit_message(changes: str, base_url: str = "", timeout: int = 120) -> str:
+    url = analysis._resolve_ai_base_url(base_url)
+    budget = analysis.resolve_ai_budget(url)
+    models = analysis.fetch_models(url, timeout)
+    if not models:
+        raise RuntimeError("No AI models available")
+    model = analysis.select_model(models, url)
+    prompt = build_prompt(analysis.truncate_text(changes, budget["max_diff_chars"]))
+    response = analysis.call_ai(url, timeout, model, prompt, max_tokens=min(200, budget["max_output_tokens"]))
+    return analysis.extract_text(response)
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--ai-base-url", default="", metavar="URL", help="AI server (default: stored AI profile)")
+    args = parser.parse_args()
     changes = get_staged_changes()
     if changes:
-        message = generate_commit_message(changes)
-        print("Generated Commit Message:\n" + message)
+        print("Generated Commit Message:\n" + generate_commit_message(changes, args.ai_base_url))
     else:
         print("No staged changes found.")
