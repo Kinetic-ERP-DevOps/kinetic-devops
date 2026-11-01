@@ -23,11 +23,15 @@ permissions:
 
 jobs:
   ci-bot:
-    runs-on: ubuntu-latest
+    runs-on: alpine   # a home runner label (no Ubuntu); any label with git, Node.js and network works
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The action runs Python; on runners without one it uses uv's (see action.yml).
+      - uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
       - uses: ./.forgejo/actions/ci-bot
         with:
           api-key: ${{ secrets.LLM_API_KEY }}

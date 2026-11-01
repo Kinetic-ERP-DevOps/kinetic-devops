@@ -51,7 +51,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: alpine   # a home runner label (no Ubuntu); any label with git, Node.js and network works
     if: >-
       vars.GH_REPO != '' && (github.event_name == 'push' ||
       contains(format(',{0},', vars.SYNC_ACTORS), format(',{0},', github.actor)))

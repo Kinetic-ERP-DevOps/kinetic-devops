@@ -13,17 +13,19 @@ on:
 permissions:
   contents: read
 
+# Linux coverage on real distros, no Ubuntu: every job runs directly on a fresh VM of the distro in runs-on
+# (the home runner's native labels: alpine = musl/OpenRC, fedora-coreos = rpm-ostree/SELinux, arch = rolling
+# glibc). The required Python gates keep their names (branch protection) and are spread over the distros.
+# Python comes from uv (managed builds, musl included): the setup-python action only has Ubuntu builds.
+# UV_PYTHON overrides the repo's .python-version (3.14, for local work); jobs set their own.
 env:
-  # Use the interpreter from setup-python; never download another one.
-  # UV_PYTHON overrides the repo's .python-version (3.14, for local work) for
-  # every uv command; jobs that set up a different Python override it.
-  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON_DOWNLOADS: automatic
   UV_PYTHON: "3.12"
 
 jobs:
   sensitive-data-gate:
     name: Sensitive Data Gate
-    runs-on: ubuntu-latest
+    runs-on: alpine
 
     steps:
       - name: Checkout
@@ -31,27 +33,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: https://github.com/astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          version: "0.13.5"
 
-      - name: Install uv and sync the locked environment
-        run: |
-          python -m pip install uv
-          uv sync --locked
+      - name: Sync the locked environment
+        run: uv sync --locked
 
       - name: Run sensitive data gate
         run: uv run python scripts/hooks/pre-commit --remote-scan-only
 
   required-test:
     name: Python Test Gate (required, py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.distro }}
     needs: sensitive-data-gate
     strategy:
       fail-fast: false
       matrix:
+        # Every supported Python, each on a different distro (a test keeps branch protection equal to this list).
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - python-version: "3.11"
+            distro: fedora-coreos
+          - python-version: "3.12"
+            distro: arch
+          - python-version: "3.13"
+            distro: alpine
+          - python-version: "3.14"
+            distro: arch
     env:
       UV_PYTHON: ${{ matrix.python-version }}
 
@@ -61,55 +71,50 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: https://github.com/astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          version: "0.13.5"
 
-      - name: Install uv and sync the locked environment
-        run: |
-          python -m pip install uv
-          uv sync --locked
+      - name: Sync the locked environment
+        run: uv sync --locked
 
       # Same tests as tests.test_runner, via pytest for per-test timings and skip
       # reasons (JUnit XML); scripts/compare_timings.py compares environments.
       - name: Run regression suite
-        run: uv run python -m pytest -q -p no:cacheprovider --junitxml="timings/forgejo-linux-py${{ matrix.python-version }}.xml"
+        run: uv run python -m pytest -q -p no:cacheprovider --junitxml="timings/forgejo-${{ matrix.distro }}-py${{ matrix.python-version }}.xml"
 
       - name: Record timing metadata
         if: always()
-        run: uv run python scripts/compare_timings.py meta --label "forgejo-linux-py${{ matrix.python-version }}" --out "timings/forgejo-linux-py${{ matrix.python-version }}.json" --extra "native checks"
+        run: uv run python scripts/compare_timings.py meta --label "forgejo-${{ matrix.distro }}-py${{ matrix.python-version }}" --out "timings/forgejo-${{ matrix.distro }}-py${{ matrix.python-version }}.json" --extra "native checks"
 
       - name: Upload timing record
         if: always()
         uses: actions/upload-artifact@v3
         with:
-          name: timings-forgejo-linux-py${{ matrix.python-version }}
+          name: timings-forgejo-${{ matrix.distro }}-py${{ matrix.python-version }}
           path: timings/
 
   wheel-smoke-test:
     name: Built Wheel Smoke Test
-    runs-on: ubuntu-latest
+    runs-on: fedora-coreos
     needs: sensitive-data-gate
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install uv
-        run: python -m pip install uv
+        uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
 
       - name: Build sdist and wheel
         run: uv build --out-dir "$RUNNER_TEMP/dist"
 
       - name: Wheel contains only the package
         run: |
-          python - "$RUNNER_TEMP"/dist/*.whl <<'EOF'
+          uv run --no-project python - "$RUNNER_TEMP"/dist/*.whl <<'EOF'
           import sys, zipfile
           names = zipfile.ZipFile(sys.argv[1]).namelist()
           stray = sorted({n.split("/")[0] for n in names
@@ -149,7 +154,9 @@ jobs:
 
   efx-syntax-check-tool-build:
     name: EFx Syntax Check Tool Build
-    runs-on: ubuntu-latest
+    runs-on: arch
+    env:
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"   # minimal VMs have no ICU; the build needs no culture data
 
     steps:
       - name: Checkout
