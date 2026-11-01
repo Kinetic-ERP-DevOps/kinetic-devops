@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -17,6 +17,10 @@ from kinetic_devops import repo_context
 
 
 DEFAULT_TOKEN_SERVICE = "kinetic-devops-tokens"
+GITHUB_ADMIN_ROLE_ID = 5  # built-in "Repository admin" role, for ruleset bypass lists
+GITHUB_MODES = {"ruleset", "classic"}
+RULESET_ENFORCEMENT = {"active", "evaluate", "disabled"}
+MERGE_METHODS = {"merge", "squash", "rebase"}
 
 
 @dataclass
@@ -33,6 +37,13 @@ class Target:
     forgejo_api_base: str
     token_service: str = DEFAULT_TOKEN_SERVICE
     token_account: str = ""
+    # GitHub only. "ruleset" (default) manages a repository ruleset; "classic" the legacy branch protection rule.
+    github_mode: str = "ruleset"
+    ruleset_name: str = ""  # default: "protect-<branch>"
+    enforcement: str = "active"  # "evaluate" reports what would be blocked without blocking
+    allowed_merge_methods: List[str] = field(default_factory=list)  # empty: GitHub's default (all)
+    protect_tags: List[str] = field(default_factory=list)  # tag patterns, e.g. ["v*"]
+    checks_integration_id: Optional[int] = None  # e.g. 15368 = GitHub Actions; pins who may report a check
 
 
 class BranchProtectionError(RuntimeError):
@@ -121,20 +132,7 @@ def _with_git_defaults(target: Target) -> Target:
     if provider == "forgejo" and not forgejo_api_base:
         forgejo_api_base = str(detected.get("forgejo_api_base", "")).strip()
 
-    return Target(
-        provider=provider,
-        owner=owner,
-        repo=repo,
-        branch=target.branch,
-        token_env=target.token_env,
-        token_service=target.token_service,
-        token_account=target.token_account,
-        required_checks=target.required_checks,
-        required_approvals=target.required_approvals,
-        enforce_admins=target.enforce_admins,
-        require_conversation_resolution=target.require_conversation_resolution,
-        forgejo_api_base=forgejo_api_base,
-    )
+    return replace(target, provider=provider, owner=owner, repo=repo, forgejo_api_base=forgejo_api_base)
 
 
 def _load_config(path: Path) -> Dict[str, Any]:
@@ -157,6 +155,21 @@ def _merge_target(defaults: Dict[str, Any], raw_target: Dict[str, Any]) -> Targe
     if not isinstance(required_checks_raw, list):
         raise BranchProtectionError("required_checks must be an array")
 
+    github_mode = str(merged.get("github_mode", "ruleset")).strip().lower()
+    if github_mode not in GITHUB_MODES:
+        raise BranchProtectionError(f"github_mode must be one of {sorted(GITHUB_MODES)}")
+    enforcement = str(merged.get("enforcement", "active")).strip().lower()
+    if enforcement not in RULESET_ENFORCEMENT:
+        raise BranchProtectionError(f"enforcement must be one of {sorted(RULESET_ENFORCEMENT)}")
+    merge_methods = merged.get("allowed_merge_methods") or []
+    tags = merged.get("protect_tags") or []
+    if not isinstance(merge_methods, list) or not isinstance(tags, list):
+        raise BranchProtectionError("allowed_merge_methods and protect_tags must be arrays")
+    merge_methods = [str(m).strip().lower() for m in merge_methods if str(m).strip()]
+    if set(merge_methods) - MERGE_METHODS:
+        raise BranchProtectionError(f"allowed_merge_methods may only contain {sorted(MERGE_METHODS)}")
+    integration_id = merged.get("checks_integration_id")
+
     return Target(
         provider=provider,
         owner=str(merged.get("owner", "")).strip(),
@@ -170,6 +183,12 @@ def _merge_target(defaults: Dict[str, Any], raw_target: Dict[str, Any]) -> Targe
         enforce_admins=bool(merged.get("enforce_admins", True)),
         require_conversation_resolution=bool(merged.get("require_conversation_resolution", True)),
         forgejo_api_base=str(merged.get("forgejo_api_base", "")).strip(),
+        github_mode=github_mode,
+        ruleset_name=str(merged.get("ruleset_name", "")).strip(),
+        enforcement=enforcement,
+        allowed_merge_methods=merge_methods,
+        protect_tags=[str(t).strip() for t in tags if str(t).strip()],
+        checks_integration_id=int(integration_id) if integration_id not in (None, "") else None,
     )
 
 
@@ -252,6 +271,64 @@ def _github_payload(target: Target) -> Dict[str, Any]:
     }
 
 
+def _admin_bypass(target: Target) -> List[Dict[str, Any]]:
+    # enforce_admins=True: nobody bypasses. False: repository admins may (the classic rule's meaning).
+    if target.enforce_admins:
+        return []
+    return [{"actor_id": GITHUB_ADMIN_ROLE_ID, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+
+
+def _github_ruleset_payload(target: Target) -> Dict[str, Any]:
+    """Repository ruleset equivalent of _github_payload (same JSON as GitHub's ruleset import/export)."""
+    pull_request: Dict[str, Any] = {
+        "required_approving_review_count": max(0, target.required_approvals),
+        "dismiss_stale_reviews_on_push": True,
+        "require_code_owner_review": False,
+        "require_last_push_approval": False,
+        "required_review_thread_resolution": target.require_conversation_resolution,
+    }
+    if target.allowed_merge_methods:
+        pull_request["allowed_merge_methods"] = list(target.allowed_merge_methods)
+
+    rules: List[Dict[str, Any]] = [
+        {"type": "deletion"},
+        {"type": "non_fast_forward"},
+        {"type": "pull_request", "parameters": pull_request},
+    ]
+    if target.required_checks:
+        checks = []
+        for context in target.required_checks:
+            check: Dict[str, Any] = {"context": context}
+            if target.checks_integration_id is not None:
+                check["integration_id"] = target.checks_integration_id
+            checks.append(check)
+        rules.append({
+            "type": "required_status_checks",
+            "parameters": {"strict_required_status_checks_policy": True, "required_status_checks": checks},
+        })
+
+    return {
+        "name": target.ruleset_name or f"protect-{target.branch}",
+        "target": "branch",
+        "enforcement": target.enforcement,
+        "bypass_actors": _admin_bypass(target),
+        "conditions": {"ref_name": {"include": [f"refs/heads/{target.branch}"], "exclude": []}},
+        "rules": rules,
+    }
+
+
+def _github_tag_ruleset_payload(target: Target) -> Dict[str, Any]:
+    """Tag ruleset for protect_tags: only bypass actors (admins) may create, move or delete matching tags."""
+    return {
+        "name": f"{target.ruleset_name or f'protect-{target.branch}'}-tags",
+        "target": "tag",
+        "enforcement": target.enforcement,
+        "bypass_actors": [{"actor_id": GITHUB_ADMIN_ROLE_ID, "actor_type": "RepositoryRole", "bypass_mode": "always"}],
+        "conditions": {"ref_name": {"include": [f"refs/tags/{p}" for p in target.protect_tags], "exclude": []}},
+        "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}, {"type": "non_fast_forward"}],
+    }
+
+
 def _forgejo_payload(target: Target) -> Dict[str, Any]:
     # Forgejo follows Gitea branch protection fields.
     return {
@@ -278,6 +355,60 @@ def _headers(token: str) -> Dict[str, str]:
 
 
 def _apply_github(target: Target, token: str, dry_run: bool) -> None:
+    if target.github_mode == "classic":
+        _apply_github_classic(target, token, dry_run)
+    else:
+        _apply_github_rulesets(target, token, dry_run)
+
+
+def _upsert_ruleset(api: str, token: str, existing: List[Dict[str, Any]], payload: Dict[str, Any]) -> str:
+    match = next((r for r in existing if r.get("name") == payload["name"] and r.get("target") == payload["target"]), None)
+    if match:
+        response = requests.put(f"{api}/{match['id']}", headers=_headers(token), json=payload, timeout=60)
+        action = "updated"
+    else:
+        response = requests.post(api, headers=_headers(token), json=payload, timeout=60)
+        action = "created"
+    if response.status_code // 100 != 2:
+        raise BranchProtectionError(f"GitHub ruleset {action[:-1]} failed ({response.status_code}): {response.text}")
+    return action
+
+
+def _apply_github_rulesets(target: Target, token: str, dry_run: bool) -> None:
+    api = f"https://api.github.com/repos/{target.owner}/{target.repo}/rulesets"
+    payloads = [_github_ruleset_payload(target)]
+    if target.protect_tags:
+        payloads.append(_github_tag_ruleset_payload(target))
+
+    print(f"[github] {target.owner}/{target.repo}:{target.branch} (rulesets, enforcement: {target.enforcement})")
+    print(f"  endpoint: {api}")
+    print(f"  rulesets: {[p['name'] for p in payloads]}")
+    print(f"  required_checks: {target.required_checks or ['<none>']}")
+    print(f"  required_approvals: {target.required_approvals}")
+    if target.protect_tags:
+        print(f"  protected tags: {target.protect_tags}")
+    if dry_run:
+        print("  mode: dry-run (no API call)")
+        return
+
+    listing = requests.get(f"{api}?includes_parents=false&per_page=100", headers=_headers(token), timeout=60)
+    if listing.status_code // 100 != 2:
+        raise BranchProtectionError(f"GitHub ruleset list failed ({listing.status_code}): {listing.text}")
+    existing = [r for r in listing.json() if r.get("source_type", "Repository") == "Repository"]
+    for payload in payloads:
+        print(f"  {payload['name']}: {_upsert_ruleset(api, token, existing, payload)}")
+
+    # A classic rule keeps applying alongside rulesets (the stricter wins); say so rather than delete it.
+    classic = requests.get(
+        f"https://api.github.com/repos/{target.owner}/{target.repo}/branches/{target.branch}/protection",
+        headers=_headers(token), timeout=60,
+    )
+    if classic.status_code == 200:
+        print(f"  note: a classic branch protection rule still exists on {target.branch}; "
+              "delete it (Settings > Branches) once the ruleset is verified")
+
+
+def _apply_github_classic(target: Target, token: str, dry_run: bool) -> None:
     endpoint = f"https://api.github.com/repos/{target.owner}/{target.repo}/branches/{target.branch}/protection"
     payload = _github_payload(target)
 
@@ -380,8 +511,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Apply branch protection rules for GitHub and Forgejo targets. Reads the target repos/branches "
-            "and rules (required checks, approvals, ...) from a config JSON and, with --apply, PUTs/POSTs "
-            "the protection settings to each provider's API, creating or overwriting the rule for that branch. "
+            "and rules (required checks, approvals, ...) from a config JSON and, with --apply, writes them "
+            "to each provider's API: a GitHub repository ruleset (created or updated by name; github_mode "
+            "'classic' for the legacy branch protection rule) or a Forgejo branch protection rule. "
             "Without --apply it is a dry-run."
         ),
     )

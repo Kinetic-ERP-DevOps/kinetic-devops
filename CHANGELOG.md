@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Branch protection uses GitHub repository rulesets.** `repomaker apply` / `scripts/apply_branch_protection.py`
+  now create or update a ruleset (`protect-<branch>`; optional `protect_tags` ruleset for release tags) instead
+  of the classic branch protection rule; `"github_mode": "classic"` keeps the old behaviour. New target options:
+  `enforcement` (`active`/`evaluate`), `allowed_merge_methods`, `protect_tags`, `checks_integration_id`.
+  Importable JSON in `scripts/github-rulesets/`. Required checks are now every supported Python version
+  (3.11-3.14) plus the Sensitive Data Gate, and a test keeps them equal to the CI matrices.
+
+### Fixed
+- The example Forgejo target required GitHub-style check names, which Forgejo never reports
+  (`CI Tests / <job> (<event>)`), so a rule applied from it could never be satisfied; it now uses globs.
 - **Python 3.11 is now the minimum** (`requires-python = ">=3.11"`); 3.10 reached end of life in
   October 2026 and no longer gets security fixes. New support policy: every CPython version that still
   receives security fixes, and only those (README, *Supported Python versions*). The 3.10 CI job is now a

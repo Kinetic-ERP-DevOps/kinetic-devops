@@ -6,6 +6,8 @@ Canonical implementation lives in kinetic_devops.repomaker.apply_engine.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from kinetic_devops.repomaker import apply_engine as _impl
 
 DEFAULT_TOKEN_SERVICE = _impl.DEFAULT_TOKEN_SERVICE
@@ -19,6 +21,8 @@ _merge_target = _impl._merge_target
 _parse_targets = _impl._parse_targets
 _resolve_token = _impl._resolve_token
 _github_payload = _impl._github_payload
+_github_ruleset_payload = _impl._github_ruleset_payload
+_github_tag_ruleset_payload = _impl._github_tag_ruleset_payload
 _forgejo_payload = _impl._forgejo_payload
 _headers = _impl._headers
 _apply_github = _impl._apply_github
@@ -42,20 +46,7 @@ def _with_git_defaults(target: Target) -> Target:
     if provider == "forgejo" and not forgejo_api_base:
         forgejo_api_base = str(detected.get("forgejo_api_base", "")).strip()
 
-    return Target(
-        provider=provider,
-        owner=owner,
-        repo=repo,
-        branch=target.branch,
-        token_env=target.token_env,
-        token_service=target.token_service,
-        token_account=target.token_account,
-        required_checks=target.required_checks,
-        required_approvals=target.required_approvals,
-        enforce_admins=target.enforce_admins,
-        require_conversation_resolution=target.require_conversation_resolution,
-        forgejo_api_base=forgejo_api_base,
-    )
+    return replace(target, provider=provider, owner=owner, repo=repo, forgejo_api_base=forgejo_api_base)
 
 
 def _run_target(target: Target, dry_run: bool) -> None:
