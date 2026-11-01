@@ -240,8 +240,17 @@ if dry:
 # Lease against what the GitHub branch holds right now (empty = must not exist yet): a URL push has no
 # remote-tracking ref for a plain --force-with-lease to compare with.
 current = sh("git", *git_auth(), "ls-remote", f"https://github.com/{REPO}.git", f"refs/heads/{branch}").split()
-sh("git", *git_auth(), "push", "-q", f"--force-with-lease=refs/heads/{branch}:{current[0] if current else ''}",
-   f"https://github.com/{REPO}.git", f"HEAD:refs/heads/{branch}")
+head = sh("git", "rev-parse", "HEAD").strip()
+push = subprocess.run(["git", *git_auth(), "push", "-q", f"--force-with-lease=refs/heads/{branch}:{current[0] if current else ''}",
+                       f"https://github.com/{REPO}.git", f"HEAD:refs/heads/{branch}"], capture_output=True, text=True)
+if push.returncode:
+    # A rejected push can still have landed (2026-11-01: "cannot lock ref ... reference already exists", yet the
+    # branch held this exact commit). Continue only if GitHub's branch is exactly HEAD; otherwise fail as before.
+    now = sh("git", *git_auth(), "ls-remote", f"https://github.com/{REPO}.git", f"refs/heads/{branch}").split()
+    if not now or now[0] != head:
+        raise SystemExit(redact(f"push to GitHub {branch} failed: {push.stderr.strip()[-800:]}"))
+    print(f"NOTE: push reported a failure, but GitHub {branch} is exactly {head[:7]}; continuing: "
+          + redact(push.stderr.strip().splitlines()[-1] if push.stderr.strip() else "?"))
 owner = REPO.split("/")[0]
 existing = gh(f"/repos/{REPO}/pulls?head={owner}:{branch}&state=open") or []
 if existing:

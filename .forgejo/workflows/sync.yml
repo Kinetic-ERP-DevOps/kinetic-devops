@@ -54,6 +54,7 @@ jobs:
           python-version: "3.12"
       - name: Rebase, check, test, promote
         env:
+          PYTHONUNBUFFERED: "1"   # log lines carry their real time (a buffered run printed all at exit)
           GH_REPO: ${{ vars.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
           TAG: ${{ github.ref_name }}
