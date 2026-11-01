@@ -111,8 +111,17 @@ Common environment variables:
   | `small` (default) | 3-4B, ~4k context | 4500 | 360 |
   | `medium` | 7-14B, ~16k context | 24000 | 800 |
   | `large` | 30B+, 64k+ context | 120000 | 1500 |
+  | `large-thinking` | 30B+ thinking model, 64k+ context | 120000 | 6000 |
 
   Rule of thumb: characters ~= 3.5 x tokens; keep diff + prompt + answer under ~80% of the server's context.
+
+  **Thinking models** count their thinking against `max_tokens`, so an answer can run out before its
+  `VERDICT:` line (or loop until the limit). Such a cut-off answer (`finish_reason` `length`, no verdict)
+  is asked once more with the same prompt; if it is cut off again the chunk is UNKNOWN, and the run summary
+  counts cut-off answers (`cut_off=N`). Either leave room (`--preset large-thinking`) or turn thinking off
+  for gate reviews: `auth ai-set --no-thinking` stores `{"chat_template_kwargs": {"enable_thinking":
+  false}}` as the profile's `extra_body` (honoured by llama.cpp, vLLM and LiteLLM pass-through); any other
+  extra request fields with `--extra-body JSON` (e.g. `'{"reasoning_effort": "low"}'`; `'{}'` clears).
 - `KINETIC_ANALYSIS_MAX_COMMITS` (default: `20`)
 - `KINETIC_ANALYSIS_LEGACY_OUT_DIR` (default: `D:\Kinetic_SDK\temp\legacy_intake_reviews`)
 

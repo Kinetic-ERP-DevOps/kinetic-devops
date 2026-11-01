@@ -283,6 +283,9 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
             "max_tokens": max_tokens,
             "stream": True,
         }
+    # Profile extras (e.g. thinking off); the reserved fields above always win.
+    extra = _profile_for_url(base_url).get("extra_body") or {}
+    body = {**{k: v for k, v in extra.items() if k not in body}, **body}
     req = request.Request(
         url=url,
         data=json.dumps(body).encode("utf-8"),
@@ -628,7 +631,14 @@ def render_master_summary(run_report: dict[str, Any]) -> str:
         extra = f" | verdict={verdict}" if verdict else ""
         if item.get("chunk_count", 1) > 1:
             extra += f" | chunks={item.get('chunks_reviewed')}/{item.get('chunk_count')}"
+        if item.get("cut_off_answers"):
+            extra += f" | cut_off={item['cut_off_answers']}"
         lines.append(f"- {label}: {ident} | rogue_candidate={rogue}{extra} | report={out_md}")
+    cut = sum(i.get("cut_off_answers", 0) for i in run_report["items"])
+    if cut:
+        lines.append("")
+        lines.append(f"- {cut} answer(s) hit max_tokens without a verdict (each retried once). If this is "
+                     "frequent, raise the output budget (--preset large-thinking) or turn thinking off.")
     lines.append("")
     lines.append("## Note")
     lines.append("- These are analysis-only outputs. No commit, push, or branch rewrite actions are performed.")
@@ -896,15 +906,32 @@ def _render_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _finish_reason(ai_resp: dict[str, Any]) -> str:
+    choices = ai_resp.get("choices") or [{}]
+    return str((choices[0] or {}).get("finish_reason") or "")
+
+
 def _review_chunk(base_url: str, timeout: int, model: str, budget: dict[str, int], repo: str,
                   base_ref: str, item: dict[str, Any]) -> dict[str, Any]:
-    """Review one chunk (retrying once with the compact prompt): prompt, response, text, error, verdict.
-    The compact retry prompt carries no diff, so a retried chunk's verdict is UNKNOWN whatever it says."""
+    """Review one chunk: prompt, response, text, error, verdict, finish_reason, cut_off.
+    An answer cut off at max_tokens (finish_reason "length") without a verdict, typically a
+    thinking model that used the budget thinking or looped, is asked once more with the same
+    prompt (a fresh sample usually finishes). A failed call is retried once with the compact
+    prompt, which carries no diff, so that chunk's verdict is UNKNOWN whatever it says."""
     prompt = build_prompt(repo, base_ref, item)
+    cut_off = 0
     try:
         ai_resp = call_ai(base_url, timeout, model, prompt, max_tokens=budget["max_output_tokens"])
         ai_text = extract_text(ai_resp)
         error = ""
+        if _finish_reason(ai_resp) == "length" and parse_verdict(ai_text) == "UNKNOWN":
+            cut_off = 1
+            ai_resp = call_ai(base_url, timeout, model, prompt, max_tokens=budget["max_output_tokens"])
+            ai_text = extract_text(ai_resp)
+            if _finish_reason(ai_resp) == "length" and parse_verdict(ai_text) == "UNKNOWN":
+                cut_off = 2
+                error = ("answer cut off at max_tokens twice without a verdict; raise the output budget "
+                         "(e.g. --preset large-thinking) or turn thinking off (ai-set --no-thinking)")
     except Exception as exc:
         retry_prompt = build_retry_prompt(repo, base_ref, item)
         try:
@@ -919,7 +946,8 @@ def _review_chunk(base_url: str, timeout: int, model: str, budget: dict[str, int
             error = f"initial: {exc}; retry: {retry_exc}"
     verdict = parse_verdict(ai_text) if not error else "UNKNOWN"
     return {"chunk_index": item.get("chunk_index", 1), "prompt": prompt, "response": ai_resp,
-            "text": ai_text, "error": error, "verdict": verdict}
+            "text": ai_text, "error": error, "verdict": verdict,
+            "finish_reason": _finish_reason(ai_resp), "cut_off": cut_off}
 
 
 def render_chunked_review(results: list[dict[str, Any]], chunk_count: int, verdict: str, unreviewed: int) -> str:
@@ -996,6 +1024,9 @@ def _run_diff_review(args: argparse.Namespace) -> int:
         enriched["verdict"] = verdict
         enriched["chunk_count"] = len(chunks)
         enriched["chunks_reviewed"] = len(results)
+        enriched["finish_reasons"] = [r["finish_reason"] for r in results]
+        # Answers that hit max_tokens without a verdict (retried once each; 2 = cut off again).
+        enriched["cut_off_answers"] = sum(r["cut_off"] for r in results)
         reviewed_items.append(enriched)
 
     run_report = {

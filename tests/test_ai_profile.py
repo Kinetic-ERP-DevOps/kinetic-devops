@@ -638,5 +638,71 @@ class TestChunkedDiffReview(AIProfileTestBase):
         self.assertEqual([r["status"] for r in summary["repos"]], ["ok"], summary["repos"])
 
 
+class TestThinkingModels(AIProfileTestBase):
+    """Issue #47: cut-off answers are retried and reported; thinking can be turned off per profile."""
+
+    URL = "http://gpu-host:4000"
+    BUDGET = {"max_output_tokens": 100, "retry_output_tokens": 60}
+    ITEM = {"type": "commit", "id": "abc", "subject": "s", "payload": "diff --git a/x b/x"}
+
+    @staticmethod
+    def reply(text, finish):
+        return {"choices": [{"message": {"content": text}, "finish_reason": finish}]}
+
+    def review(self, replies):
+        with mock.patch.object(analysis, "call_ai", side_effect=replies) as call:
+            result = analysis._review_chunk(self.URL, 5, "m", self.BUDGET, "repo", "HEAD~1", dict(self.ITEM))
+        return result, call
+
+    def test_cut_off_answer_is_asked_again_with_the_same_prompt(self):
+        result, call = self.review([self.reply("thinking...", "length"), self.reply("VERDICT: GO", "stop")])
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_args_list[0].args[3], call.call_args_list[1].args[3])  # same full prompt
+        self.assertEqual((result["verdict"], result["cut_off"], result["finish_reason"], result["error"]),
+                         ("GO", 1, "stop", ""))
+
+    def test_cut_off_twice_is_unknown_with_advice(self):
+        result, call = self.review([self.reply("loop", "length"), self.reply("loop", "length")])
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual((result["verdict"], result["cut_off"]), ("UNKNOWN", 2))
+        self.assertIn("large-thinking", result["error"])
+
+    def test_cut_off_with_a_verdict_is_accepted(self):
+        result, call = self.review([self.reply("VERDICT: NO-GO\nbecause...", "length")])
+        self.assertEqual((call.call_count, result["verdict"], result["cut_off"]), (1, "NO-GO", 0))
+
+    def test_extra_body_is_sent_but_cannot_override_the_review(self):
+        auth.set_ai_profile(self.URL, "openai-chat", "m", name="gate", extra_body=auth.AI_NO_THINKING)
+        sent = []
+        stream = _Response(b'data: {"choices": [{"delta": {"content": "GO"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
+        with mock.patch.object(analysis.request, "urlopen", side_effect=lambda req, timeout=None: sent.append(req) or stream):
+            analysis.call_ai(self.URL, 5, "m", "review this", max_tokens=50)
+        body = json.loads(sent[0].data)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual((body["max_tokens"], body["stream"]), (50, True))
+        for bad in ({"max_tokens": 1}, {"stream": False}, "x"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                auth.set_ai_profile(self.URL, "openai-chat", name="bad", extra_body=bad)
+
+    def test_extra_body_travels_in_the_profile_package(self):
+        auth.set_ai_profile(self.URL, "openai-chat", name="gate", extra_body={"reasoning_effort": "low"})
+        stored = json.loads(self.kr.get_password(auth.SERVICE_AI, "profile:gate"))
+        self.assertEqual(stored["extra_body"], {"reasoning_effort": "low"})
+        package = {"base_url": self.URL, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        with mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: json.dumps(package)}):
+            self.assertEqual(auth.get_ai_profile()["extra_body"], package["extra_body"])
+
+    def test_thinking_preset_leaves_room_for_reasoning(self):
+        self.assertGreater(auth.AI_BUDGET_PRESETS["large-thinking"]["max_output_tokens"],
+                           auth.AI_BUDGET_PRESETS["large"]["max_output_tokens"])
+
+    def test_run_summary_reports_cut_off_answers(self):
+        report = {"repo": "r", "base_ref": "b", "model": "m",
+                  "items": [{"type": "commit", "id": "abc", "verdict": "GO", "cut_off_answers": 1}]}
+        summary = analysis.render_master_summary(report)
+        self.assertIn("cut_off=1", summary)
+        self.assertIn("hit max_tokens", summary)
+
+
 if __name__ == "__main__":
     unittest.main()

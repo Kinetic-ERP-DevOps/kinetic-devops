@@ -68,6 +68,11 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   `D:/Kinetic_SDK` (unchanged by default).
 - `scripts/generate-commit.py` uses the stored AI profile and its budget instead of the `ollama` package
   and a fixed phi3.5-mini model.
+- Thinking models (#47): an answer cut off at `max_tokens` without a verdict is asked once more with the
+  same prompt (UNKNOWN if cut off again, with advice); `finish_reason` per chunk and the number of cut-off
+  answers are in the run report and summary. New preset `large-thinking` (6000 answer tokens). Per-profile
+  `extra_body` request fields: `auth ai-set --no-thinking` (thinking off via `chat_template_kwargs`) or
+  `--extra-body JSON`; also accepted in `KINETIC_AI_PROFILE`.
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with

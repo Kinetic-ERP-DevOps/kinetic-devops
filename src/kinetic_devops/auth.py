@@ -85,7 +85,13 @@ AI_BUDGET_PRESETS: Dict[str, Dict[str, int]] = {
     "small": {"max_diff_chars": 4500, "max_output_tokens": 360},      # 3-4B models, ~4k context
     "medium": {"max_diff_chars": 24000, "max_output_tokens": 800},    # 7-14B models, ~16k context
     "large": {"max_diff_chars": 120000, "max_output_tokens": 1500},   # 30B+ models, 64k+ context
+    # Thinking models spend max_tokens on thinking before the answer: leave room for it.
+    "large-thinking": {"max_diff_chars": 120000, "max_output_tokens": 6000},
 }
+# Extra request fields per profile (e.g. {"chat_template_kwargs": {"enable_thinking": false}} or
+# {"reasoning_effort": "low"}), merged into every AI request; they may not replace these:
+AI_RESERVED_REQUEST_KEYS = ("model", "messages", "prompt", "stream", "max_tokens", "temperature")
+AI_NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
 AI_DEFAULT_PROFILE = "default"
 AI_PROFILE_ENV = "KINETIC_AI_PROFILE"
 AI_PROFILE_VERSION = 1
@@ -140,6 +146,9 @@ def _clean_profile(raw: Dict[str, Any]) -> Dict[str, Any]:
     budget = validate_ai_budget(budget)
     if budget:
         profile["budget"] = budget
+    extra = validate_ai_extra_body(raw.get("extra_body"))
+    if extra:
+        profile["extra_body"] = extra
     key = str(raw.get("api_key") or "").strip()
     if key:
         profile["api_key"] = key
@@ -270,6 +279,21 @@ def validate_ai_budget(budget: Optional[Dict[str, Any]]) -> Dict[str, int]:
     return clean
 
 
+def validate_ai_extra_body(extra: Any) -> Dict[str, Any]:
+    """Extra request fields: a JSON object without the reserved keys. {} for None/empty."""
+    if extra is None or extra == {}:
+        return {}
+    if not isinstance(extra, dict):
+        raise ValueError("AI profile extra_body must be a JSON object")
+    reserved = sorted(set(extra) & set(AI_RESERVED_REQUEST_KEYS))
+    if reserved:
+        raise ValueError(f"extra_body may not set {reserved}; those come from the review itself")
+    try:
+        return json.loads(json.dumps(extra))
+    except (TypeError, ValueError):
+        raise ValueError("extra_body must contain only JSON values") from None
+
+
 def set_ai_profile(
     base_url: str,
     api_style: str = "openai",
@@ -278,6 +302,7 @@ def set_ai_profile(
     name: str = AI_DEFAULT_PROFILE,
     make_default: bool = False,
     budget: Optional[Dict[str, Any]] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create or replace a named profile; api_key=None keeps any existing key
     for the URL. The first profile stored becomes the default. budget (see
@@ -294,6 +319,9 @@ def set_ai_profile(
     clean_budget = validate_ai_budget(budget)
     if clean_budget:
         profile["budget"] = clean_budget
+    clean_extra = validate_ai_extra_body(extra_body)
+    if clean_extra:
+        profile["extra_body"] = clean_extra
     store = _read_ai_store()
     profiles = store["profiles"]
     same_server = [p for p in profiles.values() if _normalize_ai_url(p.get("base_url", "")) == url]
@@ -313,9 +341,10 @@ def set_ai_profile(
 
 def _format_ai_budget(profile: Dict[str, Any]) -> str:
     budget = profile.get("budget") or {}
-    if not budget:
-        return "budget: built-in default (small)"
-    return "budget: " + ", ".join(f"{k}={v}" for k, v in budget.items())
+    text = "budget: " + (", ".join(f"{k}={v}" for k, v in budget.items()) if budget else "built-in default (small)")
+    if profile.get("extra_body"):
+        text += f", extra: {json.dumps(profile['extra_body'], separators=(',', ':'))}"
+    return text
 
 
 def set_default_ai_profile(name: str) -> None:
@@ -2739,13 +2768,20 @@ def main():
     ai_set_p.add_argument("--default", action="store_true", dest="make_default", help="Make this the default profile.")
     ai_set_p.add_argument(
         "--preset", choices=sorted(AI_BUDGET_PRESETS), default=None,
-        help="Review budget for the model's size: small (default; ~4k context), medium (~16k), large (64k+). "
+        help="Review budget for the model's size: small (default; ~4k context), medium (~16k), large (64k+), "
+        "large-thinking (64k+, room for a thinking model's reasoning). "
         "Sets how much diff is sent per review and how long answers may be.",
     )
     ai_set_p.add_argument("--max-diff-chars", type=int, default=None, metavar="N",
                           help="Override: diff characters sent per reviewed item (applied after --preset).")
     ai_set_p.add_argument("--max-tokens", type=int, default=None, metavar="N",
                           help="Override: maximum answer tokens per review (applied after --preset).")
+    thinking = ai_set_p.add_mutually_exclusive_group()
+    thinking.add_argument("--no-thinking", action="store_true",
+                          help="Ask the server to skip the model's thinking (sends chat_template_kwargs "
+                          "enable_thinking=false; llama.cpp, vLLM, LiteLLM). For fast gate reviews.")
+    thinking.add_argument("--extra-body", default=None, metavar="JSON",
+                          help="Extra JSON fields for every request, e.g. '{\"reasoning_effort\": \"low\"}'; '{}' clears.")
     subparsers.add_parser(
         "ai-show",
         help="List the stored AI server profiles (never the keys themselves).",
@@ -2898,10 +2934,19 @@ def main():
                 budget["max_diff_chars"] = args.max_diff_chars
             if args.max_tokens is not None:
                 budget["max_output_tokens"] = args.max_tokens
+            # Extra request fields: --no-thinking / --extra-body; editing keeps the stored ones.
+            extra = dict((profiles.get(name) or {}).get("extra_body") or {})
+            if args.no_thinking:
+                extra = {**extra, **AI_NO_THINKING}
+            elif args.extra_body is not None:
+                try:
+                    extra = json.loads(args.extra_body)
+                except ValueError:
+                    raise ValueError("--extra-body must be a JSON object") from None
             had_key = bool(get_ai_api_key(url))
             key = getpass.getpass("API key (hidden; blank keeps the stored one): " if had_key else "API key (hidden): ").strip()
             profile = set_ai_profile(url, style, model, api_key=key or None, name=name, make_default=args.make_default,
-                                     budget=budget)
+                                     budget=budget, extra_body=extra)
             stored = "updated" if key else ("kept" if had_key else "none stored")
             is_default = " (default)" if list_ai_profiles()[0] == name else ""
             print(f"✅ AI profile '{name}'{is_default} saved: {profile['base_url']} ({profile['api_style']}), "
