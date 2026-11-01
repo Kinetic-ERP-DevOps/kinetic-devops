@@ -1,5 +1,11 @@
-# Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can).
-# sync/dry-run/<name> runs every check without pushing. See .forgejo/actions/sync/sync.py for the steps.
+# Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
+# Actions -> Sync to upstream -> Run workflow, pick the branch (dry run is ticked by default). The button
+# works only for users listed in the SYNC_ACTORS variable (empty = button disabled). sync/dry-run/<name> runs
+# every check without pushing. Steps: .forgejo/actions/sync/sync.py.
+# SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
+# own files, so anyone with WRITE ACCESS to this repo can push a workflow that reads GH_PUSH_TOKEN. Who can
+# write here = who can publish upstream. Before granting anyone else write access, move the token out of
+# this repo's secrets (e.g. to a separate promoter repo only you can write).
 # Settings -> Actions (repo or org):
 #   Secrets:   GH_PUSH_TOKEN   GitHub fine-grained token for this repo only: Contents RW, Pull requests RW;
 #                              Issues, Commit statuses, Checks, Dependabot alerts, Secret scanning alerts,
@@ -8,11 +14,22 @@
 #              SYNC_TEST_CMD   tests to run before promoting (default: uv sync --locked && pytest)
 #              SYNC_PRIVATE_PATTERNS  extra comma-separated regexes that must never go upstream
 #              SYNC_ALLOWED_EMAILS    commit e-mails allowed besides GitHub noreply addresses
+#              SYNC_ACTORS     comma-separated users allowed to use the Run workflow button (e.g. alice,bob)
 name: Sync to upstream
 
 on:
   push:
     tags: ["sync/**"]
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run: check and test everything, push nothing"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -20,7 +37,9 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    if: vars.GH_REPO != ''
+    if: >-
+      vars.GH_REPO != '' && (github.event_name == 'push' ||
+      contains(format(',{0},', vars.SYNC_ACTORS), format(',{0},', github.actor)))
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,6 +52,10 @@ jobs:
           GH_REPO: ${{ vars.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
           TAG: ${{ github.ref_name }}
+          SYNC_EVENT: ${{ github.event_name }}
+          SYNC_BRANCH: ${{ github.ref_name }}
+          SYNC_NAME: ${{ inputs.name }}
+          SYNC_DRY: ${{ inputs.dry_run }}
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
           FORGEJO_URL: ${{ github.server_url }}
