@@ -3,31 +3,18 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and versions follow the rule in the README (*Versioning*): [PEP 440](https://peps.python.org/pep-0440/)
+`0.BREAKING.FEATURES.FIXES` with an alpha/beta/rc sequence number until 1.0.0, then
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-- **`KINETIC_AI_PROFILE`**: a complete AI profile (server URL, API style, model, key) as JSON or a JSON
-  file path, for headless runners without a keyring. Previously a runner could set only the URL
-  (`KINETIC_AI_BASE_URL`), so it had no way to send a key or choose the API style.
+## [0.2.0.0a8] - 2026-11-01
 
-### Changed
-- **AI profiles are self-contained keyring entries**: each profile is one JSON entry (`profile:<name>`:
-  `{"v": 1, base_url, api_style, model, api_key}`) instead of shared settings plus a key per URL. The
-  versioned format leaves room for more fields. Existing profiles and keys are read as before and moved to
-  the new layout on the next `auth ai-set` / `ai-default` / `ai-clear`; older versions of the tool won't
-  see profiles stored after that. Profiles on the same server still share a key: setting it updates all.
-- **Branch protection uses GitHub repository rulesets.** `repomaker apply` / `scripts/apply_branch_protection.py`
-  now create or update a ruleset (`protect-<branch>`; optional `protect_tags` ruleset for release tags) instead
-  of the classic branch protection rule; `"github_mode": "classic"` keeps the old behaviour. New target options:
-  `enforcement` (`active`/`evaluate`), `allowed_merge_methods`, `protect_tags`, `checks_integration_id`.
-  Importable JSON in `scripts/github-rulesets/`. Required checks are now every supported Python version
-  (3.11-3.14) plus the Sensitive Data Gate, and a test keeps them equal to the CI matrices.
+The 8th alpha, and the first release under the versioning rule in the README (*Versioning*): this
+one has breaking changes, so 0.1.0a7 -> 0.2.0.0a8. 0.1.0a1-a7 predate the rule.
 
-### Fixed
-- The example Forgejo target required GitHub-style check names, which Forgejo never reports
-  (`CI Tests / <job> (<event>)`), so a rule applied from it could never be satisfied; it now uses globs.
+### Breaking
 - **Python 3.11 is now the minimum** (`requires-python = ">=3.11"`); 3.10 reached end of life in
   October 2026 and no longer gets security fixes. New support policy: every CPython version that still
   receives security fixes, and only those (README, *Supported Python versions*). The 3.10 CI job is now a
@@ -41,8 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uv's `.venv`; a worktree hook run with `KINETIC_HOOK_PYTHON` puts that worktree's `src/` first.
 - CI (GitHub and Forgejo) installs with `uv sync --locked` and runs everything through `uv run`.
 - This completes the src-layout migration; its roadmap and tracker documents are removed.
+- **AI profiles are self-contained keyring entries**: each profile is one JSON entry (`profile:<name>`:
+  `{"v": 1, base_url, api_style, model, api_key}`) instead of shared settings plus a key per URL. The
+  versioned format leaves room for more fields. Existing profiles and keys are read as before and moved to
+  the new layout on the next `auth ai-set` / `ai-default` / `ai-clear`; older versions of the tool won't
+  see profiles stored after that. Profiles on the same server still share a key: setting it updates all.
+- **Branch protection uses GitHub repository rulesets.** `repomaker apply` / `scripts/apply_branch_protection.py`
+  now create or update a ruleset (`protect-<branch>`; optional `protect_tags` ruleset for release tags) instead
+  of the classic branch protection rule; `"github_mode": "classic"` keeps the old behaviour. New target options:
+  `enforcement` (`active`/`evaluate`), `allowed_merge_methods`, `protect_tags`, `checks_integration_id`.
+  Importable JSON in `scripts/github-rulesets/`. Required checks are now every supported Python version
+  (3.11-3.14) plus the Sensitive Data Gate, and a test keeps them equal to the CI matrices.
+- `auth ai-set` accepts only absolute http(s) AI base URLs with a host; embedded credentials, query
+  strings and fragments are rejected. A failed `--ai-profile` selection keeps the previous profile.
 
 ### Added
+- **`KINETIC_AI_PROFILE`**: a complete AI profile (server URL, API style, model, key) as JSON or a JSON
+  file path, for headless runners without a keyring. Previously a runner could set only the URL
+  (`KINETIC_AI_BASE_URL`), so it had no way to send a key or choose the API style.
 - Native checks (tests that execute uv's generated console-script `.exe` launchers) are deferred in
   local runs and the pre-commit hook, because enterprise endpoint security may
   block newly built unsigned files. They run in CI, in Windows Sandbox, or on request with
@@ -68,8 +71,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI job "Built Wheel Smoke Test": builds the sdist and wheel, checks the wheel contains only
   `kinetic_devops/`, installs it into a clean environment and, from outside the checkout, imports every
   module and starts each console script and module CLI.
+- Forgejo CI (`.forgejo/`, ignored by GitHub; configured only through repository/organisation settings):
+  a **Run workflow** button for CI Tests; **ci-bot**, an AI review of a pull request's diff by any
+  OpenAI-compatible endpoint (`LLM_BASE_URL`, `LLM_API_KEY`) when a review is requested from it or
+  someone with write access comments `@ci-bot` (`@ci-bot test` re-runs the tests); and **`sync/<name>`
+  tags** that rebase a branch onto upstream `main`, run guards (no `.github/workflows` changes, issue
+  references, draft advisories, secret-scanning alerts, new vulnerable dependencies, no private host
+  names, addresses or non-noreply commit e-mails), run the tests, then push the branch and open or
+  update the pull request. `sync/dry-run/<name>` prints the exact pull request text and pushes nothing. (#42)
+- Forgejo **Sync** workflow can be started from the Run workflow button (pick the branch; dry run by
+  default), only by users listed in the `SYNC_ACTORS` variable (empty = disabled). (#49)
 
 ### Fixed
+- The example Forgejo target required GitHub-style check names, which Forgejo never reports
+  (`CI Tests / <job> (<event>)`), so a rule applied from it could never be satisfied; it now uses globs.
 - Encrypted-vault tests never ran on Windows: `cryptography` was only present where `keyring` pulls
   it in (Linux). It is now a dev dependency and a user-facing extra (`kinetic-devops[vault]`). When
   it is installed but can't load -- e.g. endpoint security blocks its native library -- the error
@@ -82,8 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/env_init.bat` was stored with LF-only line endings, which `cmd.exe` misparses;
   `.gitattributes` now checks out `*.bat` / `*.cmd` with CRLF.
 - The branch-protection dry-run test no longer depends on the checkout's `origin` remote.
-- `auth ai-set` accepts only absolute http(s) AI base URLs with a host; embedded credentials, query
-  strings and fragments are rejected. A failed `--ai-profile` selection keeps the previous profile.
+
+### Dependencies
+- `certifi` 2026.2.25 -> 2026.10.19; `cryptography` (dev dependency, `vault` extra) 50.0.0 -> 50.0.2.
 
 ## [0.1.0a7] - 2026-10-13
 

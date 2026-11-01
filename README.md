@@ -255,6 +255,27 @@ See [examples/complete_flow.py](examples/complete_flow.py) for a complete auth �
 - [scripts/README.md](scripts/README.md) — Helper scripts reference
 - [tests/README.md](tests/README.md) — Test suite documentation
 
+## Versioning
+
+Until 1.0.0, versions are [PEP 440](https://peps.python.org/pep-0440/)
+`0.BREAKING.FEATURES.FIXES` plus a stage and sequence number (`a8` = the 8th alpha release);
+checked by `tests/test_versioning.py`:
+
+| The release contains (its [CHANGELOG.md](CHANGELOG.md) section) | Next version | Example |
+|---|---|---|
+| a breaking change (**Breaking**) | BREAKING + 1, FEATURES and FIXES 0 | 0.2.1.3a12 -> 0.3.0.0a13 |
+| new or changed behaviour, nothing breaking (**Added** / **Changed**) | FEATURES + 1, FIXES 0 | 0.2.0.0a8 -> 0.2.1.0a9 |
+| fixes only (**Fixed** / **Security** / **Dependencies**) | FIXES + 1 | 0.2.1.0a9 -> 0.2.1.1a10 |
+
+- The sequence number goes up by exactly 1 with every release, whatever else changes, so it is the
+  release's place in the line: `a8` follows `a7`. The stage moves forward only, alpha (`a`) -> beta
+  (`b`) -> release candidate (`rc`), and the number restarts at 1 when it does (`b1`).
+- Breaking changes we know of always bump BREAKING, so `kinetic-devops~=0.2.0.0a8` gets new features
+  and fixes without them. Alpha still means any release may change behaviour.
+- Every release before 1.0.0 is a pre-release: install with a version pin or `--pre`.
+- From 1.0.0 on, versions are [Semantic Versioning](https://semver.org/) `MAJOR.MINOR.PATCH`.
+- 0.1.0a1-a7 were published before this rule; their alpha numbers carry on (`a8`).
+
 ## Known Limitations
 
 - **Alpha stage** — Breaking changes may occur between versions

@@ -336,7 +336,7 @@ wheels = [
 
 [[package]]
 name = "kinetic-devops"
-version = "0.1.0a7"
+version = "0.2.0.0a8"
 source = { editable = "." }
 dependencies = [
     { name = "keyring" },
