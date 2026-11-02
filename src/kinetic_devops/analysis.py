@@ -172,6 +172,7 @@ def _ai_client_settings(base_url: str) -> tuple[str, dict[str, str]]:
 DEFAULT_MAX_DIFF_CHARS = 4500
 DEFAULT_MAX_OUTPUT_TOKENS = 360
 DEFAULT_RETRY_OUTPUT_TOKENS = 220
+DEFAULT_TEMPERATURE = 0.15  # unless the profile sets sampling (auth ai-set --sampling)
 DEFAULT_MAX_CHUNKS = 20  # per reviewed item; beyond this the item is INCOMPLETE, never GO
 MIN_DIFF_CHARS = 200  # smaller chunks can't hold a file header plus any diff
 
@@ -270,7 +271,6 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
         body = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.15,
             "max_tokens": max_tokens,
             "stream": True,
         }
@@ -279,13 +279,13 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
         body = {
             "model": model,
             "prompt": prompt,
-            "temperature": 0.15,
             "max_tokens": max_tokens,
             "stream": True,
         }
-    # Profile extras (e.g. thinking off); the reserved fields above always win.
+    # Profile extras (thinking off, sampling, ...); the reserved fields above always win.
     extra = _profile_for_url(base_url).get("extra_body") or {}
     body = {**{k: v for k, v in extra.items() if k not in body}, **body}
+    body.setdefault("temperature", DEFAULT_TEMPERATURE)
     req = request.Request(
         url=url,
         data=json.dumps(body).encode("utf-8"),

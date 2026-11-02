@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -691,6 +692,43 @@ class TestThinkingModels(AIProfileTestBase):
         package = {"base_url": self.URL, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
         with mock.patch.dict(os.environ, {auth.AI_PROFILE_ENV: json.dumps(package)}):
             self.assertEqual(auth.get_ai_profile()["extra_body"], package["extra_body"])
+
+    def _sent_body(self):
+        sent = []
+        stream = _Response(b'data: {"choices": [{"delta": {"content": "GO"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
+        with mock.patch.object(analysis.request, "urlopen", side_effect=lambda req, timeout=None: sent.append(req) or stream):
+            analysis.call_ai(self.URL, 5, "m", "review this", max_tokens=50)
+        return json.loads(sent[0].data)
+
+    def test_default_temperature_without_profile_sampling(self):
+        auth.set_ai_profile(self.URL, "openai-chat", "m", name="gate", extra_body=auth.AI_NO_THINKING)
+        body = self._sent_body()
+        self.assertEqual(body["temperature"], analysis.DEFAULT_TEMPERATURE)
+        self.assertNotIn("top_k", body)
+
+    def test_profile_sampling_is_sent(self):
+        auth.set_ai_profile(self.URL, "openai-chat", "m", name="deep",
+                            extra_body=auth.AI_SAMPLING_PRESETS["qwen-thinking"])
+        body = self._sent_body()
+        self.assertEqual((body["temperature"], body["top_p"], body["top_k"]), (0.6, 0.95, 20))
+        self.assertEqual((body["max_tokens"], body["stream"]), (50, True))  # still the review's own
+
+    def _ai_set(self, *args):
+        with mock.patch.object(sys, "argv", ["auth", "ai-set", "--name", "deep", "--url", self.URL,
+                                             "--api-style", "openai-chat", "--model", "m", *args]), \
+                mock.patch.object(auth.getpass, "getpass", return_value=""), \
+                mock.patch("builtins.print"):
+            auth.main()
+        return json.loads(self.kr.get_password(auth.SERVICE_AI, "profile:deep")).get("extra_body", {})
+
+    def test_ai_set_sampling_replaces_only_sampling_fields(self):
+        self.assertEqual(self._ai_set("--no-thinking", "--sampling", "qwen-thinking"),
+                         {**auth.AI_NO_THINKING, "temperature": 0.6, "top_p": 0.95, "top_k": 20})
+        # Editing keeps the stored fields; another preset swaps only the sampling ones.
+        self._ai_set("--extra-body", '{"temperature": 1.0, "min_p": 0.1, "reasoning_effort": "low"}')
+        self.assertEqual(self._ai_set("--sampling", "qwen-thinking"),
+                         {"reasoning_effort": "low", "temperature": 0.6, "top_p": 0.95, "top_k": 20})
+        self.assertEqual(self._ai_set("--sampling", "default"), {"reasoning_effort": "low"})
 
     def test_thinking_preset_leaves_room_for_reasoning(self):
         self.assertGreater(auth.AI_BUDGET_PRESETS["large-thinking"]["max_output_tokens"],

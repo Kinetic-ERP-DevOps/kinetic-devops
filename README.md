@@ -122,6 +122,11 @@ Common environment variables:
   for gate reviews: `auth ai-set --no-thinking` stores `{"chat_template_kwargs": {"enable_thinking":
   false}}` as the profile's `extra_body` (honoured by llama.cpp, vLLM and LiteLLM pass-through); any other
   extra request fields with `--extra-body JSON` (e.g. `'{"reasoning_effort": "low"}'`; `'{}'` clears).
+  Sampling is per profile too: requests use temperature 0.15 unless the profile sets its own
+  (`temperature`, `top_p`, `top_k`, ... in `extra_body`). Use the model's recommended thinking-mode
+  sampling for thinking reviews: `auth ai-set --sampling qwen-thinking` (temperature 0.6, top_p 0.95,
+  top_k 20) got about twice as many labelled review cases right as 0.15 on Qwen3.6-35B-A3B. `--sampling default`
+  goes back to 0.15.
 - `KINETIC_ANALYSIS_MAX_COMMITS` (default: `20`)
 - `KINETIC_ANALYSIS_LEGACY_OUT_DIR` (default: `D:\Kinetic_SDK\temp\legacy_intake_reviews`)
 

@@ -67,8 +67,8 @@ SERVICE_API_KEY = "epicor-kinetic-apikey"
 SERVICE_SERVERS = "epicor-kinetic-servers"
 # Named AI server profiles for kinetic_devops.analysis. Each profile is one
 # self-contained keyring entry, "profile:<name>" -> {"v": 1, "base_url",
-# "api_style", "model", "api_key"[, "budget"]}, so a profile carries its server, API style,
-# model, key and review budget together. A non-secret index under "profiles" ({"v": 2,
+# "api_style", "model", "api_key"[, "budget"][, "extra_body"]}, so a profile carries its server,
+# API style, model, key, review budget and extra request fields (thinking, sampling) together. A non-secret index under "profiles" ({"v": 2,
 # "default": name, "names": [...]}) lists them. Profiles on the same server share
 # its key: setting a key updates every profile for that URL. KINETIC_AI_PROFILE
 # supplies one profile in the same JSON format (inline, or a path to a JSON file)
@@ -88,10 +88,22 @@ AI_BUDGET_PRESETS: Dict[str, Dict[str, int]] = {
     # Thinking models spend max_tokens on thinking before the answer: leave room for it.
     "large-thinking": {"max_diff_chars": 120000, "max_output_tokens": 6000},
 }
-# Extra request fields per profile (e.g. {"chat_template_kwargs": {"enable_thinking": false}} or
-# {"reasoning_effort": "low"}), merged into every AI request; they may not replace these:
-AI_RESERVED_REQUEST_KEYS = ("model", "messages", "prompt", "stream", "max_tokens", "temperature")
+# Extra request fields per profile (e.g. {"chat_template_kwargs": {"enable_thinking": false}},
+# {"reasoning_effort": "low"} or sampling settings), merged into every AI request; they may not
+# replace these:
+AI_RESERVED_REQUEST_KEYS = ("model", "messages", "prompt", "stream", "max_tokens")
 AI_NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
+# Sampling per profile (stored in extra_body). Without any, requests use temperature 0.15
+# (analysis.DEFAULT_TEMPERATURE). Recommended settings are model-specific: "qwen-thinking" is Qwen3's
+# thinking-mode recommendation; on Qwen3.6-35B-A3B it got about twice as many labelled code-review
+# cases right as temperature 0.15 (34 vs 16 of 102), and adding presence_penalty 1.0 did not help.
+# "default" removes every sampling field from the profile.
+AI_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                    "repetition_penalty")
+AI_SAMPLING_PRESETS: Dict[str, Dict[str, Any]] = {
+    "default": {},
+    "qwen-thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+}
 AI_DEFAULT_PROFILE = "default"
 AI_PROFILE_ENV = "KINETIC_AI_PROFILE"
 AI_PROFILE_VERSION = 1
@@ -2782,6 +2794,12 @@ def main():
                           "enable_thinking=false; llama.cpp, vLLM, LiteLLM). For fast gate reviews.")
     thinking.add_argument("--extra-body", default=None, metavar="JSON",
                           help="Extra JSON fields for every request, e.g. '{\"reasoning_effort\": \"low\"}'; '{}' clears.")
+    ai_set_p.add_argument(
+        "--sampling", choices=sorted(AI_SAMPLING_PRESETS), default=None,
+        help="Sampling for this profile's model (applied after --no-thinking / --extra-body): qwen-thinking = "
+        "temperature 0.6, top_p 0.95, top_k 20 (Qwen3 thinking mode); default = remove sampling fields "
+        "(temperature 0.15).",
+    )
     subparsers.add_parser(
         "ai-show",
         help="List the stored AI server profiles (never the keys themselves).",
@@ -2943,6 +2961,11 @@ def main():
                     extra = json.loads(args.extra_body)
                 except ValueError:
                     raise ValueError("--extra-body must be a JSON object") from None
+            if args.sampling is not None:
+                if not isinstance(extra, dict):
+                    raise ValueError("--extra-body must be a JSON object")
+                extra = {k: v for k, v in extra.items() if k not in AI_SAMPLING_KEYS}
+                extra.update(AI_SAMPLING_PRESETS[args.sampling])
             had_key = bool(get_ai_api_key(url))
             key = getpass.getpass("API key (hidden; blank keeps the stored one): " if had_key else "API key (hidden): ").strip()
             profile = set_ai_profile(url, style, model, api_key=key or None, name=name, make_default=args.make_default,
