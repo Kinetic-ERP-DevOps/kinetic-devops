@@ -1118,6 +1118,15 @@ class KineticConfigManager(KineticCore):
         nickname = ctx.get('nickname', '')
         company = ctx.get('company', '')
 
+        # getpass reads the console directly on Windows, not stdin, so without a terminal the prompt
+        # blocks forever instead of failing (a background run with an expired token hung for an hour).
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise RuntimeError(
+                f"Token for {nickname or url} ({user_id or 'unknown user'}) needs a password, but there is no "
+                f"interactive terminal to prompt in. Run 'python -m kinetic_devops.auth renew {nickname}' "
+                "in a terminal, then retry."
+            )
+
         # If the caller did not provide a user_id (empty), prompt now.
         if not user_id:
             while True:

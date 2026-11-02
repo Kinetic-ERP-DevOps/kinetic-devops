@@ -213,5 +213,36 @@ class TestGetActiveConfigScoping(unittest.TestCase):
         self.assertEqual(result, ("https://fallback.example",))
 
 
+class TestFetchTokenNonInteractive(unittest.TestCase):
+    """_fetch_token_kinetic must fail fast without a terminal: getpass reads the Windows console
+    directly, so a background run with an expired token otherwise blocks forever."""
+
+    def _ctx(self):
+        return {"url": "https://pilot.example", "api_key": "key", "user_id": "alice",
+                "token_slot": "slot", "nickname": "pilot", "company": "ACME"}
+
+    def test_no_terminal_raises_with_renew_hint_and_never_prompts(self):
+        mgr = _bare_manager()
+        with patch.object(sys.stdin, "isatty", return_value=False), \
+             patch.object(sys.stdout, "isatty", return_value=False), \
+             patch("kinetic_devops.auth.getpass.getpass") as mock_getpass, \
+             patch("builtins.input") as mock_input:
+            with self.assertRaises(RuntimeError) as ctx:
+                mgr._fetch_token_kinetic(self._ctx())
+        mock_getpass.assert_not_called()
+        mock_input.assert_not_called()
+        self.assertIn("kinetic_devops.auth renew pilot", str(ctx.exception))
+
+    def test_stdin_redirected_with_console_stdout_still_raises(self):
+        """`$null | python ...` keeps stdout on the console; the prompt would still hang."""
+        mgr = _bare_manager()
+        with patch.object(sys.stdin, "isatty", return_value=False), \
+             patch.object(sys.stdout, "isatty", return_value=True), \
+             patch("kinetic_devops.auth.getpass.getpass") as mock_getpass:
+            with self.assertRaises(RuntimeError):
+                mgr._fetch_token_kinetic(self._ctx())
+        mock_getpass.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

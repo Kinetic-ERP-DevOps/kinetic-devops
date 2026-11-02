@@ -56,6 +56,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   file is scanned unless it is untracked or named by an explicit `--exclude`; git scans apply explicit excludes
   only. The built-in list only trims walks of explicit subpaths and non-git folders, and a file named with
   `--file` is always scanned unless explicitly excluded.
+- A cached token that needs a password no longer hangs non-interactive runs. Without a terminal, the
+  password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
+  instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
+
 
 ## [0.2.0.0a8] - 2026-11-01
 
