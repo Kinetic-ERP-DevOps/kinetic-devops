@@ -28,6 +28,13 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - Scanner patterns for internal infrastructure: private (RFC 1918) IPv4 addresses, the tailnet CGNAT range
   (100.64/10) and IPv6 prefix, and `*.ts.net` host names. Use documentation placeholders (e.g. 192.0.2.x,
   example.com) in shared code and docs.
+- **Epicor IdP sign-in** (`auth idp-login`, `auth idp-client`, module `kinetic_devops.idp`): sign in through the
+  environment's Epicor IdP in the browser (authorization code + PKCE, loopback redirect), so no password passes
+  through the CLI. Sessions renew with the refresh token without prompting; refreshes take a per-session lock
+  and re-read the stored token, so one-time (rotating) refresh tokens survive parallel runs. Expired IdP sessions
+  never fall back to a password prompt. `renew` refreshes IdP sessions. The IdP settings come from the server's
+  anonymous `/api/.configuration`, and the client ID is stored per IdP tenant. Setup, including registering a
+  native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with

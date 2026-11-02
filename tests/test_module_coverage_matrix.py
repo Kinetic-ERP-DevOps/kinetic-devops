@@ -27,6 +27,7 @@ PACKAGE_MODULE_MATRIX = {
     "file_service",
     "find_sensitive_data",
     "fs_ops",
+    "idp",
     "KineticCore",
     "metafx",
     "repo_maker",
