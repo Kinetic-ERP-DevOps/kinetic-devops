@@ -121,6 +121,14 @@ DEFAULT_DROP_PARENT_NAME_PATTERNS = [
     "*/Ice.BO.FeatureUserSettingSvc",
 ]
 
+# Calls kept even under a dropped parent (e.g. MetaFX is UI-metadata noise, except app imports/exports, which are
+# usually the point of the trace). A dropped parent that contains one is kept, trimmed to the kept calls.
+DEFAULT_KEEP_NODE_NAME_PATTERNS = [
+    "ImportLayers-*",
+    "ImportApp-*",
+    "ExportApp-*",
+]
+
 AGGRESSIVE_DROP_PATH_PATTERNS = [
     "*.BOCall.request.url",
     "*.BOCall.request.queryParams.request",
@@ -384,6 +392,21 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Drop entire service/root nodes whose name matches this wildcard pattern (can be repeated).",
+    )
+    parser.add_argument(
+        "--keep-node-name",
+        action="append",
+        default=[],
+        help=(
+            "Keep calls whose node name matches this wildcard pattern even under a dropped parent; the parent "
+            "stays, trimmed to the kept calls (can be repeated; added to the defaults: "
+            + ", ".join(DEFAULT_KEEP_NODE_NAME_PATTERNS) + ")."
+        ),
+    )
+    parser.add_argument(
+        "--no-default-keep",
+        action="store_true",
+        help="Don't apply the built-in keep patterns (only --keep-node-name ones).",
     )
     parser.add_argument(
         "--no-default-prune",
@@ -656,30 +679,59 @@ def relink_siblings(children: list[Any]) -> None:
             child["nextSibling"] = next_name
 
 
+def subtree_has_name(node: Any, patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+    if isinstance(node, dict):
+        name = node.get("name")
+        if isinstance(name, str) and name_matches(name, patterns):
+            return True
+        return any(subtree_has_name(v, patterns) for v in node.values())
+    if isinstance(node, list):
+        return any(subtree_has_name(v, patterns) for v in node)
+    return False
+
+
 def prune_trace_tree(
     node: Any,
     path: str,
     drop_node_name_patterns: list[str],
     drop_parent_name_patterns: list[str],
     stats: Stats,
+    keep_node_name_patterns: list[str] | None = None,
 ) -> Any:
+    keep = keep_node_name_patterns or []
     if isinstance(node, dict):
-        current_name = node.get("name") if isinstance(node.get("name"), str) else ""
-
         if "children" in node and isinstance(node["children"], list):
             filtered_children: list[Any] = []
+            removed_any = False
             for idx, child in enumerate(node["children"]):
                 child_name = child.get("name", "") if isinstance(child, dict) else ""
                 child_path = f"{path}.children[{idx}]" if path else f"children[{idx}]"
 
                 parent_rule = name_matches(child_name, drop_parent_name_patterns) if child_name else None
+                if parent_rule and subtree_has_name(child, keep):
+                    # Keep the parent for the calls that matter; drop its other children.
+                    kept = []
+                    for cidx, grandchild in enumerate(child.get("children") or []):
+                        if subtree_has_name(grandchild, keep):
+                            kept.append(grandchild)
+                        else:
+                            gname = grandchild.get("name", "") if isinstance(grandchild, dict) else ""
+                            record_removal(stats, f"{child_path}.children[{cidx}].name={gname}", f"node:{parent_rule}")
+                    if len(kept) != len(child.get("children") or []):
+                        child["children"] = kept
+                        relink_siblings(child["children"])
+                    parent_rule = None
                 if parent_rule:
                     record_removal(stats, f"{child_path}.name={child_name}", f"node:{parent_rule}")
+                    removed_any = True
                     continue
 
                 node_rule = name_matches(child_name, drop_node_name_patterns) if child_name else None
-                if node_rule:
+                if node_rule and not subtree_has_name(child, keep):
                     record_removal(stats, f"{child_path}.name={child_name}", f"node:{node_rule}")
+                    removed_any = True
                     continue
 
                 filtered_children.append(
@@ -689,11 +741,15 @@ def prune_trace_tree(
                         drop_node_name_patterns,
                         drop_parent_name_patterns,
                         stats,
+                        keep,
                     )
                 )
 
             node["children"] = filtered_children
-            relink_siblings(node["children"])
+            # Only relink when siblings actually changed: relinking an untouched list would add
+            # prevSibling/nextSibling keys the trace never had (and break sensitive-values' structure check).
+            if removed_any:
+                relink_siblings(node["children"])
 
         for key, value in list(node.items()):
             if key == "children":
@@ -705,12 +761,13 @@ def prune_trace_tree(
                 drop_node_name_patterns,
                 drop_parent_name_patterns,
                 stats,
+                keep,
             )
         return node
 
     if isinstance(node, list):
         return [
-            prune_trace_tree(v, f"{path}[{i}]", drop_node_name_patterns, drop_parent_name_patterns, stats)
+            prune_trace_tree(v, f"{path}[{i}]", drop_node_name_patterns, drop_parent_name_patterns, stats, keep)
             for i, v in enumerate(node)
         ]
 
@@ -1502,6 +1559,7 @@ def process_file(
     delta_out_dir: str,
     delta_max_value_len: int,
     delta_redact_values: bool,
+    keep_node_name_patterns: list[str] | None = None,
 ) -> tuple[bool, str, str]:
     try:
         raw = src.read_text(encoding="utf-8")
@@ -1525,6 +1583,9 @@ def process_file(
         drop_node_name_patterns=drop_node_name_patterns,
         drop_parent_name_patterns=drop_parent_name_patterns,
         stats=stats,
+        keep_node_name_patterns=(
+            DEFAULT_KEEP_NODE_NAME_PATTERNS if keep_node_name_patterns is None else keep_node_name_patterns
+        ),
     )
     trimmed = trim_node(data, "", drop_patterns, drop_keys, stats)
     trimmed = normalize_placeholder_repeats(trimmed, "", stats)
@@ -1749,6 +1810,9 @@ def main() -> int:
             delta_out_dir=args.delta_out_dir,
             delta_max_value_len=args.delta_max_value_len,
             delta_redact_values=args.delta_redact_values,
+            keep_node_name_patterns=(
+                ([] if args.no_default_keep else list(DEFAULT_KEEP_NODE_NAME_PATTERNS)) + list(args.keep_node_name)
+            ),
         )
         if detail:
             print(detail)

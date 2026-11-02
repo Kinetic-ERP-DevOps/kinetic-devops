@@ -26,6 +26,14 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   `count_removed_structure` (counts structure present before and missing after), and
   `compare_json_structure` (returns `{"identical", "removed_count", "report"}`).
 
+### Fixed
+- `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
+  "structure=changed: 0 element(s) removed": pruning relinked `prevSibling`/`nextSibling` on every call
+  list, adding keys the trace never had. Siblings are now relinked only when a call was removed.
+- `trim` / `trim-context` no longer silently drop `ImportLayers`, `ImportApp` and `ExportApp` calls with the
+  rest of the MetaFX service (dropped by default as UI-metadata noise). A dropped service that contains a kept
+  call stays, trimmed to the kept calls. New `--keep-node-name PATTERN` (repeatable) and `--no-default-keep`.
+
 ## [0.2.0.0a8] - 2026-11-01
 
 The 8th alpha, and the first release under the versioning rule in the README (*Versioning*): this

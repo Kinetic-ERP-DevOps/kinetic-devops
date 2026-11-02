@@ -250,6 +250,58 @@ class TestTrimTracePathsDelta(unittest.TestCase):
             self.assertEqual(out["rows"][0], {"Company": "{COMPANY_ID}", "Plant": "{PLANT_ID}", "keep": 1})
             self.assertEqual(out["rows"][1], {"Company": "{COMPANY_ID}", "Plant": "{PLANT_ID}", "keep": 2})
 
+    @staticmethod
+    def _call(method, idx):
+        return {"name": f"{method}-{idx}", "timestamp": "t", "children": [],
+                "BOCall": {"id": str(idx), "request": {"method": "POST", "body": {}, "headers": {}},
+                           "response": {"body": {}}}}
+
+    def _tree(self):
+        metafx = "{INSTANCE}/api/v2/odata/{COMPANY_ID}/Ice.LIB.MetaFXSvc"
+        other = "{INSTANCE}/api/v2/odata/{COMPANY_ID}/Ice.BO.UserFileSvc"
+        # No prevSibling/nextSibling keys anywhere, as in many real traces.
+        return {"name": "root", "children": [
+            {"name": metafx, "children": [self._call("GetApp", 1), self._call("ImportLayers", 2)]},
+            {"name": other, "children": [self._call("GetRows", 3)]},
+        ]}
+
+    def test_sensitive_values_mode_does_not_add_sibling_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            src = self._write_input(temp_dir, self._tree())
+            ok, msg, _ = self._run_process(src, temp_dir / "reduced", temp_dir / "delta", redact_mode="sensitive-values")
+            self.assertTrue(ok, msg)
+            self.assertIn("structure=identical", msg)
+            out = (temp_dir / "reduced" / "trace_reduced.json").read_text(encoding="utf-8")
+            self.assertNotIn("Sibling", out)
+
+    def _trim_tree(self, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            src = self._write_input(temp_dir, self._tree())
+            ok, msg, _ = trim_trace_paths.process_file(
+                src=src, drop_patterns=[], drop_keys=set(), in_place=False, out_dir=str(temp_dir / "reduced"),
+                suffix="_reduced", pretty=True, dry_run=False, do_prune_empty=False, show_samples=0,
+                show_top_rules=0, no_backup=True, drop_node_name_patterns=[],
+                drop_parent_name_patterns=list(trim_trace_paths.DEFAULT_DROP_PARENT_NAME_PATTERNS),
+                strip_empty_call_context=False, show_call_summary=False, sequence_only=False,
+                redact_mode="aggressive", call_context_policy="purge", light_repair_json=True, sample_size=0,
+                sample_include_patterns=[], sample_exclude_patterns=[], delta_mode="off", delta_format="jsonc",
+                delta_out_dir=str(temp_dir / "delta"), delta_max_value_len=200, delta_redact_values=True, **kwargs)
+            self.assertTrue(ok, msg)
+            return (temp_dir / "reduced" / "trace_reduced.json").read_text(encoding="utf-8")
+
+    def test_trim_keeps_import_layers_under_dropped_service(self):
+        out = self._trim_tree()
+        self.assertIn("ImportLayers-2", out)
+        self.assertNotIn("GetApp-1", out)  # the service's metadata noise is still dropped
+        self.assertIn("GetRows-3", out)
+
+    def test_trim_drops_whole_service_when_no_keep_pattern_matches(self):
+        out = self._trim_tree(keep_node_name_patterns=[])
+        self.assertNotIn("MetaFXSvc", out)
+        self.assertNotIn("ImportLayers-2", out)
+
     def test_sensitive_values_mode_keeps_empty_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             temp_dir = Path(tmp)
