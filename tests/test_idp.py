@@ -239,5 +239,18 @@ class TestSlotStorage(unittest.TestCase):
         self.assertEqual(self.kr.store, {})
 
 
+class TestScannerLearnsIdpIdentifiers(unittest.TestCase):
+    def test_tenant_endpoint_and_client_id_patterns(self):
+        mgr = KineticConfigManager.__new__(KineticConfigManager)
+        servers = {"pilot": {"url": "https://pilot.example", "api_key": "k" * 20, "companies": "ACME",
+                             "sessions": ["alice"]}}
+        cid = "0f0e0d0c-0b0a-4908-8706-050403020100"
+        with patch.object(mgr, "_get_server_dict", return_value=servers),              patch.object(mgr, "_get_token_meta", return_value={"auth_method": "idp", "idp_tenant": "4242"}),              patch.object(idp, "get_client_id", return_value=cid):
+            pats = mgr.get_sensitive_data_patterns()
+        self.assertTrue(pats["IDP_TENANT_ENDPOINT"].search("https://idp.example/tid/4242/connect"))
+        self.assertFalse(pats["IDP_TENANT_ENDPOINT"].search("total 4242 rows"))
+        self.assertTrue(pats["IDP_CLIENT_IDS"].search(f"client {cid.upper()}"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1969,6 +1969,29 @@ class KineticConfigManager(KineticCore):
         # code/docs (refer to a Kinetic Cloud version instead). The NOTICE_ prefix
         # makes the scanner report these without failing. Case-sensitive, since
         # nicknames are often ordinary words.
+        # Epicor IdP: tenant IDs (from IdP sessions) and the registered client IDs stored per tenant.
+        # Tenant IDs are short numbers, so they are only matched in their endpoint form (".../tid/<n>").
+        tenants, client_ids = set(), set()
+        for name, config in servers.items():
+            for user in config.get("sessions", []) or []:
+                try:
+                    meta = self._get_token_meta(self._get_token_key(name, user, config.get("api_key", ""))) or {}
+                except Exception:
+                    meta = {}
+                if meta.get("idp_tenant"):
+                    tenants.add(str(meta["idp_tenant"]))
+        for tenant in tenants:
+            try:
+                cid = idp.get_client_id(tenant)
+            except Exception:
+                cid = ""
+            if cid:
+                client_ids.add(re.escape(cid))
+        if tenants:
+            patterns["IDP_TENANT_ENDPOINT"] = re.compile(r'tid/(' + '|'.join(map(re.escape, sorted(tenants))) + r')\b')
+        if client_ids:
+            patterns["IDP_CLIENT_IDS"] = re.compile(r'(?i)\b(' + '|'.join(sorted(client_ids)) + r')\b')
+
         nicknames = sorted({str(n).strip() for n in servers if len(str(n).strip()) >= 3}, key=len, reverse=True)
         if nicknames:
             patterns["NOTICE_ENV_NICKNAMES"] = re.compile(r'\b(' + '|'.join(map(re.escape, nicknames)) + r')\b')
