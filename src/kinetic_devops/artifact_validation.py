@@ -211,3 +211,69 @@ def load_scope_artifact_from_path(
         return build_scope_artifact_from_tableset(payload, ignore_fields=ignore_fields, include_company=include_company)
 
     return extract_artifact_payload(payload, ("core", "entities", "bo_methods"))
+
+
+def structure_skeleton(node: Any) -> Any:
+    """Structure-only fingerprint of any JSON-compatible value.
+
+    Dicts keep their keys (recursively), lists keep their length plus the
+    skeletons of their items, and every scalar collapses to the sentinel
+    string "<value>". Useful for verifying that a transformation (redaction,
+    normalization, export/re-import) changed values without changing shape.
+    """
+
+    if isinstance(node, Mapping):
+        return {key: structure_skeleton(value) for key, value in node.items()}
+    if isinstance(node, (list, tuple)):
+        return [len(node)] + [structure_skeleton(item) for item in node]
+    return "<value>"
+
+
+def count_removed_structure(skeleton_before: Any, skeleton_after: Any) -> int:
+    """Count structure elements present in `skeleton_before` and missing in `skeleton_after`.
+
+    Inputs must be `structure_skeleton` fingerprints (not raw values). A
+    dict/list replaced by a non-container counts as 1 removal; extra elements
+    in `skeleton_after` are not counted (this measures loss, not growth).
+    """
+
+    if isinstance(skeleton_before, Mapping):
+        if not isinstance(skeleton_after, Mapping):
+            return 1
+        removed = 0
+        for key, value in skeleton_before.items():
+            if key not in skeleton_after:
+                removed += 1
+            else:
+                removed += count_removed_structure(value, skeleton_after[key])
+        return removed
+
+    if isinstance(skeleton_before, list):
+        # Skeleton list: element 0 is the original length, the rest are item skeletons.
+        if not isinstance(skeleton_after, list):
+            return 1
+        removed = max(0, skeleton_before[0] - skeleton_after[0]) if skeleton_after else 0
+        for value, kept in zip(skeleton_before[1:], skeleton_after[1:]):
+            removed += count_removed_structure(value, kept)
+        return removed
+
+    return 0
+
+
+def compare_json_structure(before: Any, after: Any, label: str = "structure") -> Dict[str, Any]:
+    """Compare the structure of two JSON-compatible values.
+
+    Returns {"identical": bool, "removed_count": int, "report": str} where the
+    report is a human-readable one-liner such as
+    "structure=identical" or "structure=changed: 3 element(s) removed".
+    """
+
+    skeleton_before = structure_skeleton(before)
+    skeleton_after = structure_skeleton(after)
+    identical = skeleton_before == skeleton_after
+    removed_count = 0 if identical else count_removed_structure(skeleton_before, skeleton_after)
+    if identical:
+        report = f"{label}=identical"
+    else:
+        report = f"{label}=changed: {removed_count} element(s) removed"
+    return {"identical": identical, "removed_count": removed_count, "report": report}

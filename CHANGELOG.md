@@ -9,6 +9,23 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 
 ## [Unreleased]
 
+### Added
+- `trim_trace_paths --mode` matrix replaces `--redact-mode` (removed, no compatibility alias).
+  Each mode is a bundle of flag defaults that explicit command-line flags always override:
+  `trim` (aggressive redaction profile, the default), `trim-context` (context-only drops),
+  `redact-inplace` (sensitive-values redaction with `--in-place`, `--no-backup`, `--pretty`), and
+  `redact-only` (sensitive-values redaction writing to `--out-dir redacted/`).
+  Sensitive-values redaction keeps every element of structure: all default and explicit drop/prune
+  rules are suppressed, empty values are kept, and key reordering is off. After redaction the tool
+  verifies the output structure is identical to the input (via the `artifact_validation` structure
+  fingerprint) and fails the file if anything was lost; `--sample-size` disables the check with a
+  note since sampling trims structure. New modes can be added by extending `MODE_MATRIX` without
+  touching the CLI plumbing.
+- Generic JSON structure comparison helpers in `artifact_validation` (usable by any command that
+  transforms JSON artifacts): `structure_skeleton` (shape fingerprint of any JSON value),
+  `count_removed_structure` (counts structure present before and missing after), and
+  `compare_json_structure` (returns `{"identical", "removed_count", "report"}`).
+
 ## [0.2.0.0a8] - 2026-11-01
 
 The 8th alpha, and the first release under the versioning rule in the README (*Versioning*): this

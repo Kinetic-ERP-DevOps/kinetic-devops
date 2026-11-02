@@ -38,8 +38,8 @@ class TestTrimTracePathsDelta(unittest.TestCase):
             strip_empty_call_context=False,
             show_call_summary=False,
             sequence_only=False,
-            redact_mode="aggressive",
-            call_context_policy="purge",
+            redact_mode=kwargs.get("redact_mode", "aggressive"),
+            call_context_policy=kwargs.get("call_context_policy", "purge"),
             light_repair_json=True,
             sample_size=0,
             sample_include_patterns=[],
@@ -211,6 +211,196 @@ class TestTrimTracePathsDelta(unittest.TestCase):
             text = sidecars[0].read_text(encoding="utf-8")
             self.assertIn("// trace delta sidecar (annotated)", text)
             self.assertIn("\"events\"", text)
+    def test_sensitive_values_mode_preserves_structure_and_redacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            src = self._write_input(
+                temp_dir,
+                {
+                    "Company": "ZZTEST",
+                    "UserID": "fakeuser",
+                    "EMailAddress": "someone@example.com",
+                    "note": "plain text stays",
+                    "rows": [
+                        {"Company": "ZZTEST", "Plant": "00", "keep": 1},
+                        {"Company": "ZZTEST", "Plant": "01", "keep": 2},
+                    ],
+                },
+            )
+            out_dir = temp_dir / "reduced"
+            delta_dir = temp_dir / "delta"
+
+            ok, msg, detail = self._run_process(
+                src,
+                out_dir,
+                delta_dir,
+                redact_mode="sensitive-values",
+            )
+
+            self.assertTrue(ok, msg)
+            self.assertIn("removed=0 nodes", msg)
+            self.assertIn("structure=identical", msg)
+
+            out = json.loads((out_dir / "trace_reduced.json").read_text(encoding="utf-8"))
+            self.assertEqual(out["Company"], "{COMPANY_ID}")
+            self.assertEqual(out["UserID"], "{UserID}")
+            self.assertEqual(out["EMailAddress"], "{EMAIL}")
+            self.assertEqual(out["note"], "plain text stays")
+            self.assertEqual(len(out["rows"]), 2)
+            self.assertEqual(out["rows"][0], {"Company": "{COMPANY_ID}", "Plant": "{PLANT_ID}", "keep": 1})
+            self.assertEqual(out["rows"][1], {"Company": "{COMPANY_ID}", "Plant": "{PLANT_ID}", "keep": 2})
+
+    def test_sensitive_values_mode_keeps_empty_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            src = self._write_input(
+                temp_dir,
+                {
+                    "empty": "",
+                    "nested": {"empty": "", "User": "fakeuser"},
+                },
+            )
+            out_dir = temp_dir / "reduced"
+            delta_dir = temp_dir / "delta"
+
+            ok, msg, detail = self._run_process(
+                src,
+                out_dir,
+                delta_dir,
+                redact_mode="sensitive-values",
+            )
+
+            self.assertTrue(ok, msg)
+            self.assertIn("structure=identical", msg)
+            out = json.loads((out_dir / "trace_reduced.json").read_text(encoding="utf-8"))
+            self.assertEqual(out["empty"], "")
+            self.assertEqual(out["nested"]["empty"], "")
+            self.assertEqual(out["nested"]["User"], "{USERNAME}")
+
+    def test_sensitive_values_mode_with_sample_size_skips_structure_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            src = self._write_input(
+                temp_dir,
+                {
+                    "rows": [{"Company": "ZZTEST", "keep": i} for i in range(5)],
+                },
+            )
+            out_dir = temp_dir / "reduced"
+            delta_dir = temp_dir / "delta"
+
+            ok, msg, detail = trim_trace_paths.process_file(
+                src=src,
+                drop_patterns=[],
+                drop_keys=set(),
+                in_place=False,
+                out_dir=str(out_dir),
+                suffix="_reduced",
+                pretty=True,
+                dry_run=False,
+                do_prune_empty=False,
+                show_samples=0,
+                show_top_rules=0,
+                no_backup=True,
+                drop_node_name_patterns=[],
+                drop_parent_name_patterns=[],
+                strip_empty_call_context=False,
+                show_call_summary=False,
+                sequence_only=False,
+                redact_mode="sensitive-values",
+                call_context_policy="purge",
+                light_repair_json=True,
+                sample_size=2,
+                sample_include_patterns=[],
+                sample_exclude_patterns=[],
+                delta_mode="off",
+                delta_format="jsonc",
+                delta_out_dir=str(delta_dir),
+                delta_max_value_len=200,
+                delta_redact_values=True,
+            )
+
+            self.assertTrue(ok, msg)
+            self.assertIn("structure-check=skipped (sampling trims structure)", msg)
+            out = json.loads((out_dir / "trace_reduced.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(out["rows"]), 2)
+
+
+class TestModeMatrix(unittest.TestCase):
+    def test_mode_choices_and_default(self):
+        with patch("sys.argv", ["trim_trace_paths.py", "trace.json"]):
+            args = trim_trace_paths.parse_args()
+
+        self.assertEqual(args.mode, "trim")
+        self.assertEqual(
+            sorted(trim_trace_paths.MODE_MATRIX.keys()),
+            ["redact-inplace", "redact-only", "trim", "trim-context"],
+        )
+
+    def test_redact_mode_flag_removed(self):
+        with patch("sys.argv", ["trim_trace_paths.py", "trace.json", "--redact-mode", "aggressive"]):
+            with self.assertRaises(SystemExit):
+                trim_trace_paths.parse_args()
+
+    def test_redact_inplace_bundle_applies_defaults(self):
+        import argparse
+
+        args = argparse.Namespace(mode="redact-inplace", in_place=False, no_backup=False, pretty=False, out_dir="reduced")
+        args, redact_mode = trim_trace_paths.apply_mode_defaults(args)
+
+        self.assertEqual(redact_mode, "sensitive-values")
+        self.assertTrue(args.in_place)
+        self.assertTrue(args.no_backup)
+        self.assertTrue(args.pretty)
+
+    def test_redact_only_bundle_sets_out_dir(self):
+        import argparse
+
+        args = argparse.Namespace(mode="redact-only", in_place=False, no_backup=False, pretty=False, out_dir="reduced")
+        args, redact_mode = trim_trace_paths.apply_mode_defaults(args)
+
+        self.assertEqual(redact_mode, "sensitive-values")
+        self.assertEqual(args.out_dir, "redacted")
+        self.assertFalse(args.in_place)
+
+    def test_explicit_flags_win_over_mode_defaults(self):
+        import argparse
+
+        args = argparse.Namespace(
+            mode="redact-inplace",
+            in_place=False,
+            no_backup=False,
+            pretty=False,
+            out_dir="reduced",
+            _explicit_flags={"--out-dir"},
+        )
+        args, redact_mode = trim_trace_paths.apply_mode_defaults(args)
+
+        self.assertEqual(redact_mode, "sensitive-values")
+        self.assertTrue(args.in_place)
+        self.assertTrue(args.pretty)
+        self.assertEqual(args.out_dir, "reduced")
+
+    def test_trim_modes_map_to_redact_profiles(self):
+        import argparse
+
+        for mode, expected in (("trim", "aggressive"), ("trim-context", "context-only")):
+            args = argparse.Namespace(mode=mode, in_place=False, no_backup=False, pretty=False, out_dir="reduced")
+            args, redact_mode = trim_trace_paths.apply_mode_defaults(args)
+
+            self.assertEqual(redact_mode, expected)
+
+    def test_explicit_flags_tracked_by_parse_args(self):
+        with patch("sys.argv", ["trim_trace_paths.py", "trace.json", "--mode", "redact-only", "--out-dir", "custom"]):
+            args = trim_trace_paths.parse_args()
+
+        self.assertEqual(args.mode, "redact-only")
+        self.assertIn("--out-dir", args._explicit_flags)
+        self.assertNotIn("--in-place", args._explicit_flags)
+
+        args, redact_mode = trim_trace_paths.apply_mode_defaults(args)
+        self.assertEqual(redact_mode, "sensitive-values")
+        self.assertEqual(args.out_dir, "custom")
 
 
 if __name__ == "__main__":
