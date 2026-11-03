@@ -1486,6 +1486,10 @@ class KineticConfigManager(KineticCore):
                                f"(Documents/EPICOR_IDP_SIGNIN.md), then run 'auth idp-client {name}'.")
         tok = idp.login_browser(settings, client_id, port=port or idp.DEFAULT_PORT)
         meta = idp.session_meta(tok, settings, user_id, name, company_id)
+        who = meta.get("idp_username", "")
+        if not idp.identity_matches(who, user_id):
+            print(f"⚠️ Signed in to Epicor IdP as {who}, but the session is named for --user {user_id}. If that isn't "
+                  "the same person, sign out of the IdP in the browser and run idp-login again.")
         ok, reason = self._validate_bearer_access(url=cfg["url"], api_key=cfg.get("api_key", ""),
                                                   company=company_id, token=meta["AccessToken"], user_id=user_id)
         if not ok:

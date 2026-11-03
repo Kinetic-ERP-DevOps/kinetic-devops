@@ -18,6 +18,7 @@ import base64
 import contextlib
 import hashlib
 import http.server
+import json
 import os
 import secrets
 import stat
@@ -38,6 +39,7 @@ DEFAULT_PORT = 8765
 BASE_SCOPES = "openid profile offline_access"
 LOGIN_TIMEOUT_SEC = 300
 LOCK_STALE_SEC = 60
+CLOCK_SKEW_SEC = 120
 
 
 class IdPError(RuntimeError):
@@ -163,6 +165,7 @@ def login_browser(
     expected_host = f"127.0.0.1:{port}"
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(16)
+    nonce = secrets.token_urlsafe(16)
     result: Dict[str, str] = {}
     taken = threading.Lock()
 
@@ -201,7 +204,7 @@ def login_browser(
     try:
         url = settings["authorize"] + "?" + urllib.parse.urlencode({
             "client_id": client_id, "response_type": "code", "redirect_uri": redirect_uri,
-            "scope": f"{BASE_SCOPES} {settings['api_scope']}", "state": state,
+            "scope": f"{BASE_SCOPES} {settings['api_scope']}", "state": state, "nonce": nonce,
             "code_challenge": challenge, "code_challenge_method": "S256"})
         print(f"Opening the browser for Epicor sign-in (waiting up to {timeout // 60} min)...", flush=True)
         if not open_url(url):
@@ -220,9 +223,68 @@ def login_browser(
         raise IdPError(f"The sign-in response came from another issuer ({result['iss']}); refusing (RFC 9207).")
     if "error" in result:
         raise IdPError(f"IdP refused the sign-in: {result['error']} {result.get('error_description', '')}".strip())
-    return _token_request(settings["token"], {
+    tok = _token_request(settings["token"], {
         "grant_type": "authorization_code", "code": result.get("code", ""), "redirect_uri": redirect_uri,
         "client_id": client_id, "code_verifier": verifier})
+    claims = check_id_token(tok, settings["issuer"], client_id, nonce)
+    tok["idp_identity"] = {"sub": str(claims.get("sub") or ""), "username": identity_name(claims)}
+    return tok
+
+
+def _jwt_claims(token: str) -> Dict:
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (IndexError, ValueError) as exc:
+        raise IdPError("The IdP's ID token is not a readable JWT; refusing the sign-in.") from exc
+    if not isinstance(claims, dict):
+        raise IdPError("The IdP's ID token has no claims object; refusing the sign-in.")
+    return claims
+
+
+def check_id_token(tok: Dict, issuer: str, client_id: str, nonce: str, now: Optional[float] = None) -> Dict:
+    """Check the ID token from the code exchange (OIDC Core 3.1.3.7); return its claims.
+
+    iss is the discovery issuer, aud holds this client (with several audiences, azp must be this client), exp is in
+    the future (CLOCK_SKEW_SEC allowed) and nonce is this sign-in's. No signature check: the token came straight from
+    the token endpoint over https with certificate checks, which 3.1.3.7 (6) accepts instead.
+    """
+    raw = tok.get("id_token")
+    if not raw:
+        raise IdPError("The IdP returned no ID token for an OpenID sign-in; refusing the sign-in.")
+    claims = _jwt_claims(str(raw))
+    now = time.time() if now is None else now
+    if not isinstance(claims.get("iss"), str) or not _same_url(claims["iss"], issuer):
+        raise IdPError(f"The ID token was issued by {claims.get('iss')!r}, not {issuer}; refusing the sign-in.")
+    aud = claims.get("aud")
+    audiences = [aud] if isinstance(aud, str) else [a for a in aud if isinstance(a, str)] if isinstance(aud, list) else []
+    if client_id not in audiences:
+        raise IdPError("The ID token is not for this client (aud); refusing the sign-in.")
+    if (len(audiences) > 1 or "azp" in claims) and claims.get("azp") != client_id:
+        raise IdPError("The ID token was issued to another party (azp); refusing the sign-in.")
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp + CLOCK_SKEW_SEC < now:
+        raise IdPError("The ID token has expired (exp); check this computer's clock, then sign in again.")
+    if not secrets.compare_digest(str(claims.get("nonce") or "").encode(), nonce.encode()):
+        raise IdPError("The ID token doesn't belong to this sign-in (nonce); refusing the sign-in.")
+    return claims
+
+
+def identity_name(claims: Dict) -> str:
+    """The sign-in name a person recognises, from the usual OIDC / Azure AD claims."""
+    for key in ("preferred_username", "email", "upn", "unique_name", "name"):
+        if isinstance(claims.get(key), str) and claims[key].strip():
+            return claims[key].strip()
+    return ""
+
+
+def identity_matches(identity: str, user_id: str) -> bool:
+    """Does the IdP sign-in name look like the Epicor user ID naming the session (e.g. jdoe vs jdoe@corp.example)?"""
+    who, user = identity.strip().lower(), user_id.strip().lower()
+    if not who or not user:
+        return True   # nothing to compare: no warning
+    local = who.split("@", 1)[0].rsplit("\\", 1)[-1]
+    return user == local or user in who or local in user
 
 
 def refresh(token_endpoint: str, client_id: str, refresh_token: str) -> Dict:
@@ -258,6 +320,11 @@ def session_meta(tok: Dict, settings: Dict[str, str], user_id: str, nickname: st
     }
     if company:
         meta["current_company"] = company
+    identity = tok.get("idp_identity") or {}
+    if identity.get("sub"):
+        meta["idp_subject"] = identity["sub"]
+    if identity.get("username"):
+        meta["idp_username"] = identity["username"]
     return meta
 
 

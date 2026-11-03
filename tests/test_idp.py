@@ -1,6 +1,8 @@
 """Tests for kinetic_devops.idp (Epicor IdP sign-in) and its use in auth. No network: requests is mocked."""
 
+import base64
 import hashlib
+import json
 import os
 import socket
 import stat
@@ -36,6 +38,17 @@ def _resp(json_body, status=200, url="https://example.invalid/", history=()):
     r.url = url
     r.history = list(history)
     return r
+
+
+def _id_token(**claims):
+    """An unsigned JWT with these claims (signatures aren't checked: the token comes from the token endpoint)."""
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+    return f"{enc({'alg': 'RS256'})}.{enc(claims)}.sig"
+
+
+def _claims(nonce, **over):
+    return {"iss": SETTINGS["issuer"], "aud": "cid", "exp": time.time() + 300, "nonce": nonce, "sub": "s-1",
+            "preferred_username": "alice@corp.example", **over}
 
 
 def _free_port():
@@ -141,7 +154,7 @@ def _get(url, headers=None):
 
 
 class TestLoginBrowser(unittest.TestCase):
-    def _run(self, reply, timeout=10):
+    def _run(self, reply, timeout=10, claims=None):
         """reply(params) -> list of (query dict, extra headers) the 'browser' sends to the loopback redirect, in order."""
         port = _free_port()
         self.statuses = []
@@ -158,7 +171,9 @@ class TestLoginBrowser(unittest.TestCase):
             return True
 
         req = MagicMock()
-        req.post.return_value = _resp({"access_token": "AT", "refresh_token": "RT", "expires_in": 3600})
+        req.post.side_effect = lambda *a, **k: _resp({
+            "access_token": "AT", "refresh_token": "RT", "expires_in": 3600,
+            "id_token": _id_token(**(claims(self.seen["nonce"]) if claims else _claims(self.seen["nonce"])))})
         with patch.object(idp, "requests", req):
             tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=timeout, open_url=browser)
         return tok, req, port
@@ -216,6 +231,75 @@ class TestLoginBrowser(unittest.TestCase):
         with self.assertRaises(idp.IdPError) as ctx:
             self._run(lambda p: [({"error": "access_denied", "state": p["state"]}, {})])
         self.assertIn("access_denied", str(ctx.exception))
+
+    def test_nonce_is_sent_and_identity_returned(self):
+        tok, _, _ = self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})])
+        self.assertGreaterEqual(len(self.seen["nonce"]), 16)
+        self.assertEqual(tok["idp_identity"], {"sub": "s-1", "username": "alice@corp.example"})
+
+    def test_id_token_for_another_sign_in_is_refused(self):
+        with self.assertRaises(idp.IdPError) as ctx:
+            self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})], claims=lambda n: _claims("other-nonce"))
+        self.assertIn("nonce", str(ctx.exception))
+
+
+class TestIdToken(unittest.TestCase):
+    """check_id_token: OIDC Core 3.1.3.7 claim checks on the ID token from the code exchange."""
+
+    def check(self, **over):
+        return idp.check_id_token({"id_token": _id_token(**{**_claims("N"), **over})}, SETTINGS["issuer"], "cid", "N")
+
+    def refused(self, word, **over):
+        with self.assertRaises(idp.IdPError) as ctx:
+            self.check(**over)
+        self.assertIn(word, str(ctx.exception))
+
+    def test_valid_token_returns_claims(self):
+        self.assertEqual(self.check()["sub"], "s-1")
+
+    def test_missing_id_token_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            idp.check_id_token({"access_token": "AT"}, SETTINGS["issuer"], "cid", "N")
+
+    def test_unreadable_id_token_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            idp.check_id_token({"id_token": "not-a-jwt"}, SETTINGS["issuer"], "cid", "N")
+
+    def test_other_issuer_is_refused(self):
+        self.refused("issued by", iss="https://evil.example/tid/42")
+
+    def test_other_audience_is_refused(self):
+        self.refused("aud", aud="someone-else")
+
+    def test_several_audiences_need_azp(self):
+        self.refused("azp", aud=["cid", "api"])
+        self.assertEqual(self.check(aud=["cid", "api"], azp="cid")["sub"], "s-1")
+
+    def test_azp_for_another_party_is_refused(self):
+        self.refused("azp", azp="someone-else")
+
+    def test_expired_token_is_refused(self):
+        self.refused("expired", exp=time.time() - 3600)
+
+    def test_small_clock_skew_is_allowed(self):
+        self.assertTrue(self.check(exp=time.time() - 30))
+
+    def test_wrong_nonce_is_refused(self):
+        self.refused("nonce", nonce="other")
+
+    def test_identity_name_and_match(self):
+        self.assertEqual(idp.identity_name({"email": "jdoe@corp.example", "name": "J Doe"}), "jdoe@corp.example")
+        self.assertTrue(idp.identity_matches("JDoe@corp.example", "jdoe"))
+        self.assertTrue(idp.identity_matches("CORP\\jdoe", "jdoe"))
+        self.assertFalse(idp.identity_matches("bsmith@corp.example", "jdoe"))
+        self.assertTrue(idp.identity_matches("", "jdoe"))   # nothing to compare: no warning
+
+    def test_session_meta_stores_the_identity_not_the_id_token(self):
+        meta = idp.session_meta({"access_token": "AT", "id_token": "x.y.z",
+                                 "idp_identity": {"sub": "s-1", "username": "alice@corp.example"}},
+                                SETTINGS, "Alice", "pilot", "ACME")
+        self.assertEqual((meta["idp_subject"], meta["idp_username"], meta["user_id"]), ("s-1", "alice@corp.example", "alice"))
+        self.assertNotIn("id_token", meta)
 
 
 class TestRefreshSession(unittest.TestCase):
@@ -380,6 +464,38 @@ class TestAuthUsesIdpRefresh(unittest.TestCase):
             token = mgr._renew_idp_or_raise("slot", {}, "pilot", "alice", "ACME")
         self.assertEqual(token, "BROWSER")
         login.assert_called_once_with("pilot", "alice", "ACME")
+
+
+class TestIdpLoginIdentity(unittest.TestCase):
+    """idp_login stores the IdP identity and warns (doesn't refuse) when it doesn't look like --user."""
+
+    def _login(self, username):
+        mgr = KineticConfigManager.__new__(KineticConfigManager)
+        cfg = {"url": "https://pilot.example", "api_key": "key", "companies": "ACME", "sessions": []}
+        tok = {"access_token": "AT", "refresh_token": "RT", "idp_identity": {"sub": "s-1", "username": username}}
+        stored = {}
+        with patch.object(mgr, "_get_server_dict", return_value={"pilot": cfg}), \
+             patch.object(mgr, "_find_env", return_value=("pilot", cfg)), \
+             patch.object(idp, "discover", return_value=SETTINGS), \
+             patch.object(idp, "get_client_id", return_value="cid"), \
+             patch.object(idp, "login_browser", return_value=tok), \
+             patch.object(mgr, "_validate_bearer_access", return_value=(True, "ok")), \
+             patch.object(mgr, "_get_token_key", return_value="slot"), \
+             patch.object(mgr, "touch_session", side_effect=lambda slot, meta, name: stored.update(meta)), \
+             patch("builtins.print") as out:
+            token = mgr.idp_login("pilot", "jdoe", "ACME")
+        return token, stored, " ".join(str(c.args[0]) for c in out.call_args_list)
+
+    def test_matching_identity_no_warning(self):
+        token, stored, printed = self._login("jdoe@corp.example")
+        self.assertEqual((token, stored["idp_username"]), ("AT", "jdoe@corp.example"))
+        self.assertNotIn("⚠️", printed)
+
+    def test_other_identity_warns_but_signs_in(self):
+        token, stored, printed = self._login("bsmith@corp.example")
+        self.assertEqual(token, "AT")
+        self.assertIn("bsmith@corp.example", printed)
+        self.assertIn("--user jdoe", printed)
 
 
 class FakeKeyring:
