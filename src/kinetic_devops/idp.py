@@ -152,24 +152,43 @@ def login_browser(
     timeout: int = LOGIN_TIMEOUT_SEC,
     open_url: Callable[[str], bool] = webbrowser.open,
 ) -> Dict:
-    """Authorization code + PKCE with a loopback redirect. Returns the token response (not stored here)."""
+    """Authorization code + PKCE with a loopback redirect. Returns the token response (not stored here).
+
+    The listener takes exactly one callback: the first with this request's state (constant-time compare). Anything
+    else gets 400 and is ignored, so another local program or a web page can't end or hijack the sign-in: a wrong or
+    missing state, a second callback, or a Host header other than 127.0.0.1:<port> (DNS rebinding: a page on another
+    name that resolves to 127.0.0.1). An iss parameter (RFC 9207), if the IdP sends one, must be the issuer.
+    """
     redirect_uri = f"http://127.0.0.1:{port}/callback"
+    expected_host = f"127.0.0.1:{port}"
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(16)
     result: Dict[str, str] = {}
+    taken = threading.Lock()
 
     class Callback(http.server.BaseHTTPRequestHandler):
+        def _reply(self, status: int, text: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")      # the URL carried the code: keep it out of caches
+            self.send_header("Referrer-Policy", "no-referrer")  # and out of Referer headers
+            self.end_headers()
+            self.wfile.write(text.encode())
+
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path != "/callback":
-                self.send_response(404)
-                self.end_headers()
-                return
-            result.update({k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()})
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"Sign-in received. You can close this tab.")
+                return self._reply(404, "Not found.")
+            if self.headers.get("Host", "") != expected_host:
+                return self._reply(400, "Wrong host for this sign-in.")
+            query = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            with taken:
+                if result:
+                    return self._reply(400, "This sign-in was already received.")
+                if not secrets.compare_digest(query.get("state", "").encode(), state.encode()):
+                    return self._reply(400, "This response doesn't belong to the sign-in in progress.")
+                result.update(query)
+            self._reply(200, "Sign-in received. You can close this tab.")
 
         def log_message(self, *args):
             pass
@@ -197,10 +216,10 @@ def login_browser(
     if not result:
         raise IdPError("No sign-in came back in time. If the IdP showed an error page, check the client's "
                        f"redirect URIs include {redirect_uri}.")
+    if "iss" in result and not _same_url(result["iss"], settings["issuer"]):
+        raise IdPError(f"The sign-in response came from another issuer ({result['iss']}); refusing (RFC 9207).")
     if "error" in result:
         raise IdPError(f"IdP refused the sign-in: {result['error']} {result.get('error_description', '')}".strip())
-    if result.get("state") != state:
-        raise IdPError("Sign-in response didn't match this request (state mismatch); try again.")
     return _token_request(settings["token"], {
         "grant_type": "authorization_code", "code": result.get("code", ""), "redirect_uri": redirect_uri,
         "client_id": client_id, "code_verifier": verifier})

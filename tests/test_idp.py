@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from unittest.mock import MagicMock, patch
@@ -128,10 +129,22 @@ class TestDiscover(unittest.TestCase):
             idp.discover("https://kinetic.example/Env")
 
 
+def _get(url, headers=None):
+    """GET from the test 'browser': (status, headers); 0 if the listener is already gone."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=5) as r:
+            return r.status, dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers)
+    except OSError:
+        return 0, {}
+
+
 class TestLoginBrowser(unittest.TestCase):
-    def _run(self, reply):
-        """reply(params) -> query dict the 'browser' sends back to the loopback redirect."""
+    def _run(self, reply, timeout=10):
+        """reply(params) -> list of (query dict, extra headers) the 'browser' sends to the loopback redirect, in order."""
         port = _free_port()
+        self.statuses = []
 
         def browser(url):
             params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
@@ -139,19 +152,19 @@ class TestLoginBrowser(unittest.TestCase):
 
             def go():
                 time.sleep(0.2)
-                q = urllib.parse.urlencode(reply(params))
-                urllib.request.urlopen(f"{params['redirect_uri']}?{q}", timeout=5).read()
+                for query, headers in reply(params):
+                    self.statuses.append(_get(f"{params['redirect_uri']}?{urllib.parse.urlencode(query)}", headers))
             threading.Thread(target=go, daemon=True).start()
             return True
 
         req = MagicMock()
         req.post.return_value = _resp({"access_token": "AT", "refresh_token": "RT", "expires_in": 3600})
         with patch.object(idp, "requests", req):
-            tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=10, open_url=browser)
+            tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=timeout, open_url=browser)
         return tok, req, port
 
     def test_pkce_code_exchange(self):
-        tok, req, port = self._run(lambda p: {"code": "C1", "state": p["state"]})
+        tok, req, port = self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})])
         self.assertEqual(tok["access_token"], "AT")
         self.assertEqual(self.seen["code_challenge_method"], "S256")
         self.assertEqual(self.seen["redirect_uri"], f"http://127.0.0.1:{port}/callback")
@@ -160,14 +173,48 @@ class TestLoginBrowser(unittest.TestCase):
         data = req.post.call_args.kwargs["data"]
         self.assertEqual((data["grant_type"], data["code"], data["client_id"]), ("authorization_code", "C1", "cid"))
         self.assertTrue(data["code_verifier"])
+        status, headers = self.statuses[0]
+        self.assertEqual(status, 200)
+        self.assertEqual((headers.get("Cache-Control"), headers.get("Referrer-Policy")), ("no-store", "no-referrer"))
 
-    def test_state_mismatch_is_refused(self):
-        with self.assertRaises(idp.IdPError):
-            self._run(lambda p: {"code": "C1", "state": "forged"})
+    def test_wrong_state_is_ignored_and_the_real_callback_still_wins(self):
+        tok, req, _ = self._run(lambda p: [({"code": "EVIL", "state": "forged"}, {}),
+                                           ({"error": "access_denied"}, {}),   # no state at all
+                                           ({"code": "C1", "state": p["state"]}, {})])
+        self.assertEqual([s for s, _ in self.statuses[:2]], [400, 400])
+        self.assertEqual(req.post.call_args.kwargs["data"]["code"], "C1")
+
+    def test_only_wrong_state_callbacks_time_out(self):
+        with self.assertRaises(idp.IdPError) as ctx:
+            self._run(lambda p: [({"code": "C1", "state": "forged"}, {})], timeout=2)
+        self.assertIn("No sign-in came back", str(ctx.exception))
+        self.assertEqual(self.statuses[0][0], 400)
+
+    def test_second_callback_is_refused(self):
+        tok, req, _ = self._run(lambda p: [({"code": "C1", "state": p["state"]}, {}),
+                                           ({"code": "C2", "state": p["state"]}, {})])
+        self.assertEqual(self.statuses[0][0], 200)
+        self.assertNotEqual(self.statuses[1][0], 200)   # 400, or 0 if the listener has already closed
+        self.assertEqual(req.post.call_args.kwargs["data"]["code"], "C1")
+
+    def test_other_host_header_is_refused(self):
+        tok, req, port = self._run(lambda p: [({"code": "EVIL", "state": p["state"]}, {"Host": "attacker.example"}),
+                                              ({"code": "C1", "state": p["state"]}, {})])
+        self.assertEqual(self.statuses[0][0], 400)
+        self.assertEqual(req.post.call_args.kwargs["data"]["code"], "C1")
+
+    def test_iss_from_another_issuer_is_refused(self):
+        with self.assertRaises(idp.IdPError) as ctx:
+            self._run(lambda p: [({"code": "C1", "state": p["state"], "iss": "https://evil.example"}, {})])
+        self.assertIn("RFC 9207", str(ctx.exception))
+
+    def test_matching_iss_is_accepted(self):
+        tok, _, _ = self._run(lambda p: [({"code": "C1", "state": p["state"], "iss": SETTINGS["issuer"]}, {})])
+        self.assertEqual(tok["access_token"], "AT")
 
     def test_idp_error_is_reported(self):
         with self.assertRaises(idp.IdPError) as ctx:
-            self._run(lambda p: {"error": "access_denied", "state": p["state"]})
+            self._run(lambda p: [({"error": "access_denied", "state": p["state"]}, {})])
         self.assertIn("access_denied", str(ctx.exception))
 
 
