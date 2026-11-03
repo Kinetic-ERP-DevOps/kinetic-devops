@@ -20,6 +20,7 @@ import hashlib
 import http.server
 import os
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -40,7 +41,11 @@ LOCK_STALE_SEC = 60
 
 
 class IdPError(RuntimeError):
-    """Sign-in or refresh through Epicor IdP failed (message says what to do)."""
+    """Sign-in or refresh through Epicor IdP failed (message says what to do). error: the OAuth error code, if any."""
+
+    def __init__(self, message: str, error: str = ""):
+        super().__init__(message)
+        self.error = error
 
 
 def discover(server_url: str, timeout: int = 30) -> Dict[str, str]:
@@ -152,7 +157,7 @@ def _token_request(token_endpoint: str, data: Dict[str, str]) -> Dict:
     body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     if not resp.ok or "access_token" not in body:
         raise IdPError(f"IdP token request failed: {resp.status_code} {body.get('error', '')} "
-                       f"{body.get('error_description', '')}".strip())
+                       f"{body.get('error_description', '')}".strip(), error=str(body.get("error") or ""))
     return body
 
 
@@ -248,26 +253,50 @@ def move_secrets(old_slot: str, new_slot: str) -> None:
             _put_chunked(new_slot, _side(field), value)
 
 
+def lock_dir() -> str:
+    """Directory for refresh locks, private to this user.
+
+    A shared temp directory would let any local user pre-create a session's lock (refreshes then time out) or remove
+    it. Windows: the per-user temp directory. POSIX: $XDG_RUNTIME_DIR/kinetic-devops, else <tmp>/kinetic-devops-<uid>,
+    created 0700 and refused unless it is a real directory owned by this user that nobody else can access.
+    """
+    if os.name == "nt":
+        path = os.path.join(tempfile.gettempdir(), "kinetic-devops")
+        os.makedirs(path, exist_ok=True)
+        return path
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    path = (os.path.join(runtime, "kinetic-devops") if runtime and os.path.isdir(runtime)
+            else os.path.join(tempfile.gettempdir(), f"kinetic-devops-{uid}"))
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(path, 0o700)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o077:
+        raise IdPError(f"Refusing the lock directory {path}: it must be a directory you own with mode 0700. "
+                       "Remove it and retry.")
+    return path
+
+
 @contextlib.contextmanager
 def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
     """Cross-process lock around a refresh, so a rotated refresh token is used exactly once."""
     name = "kinetic-idp-" + hashlib.sha256(slot.encode()).hexdigest()[:16] + ".lock"
-    path = os.path.join(tempfile.gettempdir(), name)
+    path = os.path.join(lock_dir(), name)
     deadline = time.time() + wait
     while True:
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             break
         except FileExistsError:
-            try:
+            # A lock older than LOCK_STALE_SEC is left over from a crashed process: take it over. If it can't be
+            # checked or removed (just released, or not ours), wait like for any held lock; never retry at once.
+            with contextlib.suppress(OSError):
                 if time.time() - os.path.getmtime(path) > LOCK_STALE_SEC:
                     os.remove(path)
                     continue
-            except OSError:
-                continue
-            if time.time() > deadline:
-                raise IdPError("Timed out waiting for another process to finish refreshing the IdP session.")
-            time.sleep(0.2)
+        if time.time() > deadline:
+            raise IdPError("Timed out waiting for another process to finish refreshing the IdP session.")
+        time.sleep(0.2)
     try:
         os.close(fd)
         yield
@@ -295,7 +324,13 @@ def refresh_session(meta: Dict, reread: Callable[[], Optional[Dict]], store: Cal
             return None
         try:
             tok = refresh(current["idp_token_endpoint"], client_id, rt)
-        except IdPError:
+        except IdPError as exc:
+            if exc.error == "invalid_grant":
+                # The IdP rejected this refresh token for good (expired, revoked or already used): drop it, so later
+                # runs go straight to "sign in again" instead of sending a dead token every time.
+                dropped = {k: v for k, v in current.items() if k not in ("_is_valid", "_remaining")}
+                dropped["refresh_token"] = ""
+                store(dropped)
             return None
         updated = dict(current)
         for k in ("_is_valid", "_remaining"):

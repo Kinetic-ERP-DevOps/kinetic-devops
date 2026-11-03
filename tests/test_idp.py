@@ -1,7 +1,11 @@
 """Tests for kinetic_devops.idp (Epicor IdP sign-in) and its use in auth. No network: requests is mocked."""
 
+import hashlib
+import os
 import socket
+import stat
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -125,10 +129,39 @@ class TestRefreshSession(unittest.TestCase):
         self.assertEqual(tok, "NEW")
         req.post.assert_called_once()
 
-    def test_failed_refresh_returns_none_and_stores_nothing(self):
+    def test_rejected_refresh_token_is_dropped(self):
         tok, _ = self._refresh(lambda: dict(self.meta), post=_resp({"error": "invalid_grant"}, 400))
         self.assertIsNone(tok)
+        self.assertEqual(self.stored[-1]["refresh_token"], "")
+        self.assertEqual(self.stored[-1]["AccessToken"], "OLD")
+        self.assertNotIn("_is_valid", self.stored[-1])
+
+    def test_temporary_refresh_failure_keeps_the_refresh_token(self):
+        tok, _ = self._refresh(lambda: dict(self.meta), post=_resp({"error": "temporarily_unavailable"}, 503))
+        self.assertIsNone(tok)
         self.assertEqual(self.stored, [])
+
+    def test_lock_waits_and_times_out_when_the_lock_cant_be_checked(self):
+        """Regression: an OSError while checking a held lock used to retry at once, forever (no sleep, no deadline)."""
+        path = os.path.join(idp.lock_dir(), "kinetic-idp-" + hashlib.sha256(self.slot.encode()).hexdigest()[:16] + ".lock")
+        open(path, "w").close()
+        outcome = []
+
+        def worker():
+            try:
+                with patch.object(idp.os.path, "getmtime", side_effect=OSError("gone")):
+                    with idp.slot_lock(self.slot, wait=0.5):
+                        outcome.append("locked")
+            except idp.IdPError as exc:
+                outcome.append(str(exc))
+        try:
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            t.join(5)
+            self.assertFalse(t.is_alive(), "slot_lock spun past its deadline")
+            self.assertIn("Timed out", outcome[0])
+        finally:
+            os.remove(path)
 
     def test_lock_serialises_refreshes(self):
         inside, overlap = [], []
@@ -146,6 +179,42 @@ class TestRefreshSession(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(overlap, [])
+
+
+@unittest.skipIf(os.name == "nt", "POSIX permissions; Windows uses the per-user temp directory")
+class TestLockDir(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.env = patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        os.chmod(self.tmp, 0o700)
+        for root, dirs, _ in os.walk(self.tmp, topdown=False):
+            for d in dirs:
+                os.rmdir(os.path.join(root, d))
+        os.rmdir(self.tmp)
+
+    def test_private_directory_is_created_0700(self):
+        path = idp.lock_dir()
+        self.assertEqual(path, os.path.join(self.tmp, "kinetic-devops"))
+        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o700)
+
+    def test_directory_others_can_access_is_refused(self):
+        os.mkdir(os.path.join(self.tmp, "kinetic-devops"), 0o700)
+        os.chmod(os.path.join(self.tmp, "kinetic-devops"), 0o777)
+        with self.assertRaises(idp.IdPError):
+            idp.lock_dir()
+
+    def test_symlink_is_refused(self):
+        os.mkdir(os.path.join(self.tmp, "elsewhere"), 0o700)
+        os.symlink(os.path.join(self.tmp, "elsewhere"), os.path.join(self.tmp, "kinetic-devops"))
+        try:
+            with self.assertRaises(idp.IdPError):
+                idp.lock_dir()
+        finally:
+            os.remove(os.path.join(self.tmp, "kinetic-devops"))
 
 
 class TestAuthUsesIdpRefresh(unittest.TestCase):
