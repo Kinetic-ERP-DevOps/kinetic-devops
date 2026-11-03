@@ -80,20 +80,15 @@ All test results are logged to `tests/test_results.log` for CI/CD integration.
 
 ## Pre-commit Hook
 
-To enable pre-commit testing:
+To enable pre-commit testing (Git Bash on Windows, or any POSIX shell):
 
-**Windows (PowerShell):**
-```powershell
-./scripts/install-hook.ps1
+```sh
+sh scripts/install-hook.sh
 ```
 
-**Linux/macOS:**
-```bash
-chmod +x scripts/hooks/pre-commit
-git config core.hooksPath scripts/hooks
-```
-
-The pre-commit hook will automatically run the sensitive-data gate and test suite before allowing commits.
+(`./scripts/install-hook.ps1` installs the same hooks from PowerShell.) The pre-commit hook will
+automatically run the local branch guard, the sensitive-data gate and the test suite before allowing
+commits. See [scripts/README.md](../scripts/README.md#git-hooks) for all installed hooks.
 
 ## Environment Validation
 

@@ -7,7 +7,7 @@ import sys
 import subprocess
 import zipfile
 import io
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 try:
     from .auth import KineticConfigManager
@@ -26,6 +26,14 @@ GENERIC_PATTERNS = {
     # Final reporting is filtered through heuristics to suppress identifier noise.
     "GENERIC_BASE64_32": re.compile(r'["\']([A-Za-z0-9+/_-]{24,}={0,2})["\']'),
     "PRIVATE_KEY_BLOCK": re.compile(r'PRIVATE KEY'),  # kd-sensitive-scan-ignore-line: pattern definition, not a secret
+    # Internal infrastructure: private (RFC 1918) IPv4 addresses, the tailnet's CGNAT range and IPv6 prefix, and
+    # tailnet host names. Shared code and docs should use placeholders (e.g. 192.0.2.x from RFC 5737, example.com).
+    "INTERNAL_PRIVATE_IPV4": re.compile(
+        r'\b(?:10(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}|192\.168(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2})\b'
+    ),
+    "INTERNAL_TAILNET_IPV4": re.compile(r'\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2}\b'),
+    "INTERNAL_TAILNET_IPV6": re.compile(r'(?i)\bfd7a:115c:a1e0:'),
+    "INTERNAL_TAILNET_HOST": re.compile(r'(?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net\b'),
 }
 
 CAMEL_CASE_RE = re.compile(r'^(?:[A-Z][a-z0-9]+)+(?:[A-Z][a-z0-9]+)*$|^[a-z]+(?:[A-Z][a-z0-9]+)+$')
@@ -327,11 +335,22 @@ def get_sensitive_data_from_keyring() -> Dict[str, re.Pattern]:
         print(f"Could not get sensitive data patterns from auth manager: {e}")
         return patterns
 
-def get_files_to_scan(start_path: str, use_gitignore: bool, exclude_dirs: set) -> List[str]:
-    """Generates a list of files to scan, optionally respecting .gitignore."""
+def get_files_to_scan(
+    start_path: str, use_gitignore: bool, exclude_dirs: set, tracked_exclude_dirs: Optional[set] = None
+) -> List[str]:
+    """Generates a list of files to scan.
+
+    Repo scan (git work tree, scan root "."): every tracked file (including newly staged ones) is scanned
+    unless an explicit exclude names it; untracked files are not scanned. ``tracked_exclude_dirs`` holds the
+    explicit excludes (``None``: use ``exclude_dirs``). Folder names never hide committed content.
+
+    Explicit subpaths and non-git folders are walked, trimmed by ``exclude_dirs`` (built-in name list plus
+    explicit excludes): that is how files outside the tracked tree get scanned before they are read.
+    """
     file_list = []
-    
+
     exclude_tokens = _normalize_exclude_tokens(exclude_dirs)
+    tracked_tokens = exclude_tokens if tracked_exclude_dirs is None else _normalize_exclude_tokens(tracked_exclude_dirs)
 
     normalized_start = _normalize_path_for_match(start_path)
     explicit_subpath = normalized_start not in {"", "."}
@@ -343,14 +362,11 @@ def get_files_to_scan(start_path: str, use_gitignore: bool, exclude_dirs: set) -
             # Check if git is installed and this is a repo
             subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], cwd=start_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             
-            # List tracked and untracked files, respecting .gitignore
-            cmd = ['git', 'ls-files', '-c', '-o', '--exclude-standard']
-            result = subprocess.run(cmd, cwd=start_path, capture_output=True, text=True, check=True)
-            
+            # Tracked files only (index, so newly staged files count): untracked files are the exclusion.
+            result = subprocess.run(['git', 'ls-files', '-c'], cwd=start_path, capture_output=True, text=True, check=True)
             for line in result.stdout.splitlines():
-                if _path_is_excluded(line, exclude_tokens):
+                if _path_is_excluded(line, tracked_tokens):
                     continue
-
                 full_path = os.path.join(start_path, line)
                 if os.path.isfile(full_path):
                     file_list.append(full_path)
@@ -591,26 +607,29 @@ def find_sensitive_data(
     return findings
 
 
-def _resolve_scan_files(scan_path: str, explicit_file: str, use_gitignore: bool, exclude_dirs: set) -> List[str]:
+def _resolve_scan_files(
+    scan_path: str, explicit_file: str, use_gitignore: bool, exclude_dirs: set,
+    tracked_exclude_dirs: Optional[set] = None,
+) -> List[str]:
+    # A file named on the command line is always scanned unless an explicit --exclude names it:
+    # the built-in name list is for trimming directory walks, not for overriding a direct request.
+    named_excludes = exclude_dirs if tracked_exclude_dirs is None else tracked_exclude_dirs
     target_file = str(explicit_file or "").strip()
     if target_file:
         if not os.path.isfile(target_file):
             return []
-        exclude_tokens = _normalize_exclude_tokens(exclude_dirs)
-        rel_path = os.path.basename(target_file)
-        if _path_is_excluded(rel_path, exclude_tokens):
+        if _path_is_excluded(os.path.basename(target_file), _normalize_exclude_tokens(named_excludes)):
             return []
         return [target_file]
 
     if os.path.isfile(scan_path):
-        exclude_tokens = _normalize_exclude_tokens(exclude_dirs)
-        rel_path = os.path.basename(scan_path)
-        if _path_is_excluded(rel_path, exclude_tokens):
+        if _path_is_excluded(os.path.basename(scan_path), _normalize_exclude_tokens(named_excludes)):
             return []
         return [scan_path]
 
-    return get_files_to_scan(scan_path, use_gitignore=use_gitignore, exclude_dirs=exclude_dirs)
-
+    return get_files_to_scan(
+        scan_path, use_gitignore=use_gitignore, exclude_dirs=exclude_dirs, tracked_exclude_dirs=tracked_exclude_dirs
+    )
 
 def main():
     parser = argparse.ArgumentParser(
@@ -686,10 +705,15 @@ def main():
         print("ℹ️  Generic Base64 pattern scanning is disabled.")
 
     # --- Configure Exclusions ---
+    # In the repo, a file is scanned unless it is untracked or explicitly excluded (--exclude): tracked files and
+    # every git scan (staged, diff, commit, history, stash) are what commits and pushes carry, so a folder that
+    # happens to be called e.g. "reports" or "temp" never hides them. The built-in name list only trims walks of
+    # explicit subpaths and non-git folders.
+    explicit_excludes = set(args.exclude)
     if args.ignore_defaults:
-        exclude_dirs = set(args.exclude)
+        exclude_dirs = set(explicit_excludes)
     else:
-        exclude_dirs = DEFAULT_EXCLUDE_DIRS.union(set(args.exclude))
+        exclude_dirs = DEFAULT_EXCLUDE_DIRS.union(explicit_excludes)
 
     # --- Transparency Log ---
     print("\n--- Scan Configuration ---")
@@ -702,7 +726,8 @@ def main():
         print("Default Exclusions: IGNORED.")
     
     if exclude_dirs:
-        print(f"Manual Exclusions: {sorted(list(exclude_dirs))}")
+        print(f"Exclusions when walking a folder (non-git or explicit subpath): {sorted(list(exclude_dirs))}")
+    print(f"Repo scan: tracked files only; explicit exclusions: {sorted(explicit_excludes) or 'none'}")
     print("--------------------------\n")
     
     # --- Run Scans ---
@@ -714,7 +739,10 @@ def main():
     else:
         print(f"Gathering files in {args.path}...")
 
-    files = _resolve_scan_files(args.path, args.file, use_gitignore=not args.no_gitignore, exclude_dirs=exclude_dirs)
+    files = _resolve_scan_files(
+        args.path, args.file, use_gitignore=not args.no_gitignore, exclude_dirs=exclude_dirs,
+        tracked_exclude_dirs=explicit_excludes,
+    )
     print(f"Scanning {len(files)} files...")
     findings.extend(find_sensitive_data(files, all_patterns, generic_base64_options=generic_base64_options))
 
@@ -732,7 +760,7 @@ def main():
             scan_git_history,
             args.path,
             all_patterns,
-            exclude_dirs=exclude_dirs,
+            exclude_dirs=explicit_excludes,
             include_path=args.path,
             generic_base64_options=generic_base64_options,
         )
@@ -742,7 +770,7 @@ def main():
             scan_git_diff,
             args.path,
             all_patterns,
-            exclude_dirs=exclude_dirs,
+            exclude_dirs=explicit_excludes,
             staged=False,
             include_path=args.path,
             generic_base64_options=generic_base64_options,
@@ -753,7 +781,7 @@ def main():
             scan_git_diff,
             args.path,
             all_patterns,
-            exclude_dirs=exclude_dirs,
+            exclude_dirs=explicit_excludes,
             staged=True,
             include_path=args.path,
             generic_base64_options=generic_base64_options,
@@ -765,7 +793,7 @@ def main():
             args.path,
             args.commit,
             all_patterns,
-            exclude_dirs=exclude_dirs,
+            exclude_dirs=explicit_excludes,
             include_path=args.path,
             generic_base64_options=generic_base64_options,
         )
@@ -775,7 +803,7 @@ def main():
             scan_git_stashes,
             args.path,
             all_patterns,
-            exclude_dirs=exclude_dirs,
+            exclude_dirs=explicit_excludes,
             include_path=args.path,
             generic_base64_options=generic_base64_options,
         )
