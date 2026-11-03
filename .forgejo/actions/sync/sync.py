@@ -3,6 +3,7 @@
 Triggered by pushing a tag sync/<name> (only allowed users can; protect sync/* in Forgejo).
 sync/dry-run/<name> runs every step except the push and the PR. The same runs from the Actions tab
 (Run workflow on the branch to promote; inputs: name, dry run). Steps:
+  0. stop if the commit under test isn't the branch's head now (a re-run of an old run, a tag left behind)
   1. fetch GitHub main; rebase the tagged commits onto it (conflict -> stop, list files)
   2. guards: .github/workflows changes (push those from a workstation); "Closes/Fixes #N" must be open
      GitHub issues; mentions of a *draft* security advisory (undisclosed fix -> use its private fork);
@@ -119,6 +120,26 @@ if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or name in ("main", "master") or 
 branch = f"sync/{name}"
 print(f"sync: {TAG} -> GitHub {REPO} branch {branch}{' (dry run)' if dry else ''}")
 
+# 0. Test what the branch holds now. A re-run replays its original commit, and a tag stays where it was put, so
+# both can test code the branch has since replaced (2026-11-02: two re-runs refused a fix the branch already had).
+tested = sh("git", "rev-parse", "HEAD").strip()
+heads = {ref[len("refs/heads/"):]: sha for sha, ref in
+         (l.split("\t") for l in sh("git", "ls-remote", "--heads", "origin").splitlines() if "\t" in l)}
+src_branch = src if E.get("SYNC_EVENT") == "workflow_dispatch" else \
+    next((b for b in heads if b.replace("/", "-") == name or b == name), None)
+if src_branch is None:
+    print(f"sync: no branch in this repo matches {name!r}; testing {TAG} at {tested[:7]} as tagged")
+elif heads.get(src_branch) != tested:
+    sys.exit(f"sync: stale run: this tests {tested[:7]}, but branch {src_branch} is at "
+             f"{(heads.get(src_branch) or 'nothing (deleted)')[:7]}. "
+             + ("Start a new run (Run workflow) instead of re-running an old one."
+                if E.get("SYNC_EVENT") == "workflow_dispatch" else
+                f"Move the tag to the branch head (git fetch origin && git tag -f {TAG} origin/{src_branch} && "
+                f"git push -f origin {TAG}), "
+                "or use the Run workflow button."))
+else:
+    print(f"sync: {src_branch} is at {tested[:7]}, the commit under test")
+
 # 1. GitHub main, rebase
 sh("git", *git_auth(), "fetch", "--no-tags", "-q", f"https://github.com/{REPO}.git", "main:refs/remotes/github/main")
 base = sh("git", "merge-base", "HEAD", "github/main").strip()
@@ -141,9 +162,15 @@ print(f"{len(commits)} commit(s), {len(changed)} file(s) changed after rebase")
 # e-mail upstream. Checked on everything that leaves: commit identities, messages, the diff's added lines,
 # and (below) the PR title/body. Added after a PR body linked the Forgejo run and commits carried a personal
 # address (2026-10-31).
+# IPv4: every part must be 0-255 and the address can't sit inside a longer dotted number, so version strings
+# (a Windows build, a four-part package version) aren't taken for private addresses (2026-11-02: a test file's
+# "not an address" cases were refused).
+OCT = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+def ipv4(head, parts):  # head: the fixed leading part(s); parts: how many free octets follow
+    return rf"(?<![\d.]){head}" + rf"\.{OCT}" * parts + r"(?!\.?\d)"
 private = [re.escape(urllib.parse.urlparse(E.get("FORGEJO_URL", "")).hostname or "") or None,
-           r"[a-z0-9-]+\.ts\.net\b", r"\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d+\.\d+\b",
-           r"\b192\.168\.\d+\.\d+\b", r"\b10\.\d+\.\d+\.\d+\b", r"\bfd7a:115c:" r"a1e0:"]   # split so this source line doesn't match itself
+           r"[a-z0-9-]+\.ts\.net\b", ipv4(r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])", 2),
+           ipv4(r"192\.168", 2), ipv4(r"10", 3), r"\bfd7a:115c:" r"a1e0:"]   # split so this source line doesn't match itself
 private += [p for p in (E.get("SYNC_PRIVATE_PATTERNS") or "").split(",") if p.strip()]
 private = [re.compile(p, re.I) for p in private if p]
 def leaks(text):
