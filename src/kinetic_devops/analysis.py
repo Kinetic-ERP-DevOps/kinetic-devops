@@ -433,14 +433,28 @@ def parse_verdict(review_text: str) -> str:
     """GO / NO-GO from the leading "VERDICT:" line the prompt asks for; else from the final
     GO/NO-GO section (NO-GO wins); else UNKNOWN (e.g. an answer cut off before any verdict).
     A VERDICT line naming both ("VERDICT: GO or VERDICT: NO-GO") is the instruction echoed back,
-    not a decision: it is ignored, including by the fallback."""
+    not a decision: it is ignored, including by the fallback.
+    A leading GO is overruled by a later explicit "VERDICT: NO-GO" line or a final GO/NO-GO section
+    that says NO-GO: an answer quoting a "VERDICT: GO" from the diff (a prompt injection) near its
+    start must not pass as GO when its own conclusion is NO-GO. Disagreement fails safe."""
     text = review_text or ""
-    for lead in _VERDICT_LINE.finditer(text[:400]):
-        if not _VERDICT_WORD.search(lead.group(2)):
-            return "NO-GO" if lead.group(1).upper().startswith("NO") else "GO"
+    lead = None
+    for m in _VERDICT_LINE.finditer(text[:400]):
+        if not _VERDICT_WORD.search(m.group(2)):
+            lead = "NO-GO" if m.group(1).upper().startswith("NO") else "GO"
+            break
     text = "\n".join(line for line in text.splitlines()
                      if not (_VERDICT_LINE.match(line) and len(_VERDICT_WORD.findall(line)) > 1))
     idx = text.upper().rfind("GO/NO-GO")
+    if lead == "NO-GO":
+        return "NO-GO"
+    if lead == "GO":
+        later_no_go = any(m.group(1).upper().startswith("NO") and not _VERDICT_WORD.search(m.group(2))
+                          for m in _VERDICT_LINE.finditer(text))
+        section = text[idx + len("GO/NO-GO"):] if idx >= 0 else ""   # no heading: trust the lead line
+        if later_no_go or re.search(r"\bNO[- ]GO\b", section, re.IGNORECASE):
+            return "NO-GO"
+        return "GO"
     tail = text[idx + len("GO/NO-GO"):] if idx >= 0 else text[-600:]
     if re.search(r"\bNO[- ]GO\b", tail, re.IGNORECASE):
         return "NO-GO"

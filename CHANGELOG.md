@@ -60,6 +60,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - Review prompts ask for a leading `VERDICT: GO|NO-GO` line, so the verdict survives an answer cut off by
   the token limit (at 360 tokens, answers often ended before the final GO/NO-GO section). A line naming
   both (`VERDICT: GO or VERDICT: NO-GO`, the instruction echoed back) is ignored.
+  A leading `VERDICT: GO` is overruled when the answer's own conclusion says NO-GO (a later
+  `VERDICT: NO-GO` line or a final GO/NO-GO section saying NO-GO), so an answer that quotes a
+  `VERDICT: GO` planted in the diff (prompt injection) near its start can't pass as GO. Without a final
+  section the leading line still stands (cut-off answers).
 - AI requests are **streamed** (`stream: true`), so a review that gives up actually stops the work: the
   server slot frees within seconds instead of running until the answer ends (llama.cpp keeps generating
   for a non-streaming request whose client disconnected). `--ai-timeout` is now a deadline for the whole
