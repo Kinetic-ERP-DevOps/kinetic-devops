@@ -106,9 +106,28 @@ if E.get("SYNC_EVENT") == "workflow_dispatch":
         sh("git", "checkout", "-q", "--detach", f"refs/remotes/origin/{src}")
         print(f"sync: checked out {src} at {sh('git', 'rev-parse', '--short', 'HEAD').strip()} (checks from {ref})")
     name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
-    # A real push needs "push" typed: a checkbox that was ticked arrived as false (2026-11-01, the dialog
-    # submitted twice), so nothing but an explicit word turns the dry run off.
-    dry = (E.get("SYNC_CONFIRM") or "").strip().lower() != "push"
+    # What the dialog sent. 2026-11-02: three runs recorded no inputs at all, so a push that was asked for ran as a
+    # dry run and reported success. `mode` has a non-empty default, so it is always sent by this workflow's dialog;
+    # without it the run can't know what was asked for and stops. A push needs mode=push AND "push" typed in
+    # confirm (a checkbox once arrived as false when ticked, 2026-11-01); any disagreement stops, nothing pushed.
+    raw = (E.get("SYNC_INPUTS") or "").strip()
+    try:
+        inputs = json.loads(raw) if raw else None
+    except ValueError:
+        inputs = None
+    if not isinstance(inputs, dict) or "mode" not in inputs:
+        sys.exit(f"sync: the Run workflow dialog sent no usable inputs (received {raw or 'nothing'!r}), so it is unknown "
+                 "whether a dry run or a push was asked for. Nothing was pushed. Run it again from Actions -> Sync to "
+                 "upstream -> Run workflow, or use a sync/dry-run/<name> or sync/<name> tag.")
+    mode = str(inputs.get("mode") or "").strip().lower()
+    confirm = (E.get("SYNC_CONFIRM") or "").strip().lower()
+    if mode not in ("dry-run", "push"):
+        sys.exit(f"sync: mode must be dry-run or push, got {mode!r}. Nothing was pushed.")
+    if (mode == "push") != (confirm == "push"):
+        sys.exit(f"sync: mode {mode!r} but confirm {confirm or 'blank'!r}: for a push choose mode push AND type push in "
+                 "confirm; for a dry run leave confirm blank. Nothing was pushed.")
+    dry = mode == "dry-run"
+    print(f"sync: dialog inputs {json.dumps(inputs, sort_keys=True)} -> {'dry run' if dry else 'push'}")
     TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
 else:
     name = TAG[len("sync/"):]

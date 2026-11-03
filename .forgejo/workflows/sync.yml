@@ -31,8 +31,13 @@ on:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
         required: false
         default: ""
+      mode:
+        description: "dry-run (check and test, push nothing) or push (promote for real; also type push below)"
+        type: choice
+        options: [dry-run, push]
+        default: dry-run
       confirm:
-        description: "Type push to promote for real; anything else (blank) is a dry run"
+        description: "With mode push: type push here as well"
         required: false
         default: ""
 
@@ -41,8 +46,9 @@ concurrency:
   group: sync-to-upstream
   cancel-in-progress: false
 
-# No `permissions:` block: Forgejo ignores it (and warns on every job); the automatic token's access is set
-# by Forgejo, and extra API access comes from secrets (or Forgejo's Authorized Integrations).
+# Least privilege for the job token (restored 2026-11-02: the claim that Forgejo ignores this block is unverified).
+permissions:
+  contents: read
 
 jobs:
   sync:
@@ -68,6 +74,7 @@ jobs:
           SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
           SYNC_CONFIRM: ${{ inputs.confirm }}
+          SYNC_INPUTS: ${{ toJSON(inputs) }}   # what the dialog actually sent: missing -> refuse (2026-11-02)
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
           FORGEJO_URL: ${{ github.server_url }}

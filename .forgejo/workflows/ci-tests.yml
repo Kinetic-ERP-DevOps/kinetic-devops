@@ -9,8 +9,9 @@ on:
       - main
       - master
 
-# No `permissions:` block: Forgejo ignores it (and warns on every job); the automatic token's access is set
-# by Forgejo, and extra API access comes from secrets (or Forgejo's Authorized Integrations).
+# Least privilege for the job token (restored 2026-11-02: the claim that Forgejo ignores this block is unverified).
+permissions:
+  contents: read
 
 env:
   # Use the interpreter from setup-python; never download another one.
