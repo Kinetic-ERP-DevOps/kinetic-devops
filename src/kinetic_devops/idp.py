@@ -48,18 +48,78 @@ class IdPError(RuntimeError):
         self.error = error
 
 
+def _https(url: str, what: str) -> urllib.parse.ParseResult:
+    """Every address outside this machine must be https (the loopback redirect is the only http one, RFC 8252)."""
+    parsed = urllib.parse.urlparse(str(url or ""))
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise IdPError(f"{what} must be an https:// address (got {url!r}); refusing to use it for sign-in.")
+    return parsed
+
+
+def _same_url(a: str, b: str) -> bool:
+    """URLs equal apart from the case of scheme and host and a trailing slash."""
+    pa, pb = urllib.parse.urlparse(a), urllib.parse.urlparse(b)
+    return ((pa.scheme.lower(), (pa.netloc or "").lower(), pa.path.rstrip("/"))
+            == (pb.scheme.lower(), (pb.netloc or "").lower(), pb.path.rstrip("/")))
+
+
+REDIRECTS = (301, 302, 303, 307, 308)
+MAX_REDIRECTS = 5
+
+
+def _get_json(url: str, what: str, timeout: int) -> Dict:
+    """GET over https with certificate checks; refuse an error status, or a redirect that leaves https.
+
+    Redirects are followed here, not by requests, so a Location that isn't https is refused before anything is sent
+    to it (requests would make the plain-http request first and only then let us look at it).
+    """
+    _https(url, what)
+    for _ in range(MAX_REDIRECTS + 1):
+        resp = requests.get(url, timeout=timeout, verify=True, allow_redirects=False)
+        location = resp.headers.get("Location") or resp.headers.get("location")
+        if resp.status_code not in REDIRECTS or not location:
+            break
+        url = urllib.parse.urljoin(url, location)
+        _https(url, f"{what} redirect target")
+    else:
+        raise IdPError(f"{what}: more than {MAX_REDIRECTS} redirects ({url}).")
+    if not resp.ok:
+        raise IdPError(f"{what} answered HTTP {resp.status_code} ({url}).")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise IdPError(f"{what} is not JSON ({url}).") from exc
+    if not isinstance(body, dict):
+        raise IdPError(f"{what} is not a JSON object ({url}).")
+    return body
+
+
 def discover(server_url: str, timeout: int = 30) -> Dict[str, str]:
-    """IdP settings for a Kinetic server: tenant, endpoints, and the scope Kinetic's API needs."""
+    """IdP settings for a Kinetic server: tenant, issuer, endpoints, and the scope Kinetic's API needs.
+
+    Checks (OIDC Discovery 1.0, 4.3): https everywhere, the discovery document's issuer is the endpoint Kinetic
+    names, and the authorize and token endpoints are on the issuer's host (a document that sends the code or the
+    refresh token anywhere else is refused).
+    """
     base = server_url.rstrip("/")
-    resp = requests.get(f"{base}/api/.configuration", timeout=timeout)
-    resp.raise_for_status()
-    idp = (resp.json() or {}).get("IdentityProvider") or {}
+    _https(base, "The Kinetic server URL")
+    idp = _get_json(f"{base}/api/.configuration", "Kinetic's /api/.configuration", timeout).get("IdentityProvider") or {}
     if not idp.get("Enabled") or not idp.get("Endpoint"):
         raise IdPError(f"Epicor IdP sign-in is not enabled on {base}; use password sign-in ('auth renew').")
-    endpoint = idp["Endpoint"].rstrip("/")
-    disc = requests.get(f"{endpoint}/.well-known/openid-configuration", timeout=timeout).json()
+    endpoint = str(idp["Endpoint"]).rstrip("/")
+    _https(endpoint, "The IdP endpoint in /api/.configuration")
+    disc = _get_json(f"{endpoint}/.well-known/openid-configuration", "The IdP discovery document", timeout)
+    issuer = str(disc.get("issuer") or "")
+    if not _same_url(issuer, endpoint):
+        raise IdPError(f"The IdP discovery document's issuer ({issuer or 'missing'}) is not the IdP endpoint Kinetic "
+                       f"names ({endpoint}); refusing to sign in.")
+    host = _https(issuer, "The IdP issuer").hostname
+    for key in ("authorization_endpoint", "token_endpoint"):
+        if _https(disc.get(key), f"The IdP's {key}").hostname != host:
+            raise IdPError(f"The IdP's {key} ({disc.get(key)}) is not on the issuer's host ({host}); refusing.")
     return {
         "endpoint": endpoint,
+        "issuer": issuer,
         "tenant": urllib.parse.urlparse(endpoint).path.rstrip("/").rsplit("/", 1)[-1],
         "authorize": disc["authorization_endpoint"],
         "token": disc["token_endpoint"],
@@ -153,7 +213,8 @@ def refresh(token_endpoint: str, client_id: str, refresh_token: str) -> Dict:
 
 
 def _token_request(token_endpoint: str, data: Dict[str, str]) -> Dict:
-    resp = requests.post(token_endpoint, data=data, timeout=30)
+    _https(token_endpoint, "The IdP token endpoint")   # also guards a stored endpoint used for refreshes
+    resp = requests.post(token_endpoint, data=data, timeout=30, verify=True, allow_redirects=False)
     body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     if not resp.ok or "access_token" not in body:
         raise IdPError(f"IdP token request failed: {resp.status_code} {body.get('error', '')} "

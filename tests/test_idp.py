@@ -18,18 +18,22 @@ from kinetic_devops.auth import KineticConfigManager
 
 CONFIG = {"IdentityProvider": {"Enabled": True, "Endpoint": "https://idp.example/tid/42/",
                                "ApiScope": "epicor_erp idp_access"}}
-DISCOVERY = {"authorization_endpoint": "https://idp.example/tid/42/connect/authorize",
+DISCOVERY = {"issuer": "https://idp.example/tid/42",
+             "authorization_endpoint": "https://idp.example/tid/42/connect/authorize",
              "token_endpoint": "https://idp.example/tid/42/connect/token"}
-SETTINGS = {"endpoint": "https://idp.example/tid/42", "tenant": "42", "authorize": DISCOVERY["authorization_endpoint"],
-            "token": DISCOVERY["token_endpoint"], "api_scope": "epicor_erp idp_access"}
+SETTINGS = {"endpoint": "https://idp.example/tid/42", "issuer": "https://idp.example/tid/42", "tenant": "42",
+            "authorize": DISCOVERY["authorization_endpoint"], "token": DISCOVERY["token_endpoint"],
+            "api_scope": "epicor_erp idp_access"}
 
 
-def _resp(json_body, status=200):
+def _resp(json_body, status=200, url="https://example.invalid/", history=()):
     r = MagicMock()
     r.ok = 200 <= status < 300
     r.status_code = status
     r.json.return_value = json_body
     r.headers = {"content-type": "application/json"}
+    r.url = url
+    r.history = list(history)
     return r
 
 
@@ -40,13 +44,82 @@ def _free_port():
 
 
 class TestDiscover(unittest.TestCase):
-    def test_reads_tenant_endpoints_and_scope(self):
+    def _discover(self, server="https://kinetic.example/Env/", config=CONFIG, discovery=DISCOVERY, **resp_kw):
         req = MagicMock()
-        req.get.side_effect = [_resp(CONFIG), _resp(DISCOVERY)]
+        req.get.side_effect = lambda url, **kw: _resp(config if url.endswith("/api/.configuration") else discovery,
+                                                      url=resp_kw.get("url", url), **{k: v for k, v in resp_kw.items() if k != "url"})
         with patch.object(idp, "requests", req):
-            s = idp.discover("https://kinetic.example/Env/")
+            return idp.discover(server), req
+
+    def test_reads_tenant_endpoints_and_scope(self):
+        s, req = self._discover()
         self.assertEqual(s, SETTINGS)
         self.assertEqual(req.get.call_args_list[0].args[0], "https://kinetic.example/Env/api/.configuration")
+        self.assertTrue(all(c.kwargs.get("verify") is True for c in req.get.call_args_list))
+
+    def test_http_server_url_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            self._discover(server="http://kinetic.example/Env")
+
+    def test_http_idp_endpoint_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            self._discover(config={"IdentityProvider": {"Enabled": True, "Endpoint": "http://idp.example/tid/42"}})
+
+    def test_redirect_to_http_is_refused_before_it_is_requested(self):
+        req = MagicMock()
+        moved = _resp({}, 302)
+        moved.headers = {"Location": "http://elsewhere.example/api/.configuration"}
+        req.get.return_value = moved
+        with patch.object(idp, "requests", req), self.assertRaises(idp.IdPError) as ctx:
+            idp.discover("https://kinetic.example/Env")
+        self.assertIn("redirect target", str(ctx.exception))
+        req.get.assert_called_once()   # the http address was never requested
+        self.assertIs(req.get.call_args.kwargs["allow_redirects"], False)
+
+    def test_https_redirect_is_followed(self):
+        moved = _resp({}, 302)
+        moved.headers = {"Location": "/Env2/api/.configuration"}
+        req = MagicMock()
+        req.get.side_effect = [moved, _resp(CONFIG), _resp(DISCOVERY)]
+        with patch.object(idp, "requests", req):
+            s = idp.discover("https://kinetic.example/Env")
+        self.assertEqual(s["issuer"], SETTINGS["issuer"])
+        self.assertEqual(req.get.call_args_list[1].args[0], "https://kinetic.example/Env2/api/.configuration")
+
+    def test_redirect_loop_is_refused(self):
+        moved = _resp({}, 302)
+        moved.headers = {"Location": "https://kinetic.example/Env/api/.configuration"}
+        req = MagicMock()
+        req.get.return_value = moved
+        with patch.object(idp, "requests", req), self.assertRaises(idp.IdPError):
+            idp.discover("https://kinetic.example/Env")
+
+    def test_error_status_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            self._discover(status=500)
+
+    def test_issuer_must_be_the_endpoint(self):
+        with self.assertRaises(idp.IdPError) as ctx:
+            self._discover(discovery={**DISCOVERY, "issuer": "https://evil.example/tid/42"})
+        self.assertIn("issuer", str(ctx.exception))
+
+    def test_issuer_trailing_slash_and_host_case_are_the_same(self):
+        s, _ = self._discover(discovery={**DISCOVERY, "issuer": "https://IDP.example/tid/42/"})
+        self.assertEqual(s["issuer"], "https://IDP.example/tid/42/")
+
+    def test_token_endpoint_on_another_host_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            self._discover(discovery={**DISCOVERY, "token_endpoint": "https://evil.example/connect/token"})
+
+    def test_http_authorize_endpoint_is_refused(self):
+        with self.assertRaises(idp.IdPError):
+            self._discover(discovery={**DISCOVERY, "authorization_endpoint": "http://idp.example/tid/42/connect/authorize"})
+
+    def test_refresh_refuses_a_stored_http_token_endpoint(self):
+        req = MagicMock()
+        with patch.object(idp, "requests", req), self.assertRaises(idp.IdPError):
+            idp.refresh("http://idp.example/tid/42/connect/token", "cid", "RT")
+        req.post.assert_not_called()
 
     def test_disabled_idp_raises(self):
         req = MagicMock()
@@ -116,6 +189,7 @@ class TestRefreshSession(unittest.TestCase):
         tok, req = self._refresh(lambda: dict(self.meta))
         self.assertEqual(tok, "NEW")
         self.assertEqual(req.post.call_args.kwargs["data"]["refresh_token"], "RT1")
+        self.assertEqual((req.post.call_args.kwargs["verify"], req.post.call_args.kwargs["allow_redirects"]), (True, False))
         self.assertEqual(self.stored[-1]["refresh_token"], "RT2")
         self.assertNotIn("_is_valid", self.stored[-1])
 
