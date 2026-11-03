@@ -327,5 +327,53 @@ class TestAccessScopeValidation(unittest.TestCase):
                 os.remove(eas_path)
 
 
+class TestJsonStructureComparison(unittest.TestCase):
+    def test_structure_skeleton_shapes(self):
+        self.assertEqual(artifact_validation.structure_skeleton(42), "<value>")
+        self.assertEqual(artifact_validation.structure_skeleton(None), "<value>")
+        self.assertEqual(
+            artifact_validation.structure_skeleton({"a": 1, "b": [1, 2]}),
+            {"a": "<value>", "b": [2, "<value>", "<value>"]},
+        )
+        self.assertEqual(
+            artifact_validation.structure_skeleton([{"x": "y"}]),
+            [1, {"x": "<value>"}],
+        )
+
+    def test_compare_identical_structure_ignores_values(self):
+        before = {"a": 1, "b": ["x", {"c": "y"}]}
+        after = {"a": 2, "b": ["z", {"c": "w"}]}
+        result = artifact_validation.compare_json_structure(before, after)
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["removed_count"], 0)
+        self.assertEqual(result["report"], "structure=identical")
+
+    def test_compare_counts_removed_keys(self):
+        # A removed key counts as one element, even if its value was a subtree.
+        result = artifact_validation.compare_json_structure({"a": 1, "b": {"c": 2}}, {"a": 1})
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["removed_count"], 1)
+        self.assertEqual(result["report"], "structure=changed: 1 element(s) removed")
+
+    def test_compare_counts_removed_list_items(self):
+        result = artifact_validation.compare_json_structure([1, 2, 3], [1, 2])
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["removed_count"], 1)
+
+    def test_compare_growth_is_not_counted(self):
+        result = artifact_validation.compare_json_structure({"a": 1}, {"a": 1, "b": 2})
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["removed_count"], 0)
+
+    def test_compare_container_becomes_scalar_counts_one(self):
+        result = artifact_validation.compare_json_structure({"a": {"b": 1}}, {"a": "x"})
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["removed_count"], 1)
+
+    def test_compare_custom_label(self):
+        result = artifact_validation.compare_json_structure({"a": 1}, {"a": 1}, label="redact-only")
+        self.assertEqual(result["report"], "redact-only=identical")
+
+
 if __name__ == "__main__":
     unittest.main()

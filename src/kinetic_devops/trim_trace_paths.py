@@ -5,7 +5,9 @@ Examples:
   python trim_trace_paths.py UseExistingSN.json --preset kinetic-heavy --in-place
   python trim_trace_paths.py "*.json" --drop "*.request.headers.Authorization" --out-dir reduced
   python trim_trace_paths.py dump.json --rules-file rules.txt --pretty
-    python trim_trace_paths.py dump.json --delta-mode summary --delta-format jsonc
+  python trim_trace_paths.py dump.json --delta-mode summary --delta-format jsonc
+  python trim_trace_paths.py dump.json --mode redact-inplace
+  python trim_trace_paths.py dump.json --mode redact-only --out-dir redacted/
 """
 
 from __future__ import annotations
@@ -24,6 +26,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    from .artifact_validation import count_removed_structure, structure_skeleton
+except ImportError:  # pragma: no cover - direct script execution
+    from artifact_validation import count_removed_structure, structure_skeleton
 
 INDEX_RE = re.compile(r"\[\d+\]")
 PLACEHOLDER_REPEAT_RE = re.compile(r"(\{[A-Za-z0-9_]+\})(?:\1)+")
@@ -114,6 +121,14 @@ DEFAULT_DROP_PARENT_NAME_PATTERNS = [
     "*/Ice.BO.FeatureUserSettingSvc",
 ]
 
+# Calls kept even under a dropped parent (e.g. MetaFX is UI-metadata noise, except app imports/exports, which are
+# usually the point of the trace). A dropped parent that contains one is kept, trimmed to the kept calls.
+DEFAULT_KEEP_NODE_NAME_PATTERNS = [
+    "ImportLayers-*",
+    "ImportApp-*",
+    "ExportApp-*",
+]
+
 AGGRESSIVE_DROP_PATH_PATTERNS = [
     "*.BOCall.request.url",
     "*.BOCall.request.queryParams.request",
@@ -193,6 +208,60 @@ PRESETS: dict[str, list[str]] = {
 DELTA_MODES = ["off", "summary", "annotated"]
 DELTA_FORMATS = ["jsonl", "jsonc", "both"]
 
+# Composable CLI modes for --mode. Each mode is a bundle of flag defaults; any
+# flag explicitly passed on the command line overrides the mode's default.
+# "redact_mode" is derived from the mode only (it is not a CLI flag). Add a new
+# mode by adding an entry here -- no changes to parse_args/main are needed.
+MODE_MATRIX: dict[str, dict[str, Any]] = {
+    "trim": {
+        "redact_mode": "aggressive",
+    },
+    "trim-context": {
+        "redact_mode": "context-only",
+    },
+    "redact-inplace": {
+        "redact_mode": "sensitive-values",
+        "in_place": True,
+        "no_backup": True,
+        "pretty": True,
+    },
+    "redact-only": {
+        "redact_mode": "sensitive-values",
+        "out_dir": "redacted",
+    },
+}
+
+# Flags a mode may override, with the legacy CLI default used when neither the
+# user nor the mode specifies the flag.
+_MODE_FLAG_FALLBACKS: dict[str, Any] = {
+    "in_place": False,
+    "no_backup": False,
+    "pretty": False,
+    "out_dir": "reduced",
+}
+
+
+class _ExplicitStoreTrue(argparse.Action):
+    """store_true that also records the flag on ns._explicit_flags."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values, option_string=None):
+        explicit = set(getattr(namespace, "_explicit_flags", set()))
+        if option_string is not None:
+            explicit.add(option_string)
+        setattr(namespace, "_explicit_flags", explicit)
+        setattr(namespace, self.dest, True)
+
+
+class _ExplicitStore(argparse.Action):
+    """store that also records the flag on ns._explicit_flags."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values, option_string=None):
+        explicit = set(getattr(namespace, "_explicit_flags", set()))
+        if option_string is not None:
+            explicit.add(option_string)
+        setattr(namespace, "_explicit_flags", explicit)
+        setattr(namespace, self.dest, values)
+
 
 @dataclass
 class Stats:
@@ -226,7 +295,9 @@ def parse_args() -> argparse.Namespace:
             "  python -m kinetic_devops.trim_trace_paths trace.json --preset kinetic-heavy --in-place\n"
             "  python -m kinetic_devops.trim_trace_paths \"*.json\" --drop \"*.request.headers.Authorization\" "
             "--out-dir reduced\n"
-            "  python -m kinetic_devops.trim_trace_paths dump.json --delta-mode summary --dry-run"
+            "  python -m kinetic_devops.trim_trace_paths dump.json --delta-mode summary --dry-run\n"
+            "  python -m kinetic_devops.trim_trace_paths dump.json --mode redact-inplace\n"
+            "  python -m kinetic_devops.trim_trace_paths dump.json --mode redact-only"
         ),
     )
     parser.add_argument(
@@ -261,11 +332,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--in-place",
-        action="store_true",
+        action=_ExplicitStoreTrue,
+        default=False,
         help="Overwrite each source file with its reduced version.",
     )
     parser.add_argument(
         "--out-dir",
+        action=_ExplicitStore,
         default="reduced",
         help="Output directory when not using --in-place (default: reduced).",
     )
@@ -281,7 +354,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pretty",
-        action="store_true",
+        action=_ExplicitStoreTrue,
+        default=False,
         help="Pretty-print output JSON (larger files, easier diffs).",
     )
     parser.add_argument(
@@ -303,7 +377,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-backup",
-        action="store_true",
+        action=_ExplicitStoreTrue,
+        default=False,
         help="Disable automatic .bak file creation for --in-place writes.",
     )
     parser.add_argument(
@@ -317,6 +392,21 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Drop entire service/root nodes whose name matches this wildcard pattern (can be repeated).",
+    )
+    parser.add_argument(
+        "--keep-node-name",
+        action="append",
+        default=[],
+        help=(
+            "Keep calls whose node name matches this wildcard pattern even under a dropped parent; the parent "
+            "stays, trimmed to the kept calls (can be repeated; added to the defaults: "
+            + ", ".join(DEFAULT_KEEP_NODE_NAME_PATTERNS) + ")."
+        ),
+    )
+    parser.add_argument(
+        "--no-default-keep",
+        action="store_true",
+        help="Don't apply the built-in keep patterns (only --keep-node-name ones).",
     )
     parser.add_argument(
         "--no-default-prune",
@@ -336,10 +426,15 @@ def parse_args() -> argparse.Namespace:
         help="Print summary of calls remaining after pruning (default: on).",
     )
     parser.add_argument(
-        "--redact-mode",
-        choices=["aggressive", "context-only"],
-        default="aggressive",
-        help="Redaction profile: aggressive (legacy default) or context-only.",
+        "--mode",
+        choices=sorted(MODE_MATRIX.keys()),
+        default="trim",
+        help=(
+            "Composable mode bundle (explicit flags override mode defaults): "
+            "trim (aggressive redaction profile, default), trim-context (context-only drops), "
+            "redact-inplace (sensitive-values redaction; in place, no backup, pretty), "
+            "redact-only (sensitive-values redaction; writes to --out-dir redacted/)."
+        ),
     )
     parser.add_argument(
         "--call-context-policy",
@@ -584,30 +679,59 @@ def relink_siblings(children: list[Any]) -> None:
             child["nextSibling"] = next_name
 
 
+def subtree_has_name(node: Any, patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+    if isinstance(node, dict):
+        name = node.get("name")
+        if isinstance(name, str) and name_matches(name, patterns):
+            return True
+        return any(subtree_has_name(v, patterns) for v in node.values())
+    if isinstance(node, list):
+        return any(subtree_has_name(v, patterns) for v in node)
+    return False
+
+
 def prune_trace_tree(
     node: Any,
     path: str,
     drop_node_name_patterns: list[str],
     drop_parent_name_patterns: list[str],
     stats: Stats,
+    keep_node_name_patterns: list[str] | None = None,
 ) -> Any:
+    keep = keep_node_name_patterns or []
     if isinstance(node, dict):
-        current_name = node.get("name") if isinstance(node.get("name"), str) else ""
-
         if "children" in node and isinstance(node["children"], list):
             filtered_children: list[Any] = []
+            removed_any = False
             for idx, child in enumerate(node["children"]):
                 child_name = child.get("name", "") if isinstance(child, dict) else ""
                 child_path = f"{path}.children[{idx}]" if path else f"children[{idx}]"
 
                 parent_rule = name_matches(child_name, drop_parent_name_patterns) if child_name else None
+                if parent_rule and subtree_has_name(child, keep):
+                    # Keep the parent for the calls that matter; drop its other children.
+                    kept = []
+                    for cidx, grandchild in enumerate(child.get("children") or []):
+                        if subtree_has_name(grandchild, keep):
+                            kept.append(grandchild)
+                        else:
+                            gname = grandchild.get("name", "") if isinstance(grandchild, dict) else ""
+                            record_removal(stats, f"{child_path}.children[{cidx}].name={gname}", f"node:{parent_rule}")
+                    if len(kept) != len(child.get("children") or []):
+                        child["children"] = kept
+                        relink_siblings(child["children"])
+                    parent_rule = None
                 if parent_rule:
                     record_removal(stats, f"{child_path}.name={child_name}", f"node:{parent_rule}")
+                    removed_any = True
                     continue
 
                 node_rule = name_matches(child_name, drop_node_name_patterns) if child_name else None
-                if node_rule:
+                if node_rule and not subtree_has_name(child, keep):
                     record_removal(stats, f"{child_path}.name={child_name}", f"node:{node_rule}")
+                    removed_any = True
                     continue
 
                 filtered_children.append(
@@ -617,11 +741,15 @@ def prune_trace_tree(
                         drop_node_name_patterns,
                         drop_parent_name_patterns,
                         stats,
+                        keep,
                     )
                 )
 
             node["children"] = filtered_children
-            relink_siblings(node["children"])
+            # Only relink when siblings actually changed: relinking an untouched list would add
+            # prevSibling/nextSibling keys the trace never had (and break sensitive-values' structure check).
+            if removed_any:
+                relink_siblings(node["children"])
 
         for key, value in list(node.items()):
             if key == "children":
@@ -633,12 +761,13 @@ def prune_trace_tree(
                 drop_node_name_patterns,
                 drop_parent_name_patterns,
                 stats,
+                keep,
             )
         return node
 
     if isinstance(node, list):
         return [
-            prune_trace_tree(v, f"{path}[{i}]", drop_node_name_patterns, drop_parent_name_patterns, stats)
+            prune_trace_tree(v, f"{path}[{i}]", drop_node_name_patterns, drop_parent_name_patterns, stats, keep)
             for i, v in enumerate(node)
         ]
 
@@ -1430,6 +1559,7 @@ def process_file(
     delta_out_dir: str,
     delta_max_value_len: int,
     delta_redact_values: bool,
+    keep_node_name_patterns: list[str] | None = None,
 ) -> tuple[bool, str, str]:
     try:
         raw = src.read_text(encoding="utf-8")
@@ -1443,6 +1573,9 @@ def process_file(
     stats = Stats()
     setattr(stats, "redact_mode", redact_mode)
     setattr(stats, "call_context_policy", call_context_policy)
+    # In sensitive-values mode the promise is structure preservation; snapshot the
+    # structure fingerprint up front so it can be verified after the redaction pass.
+    skeleton_before = structure_skeleton(data) if redact_mode == "sensitive-values" and sample_size == 0 else None
     original_data = copy.deepcopy(data) if delta_mode != "off" else None
     data = prune_trace_tree(
         data,
@@ -1450,14 +1583,18 @@ def process_file(
         drop_node_name_patterns=drop_node_name_patterns,
         drop_parent_name_patterns=drop_parent_name_patterns,
         stats=stats,
+        keep_node_name_patterns=(
+            DEFAULT_KEEP_NODE_NAME_PATTERNS if keep_node_name_patterns is None else keep_node_name_patterns
+        ),
     )
     trimmed = trim_node(data, "", drop_patterns, drop_keys, stats)
     trimmed = normalize_placeholder_repeats(trimmed, "", stats)
     trimmed = compact_stringified_call_context(trimmed, "", stats)
     trimmed = redact_values_by_key(trimmed, stats)
-    if strip_empty_call_context:
+    if redact_mode != "sensitive-values" and strip_empty_call_context:
         trimmed = strip_empty_stringified_context(trimmed, "", stats)
-    trimmed = reorder_context_headers(trimmed)
+    if redact_mode != "sensitive-values":
+        trimmed = reorder_context_headers(trimmed)
     if do_prune_empty:
         trimmed = prune_empty(trimmed)
     if sequence_only:
@@ -1473,6 +1610,19 @@ def process_file(
             sample_include_patterns,
             sample_exclude_patterns,
         )
+
+    structure_note = ""
+    if redact_mode == "sensitive-values":
+        if skeleton_before is not None:
+            skeleton_after = structure_skeleton(trimmed)
+            if skeleton_before == skeleton_after:
+                structure_note = "structure=identical"
+            else:
+                removed_struct = count_removed_structure(skeleton_before, skeleton_after)
+                structure_note = f"structure=changed: {removed_struct} element(s) removed"
+                return False, f"ERROR {src}: {structure_note}; sensitive-values mode must preserve all structure", ""
+        else:
+            structure_note = "structure-check=skipped (sampling trims structure)"
 
     if pretty:
         out_text = json.dumps(trimmed, ensure_ascii=False, indent=2)
@@ -1514,6 +1664,8 @@ def process_file(
         f"OK {src} -> {where} | removed={stats.removed} nodes | "
         f"normalized={stats.normalized} strings | size {before:,} -> {after:,} bytes ({pct:.1f}% smaller)"
     )
+    if structure_note:
+        summary += f" | {structure_note}"
     if sample_size > 0:
         summary += f" | sampled={stats.sampled_lists} lists / {stats.sampled_items} items (first {sample_size})"
         if sample_include_patterns:
@@ -1534,8 +1686,28 @@ def process_file(
     return True, summary, details
 
 
+def apply_mode_defaults(args: argparse.Namespace) -> tuple[argparse.Namespace, str]:
+    """Apply the --mode bundle to parsed args.
+
+    The mode supplies defaults for the flags it defines; any flag the user
+    passed explicitly on the command line always wins. Returns (args, redact_mode),
+    where redact_mode is the mode's redaction profile ("aggressive",
+    "context-only", or "sensitive-values").
+    """
+    mode_bundle = MODE_MATRIX[args.mode]
+    redact_mode = mode_bundle["redact_mode"]
+    explicit_flags = set(getattr(args, "_explicit_flags", set()))
+    for flag, value in mode_bundle.items():
+        if flag == "redact_mode":
+            continue
+        if f"--{flag.replace('_', '-')}" not in explicit_flags:
+            setattr(args, flag, value)
+    return args, redact_mode
+
+
 def main() -> int:
     args = parse_args()
+    args, redact_mode = apply_mode_defaults(args)
 
     drop_patterns: list[str] = list(args.drop)
     for preset in args.preset:
@@ -1547,8 +1719,23 @@ def main() -> int:
 
     drop_node_name_patterns = list(args.drop_node_name)
     drop_parent_name_patterns = list(args.drop_parent_name)
-    if not args.no_default_prune:
-        if args.redact_mode == "context-only":
+    if redact_mode == "sensitive-values":
+        # Redact sensitive values in place; keep every element of structure.
+        # All default drop/prune rules are suppressed and explicit --drop/--drop-key
+        # options are ignored (values are replaced, elements are never removed).
+        explicit_drops = len(args.drop) + sum(len(read_rules_file(rf)) for rf in args.rules_file) + len(args.drop_key)
+        if explicit_drops:
+            print(
+                f"Note: --mode {args.mode} keeps all structure; "
+                f"ignoring {explicit_drops} explicit drop option(s).",
+                file=sys.stderr,
+            )
+        drop_patterns = []
+        drop_keys = set()
+        drop_node_name_patterns = []
+        drop_parent_name_patterns = []
+    elif not args.no_default_prune:
+        if redact_mode == "context-only":
             drop_patterns.extend(CONTEXT_ONLY_DROP_PATH_PATTERNS)
         else:
             drop_patterns.extend(AGGRESSIVE_DROP_PATH_PATTERNS)
@@ -1557,7 +1744,13 @@ def main() -> int:
         drop_node_name_patterns.extend(DEFAULT_DROP_NODE_NAME_PATTERNS)
         drop_parent_name_patterns.extend(DEFAULT_DROP_PARENT_NAME_PATTERNS)
 
-    if not drop_patterns and not drop_keys and not drop_node_name_patterns and not drop_parent_name_patterns:
+    if (
+        redact_mode != "sensitive-values"
+        and not drop_patterns
+        and not drop_keys
+        and not drop_node_name_patterns
+        and not drop_parent_name_patterns
+    ):
         print(
             "Nothing to do: provide pruning options or leave defaults enabled.",
             file=sys.stderr,
@@ -1606,7 +1799,7 @@ def main() -> int:
             strip_empty_call_context=args.strip_empty_call_context,
             show_call_summary=args.call_summary,
             sequence_only=args.sequence_only,
-            redact_mode=args.redact_mode,
+            redact_mode=redact_mode,
             call_context_policy=args.call_context_policy,
             light_repair_json=args.light_repair_json,
             sample_size=args.sample_size,
@@ -1617,6 +1810,9 @@ def main() -> int:
             delta_out_dir=args.delta_out_dir,
             delta_max_value_len=args.delta_max_value_len,
             delta_redact_values=args.delta_redact_values,
+            keep_node_name_patterns=(
+                ([] if args.no_default_keep else list(DEFAULT_KEEP_NODE_NAME_PATTERNS)) + list(args.keep_node_name)
+            ),
         )
         if detail:
             print(detail)

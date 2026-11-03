@@ -10,14 +10,38 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 ## [Unreleased]
 
 ### Added
+- `trim_trace_paths --mode` matrix replaces `--redact-mode` (removed, no compatibility alias).
+  Each mode is a bundle of flag defaults that explicit command-line flags always override:
+  `trim` (aggressive redaction profile, the default), `trim-context` (context-only drops),
+  `redact-inplace` (sensitive-values redaction with `--in-place`, `--no-backup`, `--pretty`), and
+  `redact-only` (sensitive-values redaction writing to `--out-dir redacted/`).
+  Sensitive-values redaction keeps every element of structure: all default and explicit drop/prune
+  rules are suppressed, empty values are kept, and key reordering is off. After redaction the tool
+  verifies the output structure is identical to the input (via the `artifact_validation` structure
+  fingerprint) and fails the file if anything was lost; `--sample-size` disables the check with a
+  note since sampling trims structure. New modes can be added by extending `MODE_MATRIX` without
+  touching the CLI plumbing.
+- Generic JSON structure comparison helpers in `artifact_validation` (usable by any command that
+  transforms JSON artifacts): `structure_skeleton` (shape fingerprint of any JSON value),
+  `count_removed_structure` (counts structure present before and missing after), and
+  `compare_json_structure` (returns `{"identical", "removed_count", "report"}`).
+- Scanner patterns for internal infrastructure: private (RFC 1918) IPv4 addresses, the tailnet CGNAT range
+  (100.64/10) and IPv6 prefix, and `*.ts.net` host names. Use documentation placeholders (e.g. 192.0.2.x,
+  example.com) in shared code and docs.
+
+### Fixed
+- `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
+  "structure=changed: 0 element(s) removed": pruning relinked `prevSibling`/`nextSibling` on every call
+  list, adding keys the trace never had. Siblings are now relinked only when a call was removed.
+- `trim` / `trim-context` no longer silently drop `ImportLayers`, `ImportApp` and `ExportApp` calls with the
+  rest of the MetaFX service (dropped by default as UI-metadata noise). A dropped service that contains a kept
+  call stays, trimmed to the kept calls. New `--keep-node-name PATTERN` (repeatable) and `--no-default-keep`.
 - Local branch guard in the git hooks: no commits (merge commits included) on `main`; `main` is pushed
   only as exactly `public/main` and never to `public`; the scratch `dev` branch is never pushed.
   `KINETIC_ALLOW_MAIN=1` skips it once. See CONTRIBUTING.md, "Local branch guard".
 - `scripts/install-hook.sh` installs the hooks from Git Bash, with no PowerShell script execution.
   The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
   installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
-
-### Fixed
 - **`find_sensitive_data` no longer skips committed content because of a folder name.** The built-in exclusion
   list (`temp`, `reports`, `templates`, `Apps`, `layers`, `schemas`, `bin`, `build`, ...) matched any path part,
   so tracked files in such folders, and their changes in `--staged`, `--commit`, `--diff`, `--history` and
@@ -25,11 +49,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   file is scanned unless it is untracked or named by an explicit `--exclude`; git scans apply explicit excludes
   only. The built-in list only trims walks of explicit subpaths and non-git folders, and a file named with
   `--file` is always scanned unless explicitly excluded.
-
-### Added
-- Scanner patterns for internal infrastructure: private (RFC 1918) IPv4 addresses, the tailnet CGNAT range
-  (100.64/10) and IPv6 prefix, and `*.ts.net` host names. Use documentation placeholders (e.g. 192.0.2.x,
-  example.com) in shared code and docs.
 
 ## [0.2.0.0a8] - 2026-11-01
 
