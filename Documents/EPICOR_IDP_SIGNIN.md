@@ -88,13 +88,27 @@ Use `--port` if 8765 is taken. The port must be one of the client's registered r
 | `unauthorized_client` | The client doesn't allow the authorization-code grant, or it's not a native/public client. |
 | Signed in, but "Kinetic didn't accept the token" | The IdP identity isn't mapped to an ERP user, or the environment's API key is wrong for the company. |
 | No refresh token returned / sign-in every hour | Offline access isn't allowed on the client. |
-| "session has expired and can't be refreshed" in a script | The refresh token's lifetime ran out; run `auth idp-login` in a terminal. |
+| "session has expired and can't be refreshed" in a script | The refresh token's lifetime ran out (or the IdP rejected it); run `auth idp-login` in a terminal. |
+| "issuer ... is not the IdP endpoint Kinetic names" | The server's `/api/.configuration` and the IdP's discovery document disagree; check the server's IdP settings. |
+| "The ID token has expired (exp)" right after signing in | This computer's clock is off by more than two minutes. |
+| "Refusing the lock directory" | The directory named exists but isn't yours with mode 0700; remove it and retry. |
 
 ## Security notes
 
-- The redirect is plain `http` on purpose: it only goes to `127.0.0.1` on your own machine, never across the network.
-  PKCE stops another local program from using an intercepted code. The listener accepts one callback and checks the
-  `state` value.
+- The redirect is plain `http` on purpose: it only goes to `127.0.0.1` on your own machine, never across the network
+  (RFC 8252). Everything else is `https` with certificate checks: the Kinetic server, the IdP endpoint it names, the
+  discovery document and the authorize/token endpoints. A redirect away from `https` is refused.
+- Discovery is checked: the document's `issuer` must be the IdP endpoint Kinetic names, and the authorize and token
+  endpoints must be on the issuer's host.
+- The listener takes exactly one callback: the first with this sign-in's `state`. Anything else (a wrong or missing
+  `state`, a second callback, a `Host` other than `127.0.0.1:<port>`, an `iss` from another issuer) gets an error page
+  and is ignored, so another program or a web page can't end or take over the sign-in. PKCE stops another local
+  program from using an intercepted code. The page is sent with `no-store` and `no-referrer`.
+- The ID token is checked (issuer, audience, expiry, and a `nonce` tied to this sign-in). The session keeps the IdP
+  identity (`idp_username`); `idp-login` warns if it doesn't look like the `--user` you named the session for.
+- Refreshes are serialised with a lock file in a directory only you can access (`$XDG_RUNTIME_DIR/kinetic-devops`
+  or `<tmp>/kinetic-devops-<uid>`, mode 0700; the per-user temp directory on Windows). A refresh token the IdP
+  rejects (`invalid_grant`) is dropped, so the next run asks for a new sign-in.
 - Tokens are stored where password-session tokens are: the OS keyring (Windows Credential Manager by default).
   The refresh token is long-lived, so treat the keyring entry like a password. The client ID is stored per IdP
   tenant under the keyring service `kinetic-idp`.

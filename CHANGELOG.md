@@ -35,6 +35,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   never fall back to a password prompt. `renew` refreshes IdP sessions. The IdP settings come from the server's
   anonymous `/api/.configuration`, and the client ID is stored per IdP tenant. Setup, including registering a
   native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
+  Hardened before release: https-only remote endpoints with certificate checks (the loopback redirect stays http,
+  RFC 8252); the discovery issuer must be the endpoint Kinetic names, with the authorize and token endpoints on its
+  host; the callback takes only the first response with the right `state` and checks `Host` and `iss` (RFC 9207);
+  the ID token's `iss`, `aud`/`azp`, `exp` and `nonce` are checked, and the IdP identity is stored (`idp-login`
+  warns if it doesn't look like `--user`); refresh locks live in a per-user 0700 directory and can't spin; a
+  refresh token the IdP rejects is dropped.
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
@@ -59,7 +65,7 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - A cached token that needs a password no longer hangs non-interactive runs. Without a terminal, the
   password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
-
+  Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
 
 ## [0.2.0.0a8] - 2026-11-01
 
