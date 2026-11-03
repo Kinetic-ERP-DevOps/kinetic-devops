@@ -244,5 +244,16 @@ class TestFetchTokenNonInteractive(unittest.TestCase):
         mock_getpass.assert_not_called()
 
 
+    def test_piped_stdout_with_a_terminal_on_stdin_still_prompts(self):
+        """`... | tee log`: stdout isn't a terminal, but a person can still answer the prompt."""
+        mgr = _bare_manager()
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stdout, "isatty", return_value=False), \
+             patch("builtins.input", side_effect=KeyboardInterrupt) as mock_input, \
+             patch("kinetic_devops.auth.getpass.getpass", side_effect=KeyboardInterrupt) as mock_getpass:
+            with self.assertRaises(KeyboardInterrupt):   # reached the prompt (the guard didn't raise RuntimeError)
+                mgr._fetch_token_kinetic(self._ctx())
+        self.assertTrue(mock_getpass.called or mock_input.called)
+
 if __name__ == "__main__":
     unittest.main()

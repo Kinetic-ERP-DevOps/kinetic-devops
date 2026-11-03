@@ -371,6 +371,16 @@ class TestAuthUsesIdpRefresh(unittest.TestCase):
             mgr.get_active_config(("pilot", "alice", "ACME"), fields=("token",))
         self.assertIn("idp-login pilot", str(ctx.exception))
 
+    def test_unrefreshable_idp_session_signs_in_again_with_a_terminal_on_stdin(self):
+        """stdin decides: stdout piped (`| tee`) with a person at the terminal opens the browser sign-in."""
+        mgr = self._mgr({"auth_method": "idp", "_is_valid": False, "AccessToken": "OLD"})
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(mgr, "_refresh_idp", return_value=None), \
+             patch.object(mgr, "idp_login", return_value="BROWSER") as login:
+            token = mgr._renew_idp_or_raise("slot", {}, "pilot", "alice", "ACME")
+        self.assertEqual(token, "BROWSER")
+        login.assert_called_once_with("pilot", "alice", "ACME")
+
 
 class FakeKeyring:
     """Dict-backed keyring that enforces Windows Credential Manager's ~1280-character limit."""

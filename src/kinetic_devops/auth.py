@@ -1120,7 +1120,9 @@ class KineticConfigManager(KineticCore):
 
         # getpass reads the console directly on Windows, not stdin, so without a terminal the prompt
         # blocks forever instead of failing (a background run with an expired token hung for an hour).
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # stdin decides: a redirected stdin means nobody is there to type; stdout may be piped
+        # (`... | tee log`) while a person still answers the prompt.
+        if not sys.stdin.isatty():
             raise RuntimeError(
                 f"Token for {nickname or url} ({user_id or 'unknown user'}) needs a password, but there is no "
                 f"interactive terminal to prompt in. Run 'python -m kinetic_devops.auth renew {nickname}' "
@@ -1506,7 +1508,7 @@ class KineticConfigManager(KineticCore):
         token = self._refresh_idp(slot, meta, name, force=force)
         if token:
             return token
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if sys.stdin.isatty():   # a person at the terminal (stdout may be piped): sign in again in the browser
             return self.idp_login(name, user_id, company)
         raise RuntimeError(
             f"The Epicor IdP session for {name} ({user_id}) has expired and can't be refreshed. Run "
