@@ -17,6 +17,20 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
   installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
 
+### Fixed
+- **`find_sensitive_data` no longer skips committed content because of a folder name.** The built-in exclusion
+  list (`temp`, `reports`, `templates`, `Apps`, `layers`, `schemas`, `bin`, `build`, ...) matched any path part,
+  so tracked files in such folders, and their changes in `--staged`, `--commit`, `--diff`, `--history` and
+  `--git-stash` scans (including the pre-commit and pre-push gates), were never scanned. Now, in the repo, a
+  file is scanned unless it is untracked or named by an explicit `--exclude`; git scans apply explicit excludes
+  only. The built-in list only trims walks of explicit subpaths and non-git folders, and a file named with
+  `--file` is always scanned unless explicitly excluded.
+
+### Added
+- Scanner patterns for internal infrastructure: private (RFC 1918) IPv4 addresses, the tailnet CGNAT range
+  (100.64/10) and IPv6 prefix, and `*.ts.net` host names. Use documentation placeholders (e.g. 192.0.2.x,
+  example.com) in shared code and docs.
+
 ## [0.2.0.0a8] - 2026-11-01
 
 The 8th alpha, and the first release under the versioning rule in the README (*Versioning*): this
