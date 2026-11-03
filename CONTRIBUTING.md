@@ -89,16 +89,33 @@ over the old one where practical -- GitHub's squash-merge breaks git-level ances
 branch and its squashed commit on `main`, so a branch that still thinks it's based on the pre-squash
 history can show spurious merge conflicts or fail to trigger `pull_request`-triggered CI.
 
-## Pre-commit Hook
+## Git Hooks
 
-```powershell
-Copy-Item scripts\hooks\pre-commit .git\hooks\pre-commit
-# or
-git config core.hooksPath scripts/hooks
+Install once per clone, and again after `scripts/hooks/templates/` changes (Git Bash; needs no
+PowerShell script execution, which endpoint security may block):
+
+```sh
+sh scripts/install-hook.sh
 ```
 
-Runs the sensitive-data gate and the test suite before each commit. See
-[tests/README.md](tests/README.md) for more on the test runner.
+(`.\scripts\install-hook.ps1` installs the same files.) The pre-commit hook runs the sensitive-data
+gate and the test suite before each commit; see [tests/README.md](tests/README.md) for the test
+runner and [scripts/README.md](scripts/README.md#git-hooks) for the opt-in pre-push sandbox test.
+
+## Local branch guard (`main` and `dev`)
+
+The installed hooks also keep local `main` an exact copy of `public/main`, so the two remotes'
+`main` branches can't drift apart from this clone:
+
+- **No commits on `main`**, merge commits included (pre-commit, pre-merge-commit). `main` only moves
+  by fast-forwarding to `public/main` after a PR merges (`scripts/sync-main.sh`).
+- **`main` is pushed only as exactly `public/main`**, and never to `public` itself, where it
+  moves by merging a PR (pre-push).
+- **`dev` is a local scratch branch**: merge feature branches into it to try them together, and
+  recreate it when it gets messy (`git branch -f dev main`). It is never pushed (pre-push).
+
+`KINETIC_ALLOW_MAIN=1` skips the guard for one command, for deliberate repairs only. The guard is
+local: it complements, and doesn't replace, branch protection on the remotes.
 
 ## Commit Messages
 
