@@ -35,6 +35,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   never fall back to a password prompt. `renew` refreshes IdP sessions. The IdP settings come from the server's
   anonymous `/api/.configuration`, and the client ID is stored per IdP tenant. Setup, including registering a
   native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
+  `idp-login` asks for what isn't passed when run at a terminal: the environment (from the configured list), the
+  Epicor User ID (an existing session, or a new ID with the IdP sign-in name offered) and the company; without a
+  terminal a missing environment or user stops before the browser opens.
   Hardened before release: https-only remote endpoints with certificate checks (the loopback redirect stays http,
   RFC 8252); the discovery issuer must be the endpoint Kinetic names, with the authorize and token endpoints on its
   host; the callback takes only the first response with the right `state` and checks `Host` and `iss` (RFC 9207);

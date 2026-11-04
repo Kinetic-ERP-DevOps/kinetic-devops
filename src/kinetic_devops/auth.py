@@ -894,7 +894,7 @@ class KineticConfigManager(KineticCore):
                 pass
 
     def _select_session_for_env(
-        self, selected_env: str, env_cfg: Dict, preferred_company: str = ""
+        self, selected_env: str, env_cfg: Dict, preferred_company: str = "", suggested_user: str = ""
     ) -> Tuple[str, str]:
         """Interactively select an existing session or enter a new Epicor
         User ID for an already-known environment, then pick a company if
@@ -908,6 +908,9 @@ class KineticConfigManager(KineticCore):
         If preferred_company is already set (e.g. an explicit --company
         was supplied by the caller), company selection is skipped entirely
         so an interactive prompt here never overwrites it.
+
+        suggested_user (e.g. from an IdP sign-in) is offered as the default
+        when a new User ID is entered: an empty answer takes it.
         """
         sessions = env_cfg.get("sessions", []) or []
         selected_user = None
@@ -922,7 +925,8 @@ class KineticConfigManager(KineticCore):
         # If no session was selected, insist on a non-empty user id input.
         if not selected_user:
             while True:
-                entered = input("Enter Epicor User ID: ").strip()
+                hint = f" [{suggested_user}]" if suggested_user else ""
+                entered = input(f"Enter Epicor User ID{hint}: ").strip() or suggested_user
                 if entered:
                     selected_user = entered
                     break
@@ -934,6 +938,14 @@ class KineticConfigManager(KineticCore):
             self.set_current_company(selected_env, selected_user, selected_co)
             return selected_user, selected_co
 
+        selected_co = self._select_company_for_env(selected_env, env_cfg)
+
+        # Lock choice into metadata
+        self.set_current_company(selected_env, selected_user, selected_co)
+        return selected_user, selected_co
+
+    def _select_company_for_env(self, selected_env: str, env_cfg: Dict) -> str:
+        """Pick one of the environment's configured companies (asks only when there is more than one)."""
         raw_cos = env_cfg.get('company') or env_cfg.get('companies') or ""
         available_cos = [c.strip() for c in str(raw_cos).split(',') if c.strip()]
 
@@ -958,10 +970,7 @@ class KineticConfigManager(KineticCore):
                     selected_co = available_cos[0]
         else:
             selected_co = available_cos[0] if available_cos else ""
-
-        # Lock choice into metadata
-        self.set_current_company(selected_env, selected_user, selected_co)
-        return selected_user, selected_co
+        return selected_co
 
     def prompt_for_env(self, passive: bool = False, prompt_reuse: bool = False) -> Tuple[str, str, str]:
         # 1. GLOBAL QUICK-CONNECT: Check the last session touched by ANY tool
@@ -1552,23 +1561,46 @@ class KineticConfigManager(KineticCore):
         idp.set_client_id(settings["tenant"], client_id)
         print(f"✅ Stored the IdP client ID for the IdP tenant used by {name}.")
 
-    def idp_login(self, env_name: str, user_id: str = "", company_id: str = "", port: int = 0) -> Optional[str]:
-        """Sign in through Epicor IdP in the browser and store the session like a password sign-in."""
-        name, cfg = self._find_env(self._get_server_dict(), env_name)
+    def idp_login(self, env_name: str = "", user_id: str = "", company_id: str = "", port: int = 0) -> Optional[str]:
+        """Sign in through Epicor IdP in the browser and store the session like a password sign-in.
+
+        Whatever isn't passed is asked for at a terminal: the environment (from the configured list) before the
+        sign-in; the Epicor User ID (an existing session, or a new ID with the IdP sign-in name offered as the
+        default) and the company (when there is more than one) after it. Without a terminal (stdin decides),
+        a missing environment or user stops at once with what to pass; the company defaults to the first one.
+        """
+        interactive = sys.stdin.isatty()
+        servers = self._get_server_dict()
+        if not env_name:
+            if not interactive:
+                raise SessionResolutionError("Pass ENV (the environment nickname): there is no terminal to choose one in.")
+            if not servers:
+                raise SessionResolutionError("No environments are configured yet; add one with 'auth store' first.")
+            env_name, _, _ = self.prompt_for_env(passive=True)   # passive: pick the environment only, no quick-connect
+        name, cfg = self._find_env(servers, env_name)
         if not cfg:
             print(f"❌ No environment named '{env_name}' found.")
             return None
         user_id = (user_id or os.environ.get("KIN_USER", "")).strip().lower()
-        if not user_id:
-            raise SessionResolutionError("Pass --user (your Epicor user ID) or set KIN_USER; it names the session.")
-        companies = [c.strip() for c in str(cfg.get("companies") or cfg.get("company") or "").split(",") if c.strip()]
-        company_id = company_id or (companies[0] if companies else "")
+        if not user_id and not interactive:
+            raise SessionResolutionError("Pass --user (your Epicor user ID) or set KIN_USER; it names the session, and "
+                                         "there is no terminal to ask in.")
         settings = idp.discover(cfg["url"])
         client_id = idp.get_client_id(settings["tenant"])
         if not client_id:
             raise idp.IdPError(f"No IdP client ID stored for {name}'s IdP tenant. Register a native client "
                                f"(Documents/EPICOR_IDP_SIGNIN.md), then run 'auth idp-client {name}'.")
         tok = idp.login_browser(settings, client_id, port=port or idp.DEFAULT_PORT)
+        if not user_id:   # asked now, so the IdP sign-in name can be offered (jdoe from jdoe@corp.example)
+            who = (tok.get("idp_identity") or {}).get("username", "")
+            suggestion = who.split("@", 1)[0].rsplit("\\", 1)[-1].lower()
+            user_id, picked_co = self._select_session_for_env(name, cfg, preferred_company=company_id,
+                                                               suggested_user=suggestion)
+            user_id, company_id = user_id.strip().lower(), company_id or picked_co
+        elif not company_id:
+            company_id = (self._select_company_for_env(name, cfg) if interactive else
+                          next((c.strip() for c in str(cfg.get("companies") or cfg.get("company") or "").split(",")
+                                if c.strip()), ""))
         meta = idp.session_meta(tok, settings, user_id, name, company_id)
         who = meta.get("idp_username", "")
         if not idp.identity_matches(who, user_id):
@@ -2595,12 +2627,16 @@ def main():
             "Setup: Documents/EPICOR_IDP_SIGNIN.md."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="examples:\n  python -m kinetic_devops.auth idp-login MyTestEnv --user jdoe --co ACME",
+        epilog="examples:\n  python -m kinetic_devops.auth idp-login                      (asks for everything)\n"
+               "  python -m kinetic_devops.auth idp-login MyTestEnv --user jdoe --co ACME",
     )
-    idp_login_p.add_argument("env", metavar="ENV", help="Environment nickname.")
+    idp_login_p.add_argument("env", metavar="ENV", nargs="?", default="",
+                             help="Environment nickname. Omitted: chosen from the configured list (terminal only).")
     idp_login_p.add_argument("--user", default="", metavar="USER_ID",
-                             help="Epicor user ID that names the session. Default: KIN_USER.")
-    idp_login_p.add_argument("--co", default="", metavar="COMPANY", help="Company. Default: the first configured.")
+                             help="Epicor user ID that names the session. Default: KIN_USER, else asked after the "
+                                  "sign-in with the IdP name offered (terminal only).")
+    idp_login_p.add_argument("--co", default="", metavar="COMPANY",
+                             help="Company. Default: asked when several are configured (terminal), else the first.")
     idp_login_p.add_argument("--port", type=int, default=0,
                              help="Loopback redirect port registered on the client (default 8765).")
 
