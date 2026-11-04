@@ -9,6 +9,7 @@ on:
       - main
       - master
 
+# Least privilege for the job token (restored 2026-11-02: the claim that Forgejo ignores this block is unverified).
 permissions:
   contents: read
 

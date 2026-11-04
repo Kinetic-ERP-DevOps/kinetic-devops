@@ -3,6 +3,7 @@
 Triggered by pushing a tag sync/<name> (only allowed users can; protect sync/* in Forgejo).
 sync/dry-run/<name> runs every step except the push and the PR. The same runs from the Actions tab
 (Run workflow on the branch to promote; inputs: name, dry run). Steps:
+  0. stop if the commit under test isn't the branch's head now (a re-run of an old run, a tag left behind)
   1. fetch GitHub main; rebase the tagged commits onto it (conflict -> stop, list files)
   2. guards: .github/workflows changes (push those from a workstation); "Closes/Fixes #N" must be open
      GitHub issues; mentions of a *draft* security advisory (undisclosed fix -> use its private fork);
@@ -25,10 +26,18 @@ API = "https://api.github.com"
 problems, notes = [], []
 
 
+def redact(text):  # the token, raw or base64 (as in git_auth's header), never reaches the log
+    for secret in filter(None, (TOKEN, __import__("base64").b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+                                if TOKEN else "")):
+        text = text.replace(secret, "***")
+    return text
+
+
 def sh(*cmd, check=True, env=None, input=None):
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, input=input)
     if check and r.returncode:
-        raise SystemExit(f"command failed: {' '.join(cmd[:3])}...: {r.stderr.strip()[-800:]}")
+        shown = [a for a in cmd if not a.startswith("http.") and a != "-c"][:3]   # skip git_auth's -c header
+        raise SystemExit(redact(f"command failed: {' '.join(shown)}...: {r.stderr.strip()[-800:]}"))
     return r.stdout
 
 
@@ -80,12 +89,45 @@ def audit(lock_text):
 
 
 if E.get("SYNC_EVENT") == "workflow_dispatch":
-    # "Run workflow" button: the branch picked in the dialog; name and dry run from the inputs.
-    src = E.get("SYNC_BRANCH", "")
+    # "Run workflow" button: the branch typed into the dialog (run started on main, so these checks come
+    # from main, not from the branch being promoted), else the branch the run was started on.
+    ref, typed = E.get("SYNC_BRANCH", ""), (E.get("SYNC_INPUT_BRANCH") or "").strip()
+    if typed and ref not in ("main", "master", typed):
+        sys.exit(f"sync: branch '{typed}' typed, but the run was started on '{ref}': start it on main, or leave "
+                 "the branch field blank")
+    src = typed or ref
     if src in ("", "main", "master"):
-        sys.exit(f"sync: pick the branch to promote in the Run workflow dialog (got '{src or '?'}')")
+        sys.exit("sync: type the branch to promote into the Run workflow dialog's branch field "
+                 f"(got '{src or '?'}')")
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", src) or ".." in src or src.startswith(("-", "/")):
+        sys.exit(f"sync: bad branch name {src!r}")
+    if typed and typed != ref:
+        sh("git", "fetch", "--no-tags", "-q", "origin", f"refs/heads/{src}:refs/remotes/origin/{src}")
+        sh("git", "checkout", "-q", "--detach", f"refs/remotes/origin/{src}")
+        print(f"sync: checked out {src} at {sh('git', 'rev-parse', '--short', 'HEAD').strip()} (checks from {ref})")
     name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
-    dry = E.get("SYNC_DRY", "true").lower() != "false"
+    # What the dialog sent. 2026-11-02: three runs recorded no inputs at all, so a push that was asked for ran as a
+    # dry run and reported success. `mode` has a non-empty default, so it is always sent by this workflow's dialog;
+    # without it the run can't know what was asked for and stops. A push needs mode=push AND "push" typed in
+    # confirm (a checkbox once arrived as false when ticked, 2026-11-01); any disagreement stops, nothing pushed.
+    raw = (E.get("SYNC_INPUTS") or "").strip()
+    try:
+        inputs = json.loads(raw) if raw else None
+    except ValueError:
+        inputs = None
+    if not isinstance(inputs, dict) or "mode" not in inputs:
+        sys.exit(f"sync: the Run workflow dialog sent no usable inputs (received {raw or 'nothing'!r}), so it is unknown "
+                 "whether a dry run or a push was asked for. Nothing was pushed. Run it again from Actions -> Sync to "
+                 "upstream -> Run workflow, or use a sync/dry-run/<name> or sync/<name> tag.")
+    mode = str(inputs.get("mode") or "").strip().lower()
+    confirm = (E.get("SYNC_CONFIRM") or "").strip().lower()
+    if mode not in ("dry-run", "push"):
+        sys.exit(f"sync: mode must be dry-run or push, got {mode!r}. Nothing was pushed.")
+    if (mode == "push") != (confirm == "push"):
+        sys.exit(f"sync: mode {mode!r} but confirm {confirm or 'blank'!r}: for a push choose mode push AND type push in "
+                 "confirm; for a dry run leave confirm blank. Nothing was pushed.")
+    dry = mode == "dry-run"
+    print(f"sync: dialog inputs {json.dumps(inputs, sort_keys=True)} -> {'dry run' if dry else 'push'}")
     TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
 else:
     name = TAG[len("sync/"):]
@@ -96,6 +138,26 @@ if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or name in ("main", "master") or 
     raise SystemExit(f"bad sync name: {name!r}")
 branch = f"sync/{name}"
 print(f"sync: {TAG} -> GitHub {REPO} branch {branch}{' (dry run)' if dry else ''}")
+
+# 0. Test what the branch holds now. A re-run replays its original commit, and a tag stays where it was put, so
+# both can test code the branch has since replaced (2026-11-02: two re-runs refused a fix the branch already had).
+tested = sh("git", "rev-parse", "HEAD").strip()
+heads = {ref[len("refs/heads/"):]: sha for sha, ref in
+         (l.split("\t") for l in sh("git", "ls-remote", "--heads", "origin").splitlines() if "\t" in l)}
+src_branch = src if E.get("SYNC_EVENT") == "workflow_dispatch" else \
+    next((b for b in heads if b.replace("/", "-") == name or b == name), None)
+if src_branch is None:
+    print(f"sync: no branch in this repo matches {name!r}; testing {TAG} at {tested[:7]} as tagged")
+elif heads.get(src_branch) != tested:
+    sys.exit(f"sync: stale run: this tests {tested[:7]}, but branch {src_branch} is at "
+             f"{(heads.get(src_branch) or 'nothing (deleted)')[:7]}. "
+             + ("Start a new run (Run workflow) instead of re-running an old one."
+                if E.get("SYNC_EVENT") == "workflow_dispatch" else
+                f"Move the tag to the branch head (git fetch origin && git tag -f {TAG} origin/{src_branch} && "
+                f"git push -f origin {TAG}), "
+                "or use the Run workflow button."))
+else:
+    print(f"sync: {src_branch} is at {tested[:7]}, the commit under test")
 
 # 1. GitHub main, rebase
 sh("git", *git_auth(), "fetch", "--no-tags", "-q", f"https://github.com/{REPO}.git", "main:refs/remotes/github/main")
@@ -119,9 +181,15 @@ print(f"{len(commits)} commit(s), {len(changed)} file(s) changed after rebase")
 # e-mail upstream. Checked on everything that leaves: commit identities, messages, the diff's added lines,
 # and (below) the PR title/body. Added after a PR body linked the Forgejo run and commits carried a personal
 # address (2026-10-31).
+# IPv4: every part must be 0-255 and the address can't sit inside a longer dotted number, so version strings
+# (a Windows build, a four-part package version) aren't taken for private addresses (2026-11-02: a test file's
+# "not an address" cases were refused).
+OCT = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+def ipv4(head, parts):  # head: the fixed leading part(s); parts: how many free octets follow
+    return rf"(?<![\d.]){head}" + rf"\.{OCT}" * parts + r"(?!\.?\d)"
 private = [re.escape(urllib.parse.urlparse(E.get("FORGEJO_URL", "")).hostname or "") or None,
-           r"[a-z0-9-]+\.ts\.net\b", r"\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d+\.\d+\b",
-           r"\b192\.168\.\d+\.\d+\b", r"\b10\.\d+\.\d+\.\d+\b", r"\bfd7a:115c:" r"a1e0:"]   # split so this source line doesn't match itself
+           r"[a-z0-9-]+\.ts\.net\b", ipv4(r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])", 2),
+           ipv4(r"192\.168", 2), ipv4(r"10", 3), r"\bfd7a:115c:" r"a1e0:"]   # split so this source line doesn't match itself
 private += [p for p in (E.get("SYNC_PRIVATE_PATTERNS") or "").split(",") if p.strip()]
 private = [re.compile(p, re.I) for p in private if p]
 def leaks(text):
@@ -220,8 +288,17 @@ if dry:
 # Lease against what the GitHub branch holds right now (empty = must not exist yet): a URL push has no
 # remote-tracking ref for a plain --force-with-lease to compare with.
 current = sh("git", *git_auth(), "ls-remote", f"https://github.com/{REPO}.git", f"refs/heads/{branch}").split()
-sh("git", *git_auth(), "push", "-q", f"--force-with-lease=refs/heads/{branch}:{current[0] if current else ''}",
-   f"https://github.com/{REPO}.git", f"HEAD:refs/heads/{branch}")
+head = sh("git", "rev-parse", "HEAD").strip()
+push = subprocess.run(["git", *git_auth(), "push", "-q", f"--force-with-lease=refs/heads/{branch}:{current[0] if current else ''}",
+                       f"https://github.com/{REPO}.git", f"HEAD:refs/heads/{branch}"], capture_output=True, text=True)
+if push.returncode:
+    # A rejected push can still have landed (2026-11-01: "cannot lock ref ... reference already exists", yet the
+    # branch held this exact commit). Continue only if GitHub's branch is exactly HEAD; otherwise fail as before.
+    now = sh("git", *git_auth(), "ls-remote", f"https://github.com/{REPO}.git", f"refs/heads/{branch}").split()
+    if not now or now[0] != head:
+        raise SystemExit(redact(f"push to GitHub {branch} failed: {push.stderr.strip()[-800:]}"))
+    print(f"NOTE: push reported a failure, but GitHub {branch} is exactly {head[:7]}; continuing: "
+          + redact(push.stderr.strip().splitlines()[-1] if push.stderr.strip() else "?"))
 owner = REPO.split("/")[0]
 existing = gh(f"/repos/{REPO}/pulls?head={owner}:{branch}&state=open") or []
 if existing:

@@ -1,5 +1,6 @@
 # Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
-# Actions -> Sync to upstream -> Run workflow, pick the branch (dry run is ticked by default). The button
+# Actions -> Sync to upstream -> Run workflow on main and type the branch to promote; it is a dry run unless
+# you type push into the confirm field (the dialog's branch picker also works, leaving the field blank). The button
 # works only for users listed in the SYNC_ACTORS variable (empty = button disabled). sync/dry-run/<name> runs
 # every check without pushing. Steps: .forgejo/actions/sync/sync.py.
 # SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
@@ -22,15 +23,30 @@ on:
     tags: ["sync/**"]
   workflow_dispatch:
     inputs:
+      branch:
+        description: "Branch to promote (start the run on main and type the branch here)"
+        required: false
+        default: ""
       name:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
         required: false
         default: ""
-      dry_run:
-        description: "Dry run: check and test everything, push nothing"
-        type: boolean
-        default: true
+      mode:
+        description: "dry-run (check and test, push nothing) or push (promote for real; also type push below)"
+        type: choice
+        options: [dry-run, push]
+        default: dry-run
+      confirm:
+        description: "With mode push: type push here as well"
+        required: false
+        default: ""
 
+# One sync at a time: a second run (e.g. the dialog submitted twice, 2026-11-01) waits instead of racing.
+concurrency:
+  group: sync-to-upstream
+  cancel-in-progress: false
+
+# Least privilege for the job token (restored 2026-11-02: the claim that Forgejo ignores this block is unverified).
 permissions:
   contents: read
 
@@ -49,13 +65,16 @@ jobs:
           python-version: "3.12"
       - name: Rebase, check, test, promote
         env:
+          PYTHONUNBUFFERED: "1"   # log lines carry their real time (a buffered run printed all at exit)
           GH_REPO: ${{ vars.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
           TAG: ${{ github.ref_name }}
           SYNC_EVENT: ${{ github.event_name }}
           SYNC_BRANCH: ${{ github.ref_name }}
+          SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
-          SYNC_DRY: ${{ inputs.dry_run }}
+          SYNC_CONFIRM: ${{ inputs.confirm }}
+          SYNC_INPUTS: ${{ toJSON(inputs) }}   # what the dialog actually sent: missing -> refuse (2026-11-02)
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
           FORGEJO_URL: ${{ github.server_url }}
