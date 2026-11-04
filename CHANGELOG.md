@@ -28,6 +28,19 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - Scanner patterns for internal infrastructure: private (RFC 1918) IPv4 addresses, the tailnet CGNAT range
   (100.64/10) and IPv6 prefix, and `*.ts.net` host names. Use documentation placeholders (e.g. 192.0.2.x,
   example.com) in shared code and docs.
+- **Epicor IdP sign-in** (`auth idp-login`, `auth idp-client`, module `kinetic_devops.idp`): sign in through the
+  environment's Epicor IdP in the browser (authorization code + PKCE, loopback redirect), so no password passes
+  through the CLI. Sessions renew with the refresh token without prompting; refreshes take a per-session lock
+  and re-read the stored token, so one-time (rotating) refresh tokens survive parallel runs. Expired IdP sessions
+  never fall back to a password prompt. `renew` refreshes IdP sessions. The IdP settings come from the server's
+  anonymous `/api/.configuration`, and the client ID is stored per IdP tenant. Setup, including registering a
+  native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
+  Hardened before release: https-only remote endpoints with certificate checks (the loopback redirect stays http,
+  RFC 8252); the discovery issuer must be the endpoint Kinetic names, with the authorize and token endpoints on its
+  host; the callback takes only the first response with the right `state` and checks `Host` and `iss` (RFC 9207);
+  the ID token's `iss`, `aud`/`azp`, `exp` and `nonce` are checked, and the IdP identity is stored (`idp-login`
+  warns if it doesn't look like `--user`); refresh locks live in a per-user 0700 directory and can't spin; a
+  refresh token the IdP rejects is dropped.
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
@@ -49,6 +62,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   file is scanned unless it is untracked or named by an explicit `--exclude`; git scans apply explicit excludes
   only. The built-in list only trims walks of explicit subpaths and non-git folders, and a file named with
   `--file` is always scanned unless explicitly excluded.
+- A cached token that needs a password no longer hangs non-interactive runs. Without a terminal, the
+  password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
+  instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
+  Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
 
 ## [0.2.0.0a8] - 2026-11-01
 

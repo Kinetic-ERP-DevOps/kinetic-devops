@@ -57,9 +57,11 @@ from urllib.parse import urlparse
 if __package__:
     from .KineticCore import KineticCore
     from . import crypto
+    from . import idp
 else:
     from kinetic_devops.KineticCore import KineticCore
     from kinetic_devops import crypto
+    from kinetic_devops import idp
 
 SERVICE_API_KEY = "epicor-kinetic-apikey"
 SERVICE_SERVERS = "epicor-kinetic-servers"
@@ -442,6 +444,7 @@ class KineticConfigManager(KineticCore):
             except Exception:
                 return None
 
+        data = idp.unpack(token_slot, data)
         try:
             stored_at = data.get("_local_timestamp", 0)
             expires_in = data.get("expires_in") or data.get("ExpiresIn") or DEFAULT_TTL_SEC
@@ -507,7 +510,7 @@ class KineticConfigManager(KineticCore):
         token_meta['_last_used'] = now
         
         # 3. Persist to Keyring (Obscured Slot)
-        keyring.set_password(slot, "current_token", json.dumps(token_meta))
+        keyring.set_password(slot, "current_token", json.dumps(idp.pack(slot, token_meta)))
         
         # 4. Register user in sessions list (CENTRALIZED LOGIC)
         if nickname:
@@ -641,9 +644,13 @@ class KineticConfigManager(KineticCore):
                     }
 
                     existing_token = headers.get("Authorization", "").replace("Bearer ", "").strip()
-                    renewed = self._renew_token_from_existing(renew_ctx, existing_token) if existing_token else None
-                    if not renewed and not passive:
-                        renewed = self._fetch_token_kinetic(renew_ctx)
+                    slot_meta = self._get_token_meta(slot) or {}
+                    if slot_meta.get("auth_method") == "idp":
+                        renewed = self._refresh_idp(slot, slot_meta, name, force=True)  # server rejected it
+                    else:
+                        renewed = self._renew_token_from_existing(renew_ctx, existing_token) if existing_token else None
+                        if not renewed and not passive:
+                            renewed = self._fetch_token_kinetic(renew_ctx)
 
                     if renewed:
                         refreshed = self._get_token_meta(slot) or {}
@@ -951,6 +958,7 @@ class KineticConfigManager(KineticCore):
             slot = self._get_token_key(name, user, cfg['api_key'])
             try:
                 keyring.delete_password(slot, "current_token")
+                idp.delete_secrets(slot)
                 print(f"🗑️ Cleared session for {user}")
             except: pass
         
@@ -1012,7 +1020,7 @@ class KineticConfigManager(KineticCore):
         if data:
             data['current_company'] = company_id
             # Re-save the updated JSON blob to the keyring
-            keyring.set_password(slot, "current_token", json.dumps(data))
+            keyring.set_password(slot, "current_token", json.dumps(idp.pack(slot, data)))
 
     def get_all_configs(self) -> Dict[str, Dict]:
         """Module API: Returns a dictionary of all stored configs with their current token status."""
@@ -1109,6 +1117,17 @@ class KineticConfigManager(KineticCore):
         token_slot = ctx.get('token_slot', '')
         nickname = ctx.get('nickname', '')
         company = ctx.get('company', '')
+
+        # getpass reads the console directly on Windows, not stdin, so without a terminal the prompt
+        # blocks forever instead of failing (a background run with an expired token hung for an hour).
+        # stdin decides: a redirected stdin means nobody is there to type; stdout may be piped
+        # (`... | tee log`) while a person still answers the prompt.
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                f"Token for {nickname or url} ({user_id or 'unknown user'}) needs a password, but there is no "
+                f"interactive terminal to prompt in. Run 'python -m kinetic_devops.auth renew {nickname}' "
+                "in a terminal, then retry."
+            )
 
         # If the caller did not provide a user_id (empty), prompt now.
         if not user_id:
@@ -1277,6 +1296,7 @@ class KineticConfigManager(KineticCore):
             try:
                 old_slot = self._get_token_key(name, user_id, old_key)
                 keyring.delete_password(old_slot, "current_token")
+                idp.delete_secrets(old_slot)
                 deleted_slots += 1
             except Exception:
                 pass
@@ -1432,6 +1452,73 @@ class KineticConfigManager(KineticCore):
 
         return False, f"probe failed: {last_status}"
 
+    # --- Epicor IdP sign-in (see kinetic_devops.idp and Documents/EPICOR_IDP_SIGNIN.md) ---
+
+    def idp_set_client(self, env_name: str, client_id: str = "") -> None:
+        """Store the tenant's registered IdP client ID (one per IdP tenant; environments on it share it)."""
+        name, cfg = self._find_env(self._get_server_dict(), env_name)
+        if not cfg:
+            print(f"❌ No environment named '{env_name}' found.")
+            return
+        settings = idp.discover(cfg["url"])
+        client_id = (client_id or getpass.getpass("IdP client ID (hidden): ")).strip()
+        if not client_id:
+            print("❌ No client ID entered; nothing stored.")
+            return
+        idp.set_client_id(settings["tenant"], client_id)
+        print(f"✅ Stored the IdP client ID for the IdP tenant used by {name}.")
+
+    def idp_login(self, env_name: str, user_id: str = "", company_id: str = "", port: int = 0) -> Optional[str]:
+        """Sign in through Epicor IdP in the browser and store the session like a password sign-in."""
+        name, cfg = self._find_env(self._get_server_dict(), env_name)
+        if not cfg:
+            print(f"❌ No environment named '{env_name}' found.")
+            return None
+        user_id = (user_id or os.environ.get("KIN_USER", "")).strip().lower()
+        if not user_id:
+            raise SessionResolutionError("Pass --user (your Epicor user ID) or set KIN_USER; it names the session.")
+        companies = [c.strip() for c in str(cfg.get("companies") or cfg.get("company") or "").split(",") if c.strip()]
+        company_id = company_id or (companies[0] if companies else "")
+        settings = idp.discover(cfg["url"])
+        client_id = idp.get_client_id(settings["tenant"])
+        if not client_id:
+            raise idp.IdPError(f"No IdP client ID stored for {name}'s IdP tenant. Register a native client "
+                               f"(Documents/EPICOR_IDP_SIGNIN.md), then run 'auth idp-client {name}'.")
+        tok = idp.login_browser(settings, client_id, port=port or idp.DEFAULT_PORT)
+        meta = idp.session_meta(tok, settings, user_id, name, company_id)
+        who = meta.get("idp_username", "")
+        if not idp.identity_matches(who, user_id):
+            print(f"⚠️ Signed in to Epicor IdP as {who}, but the session is named for --user {user_id}. If that isn't "
+                  "the same person, sign out of the IdP in the browser and run idp-login again.")
+        ok, reason = self._validate_bearer_access(url=cfg["url"], api_key=cfg.get("api_key", ""),
+                                                  company=company_id, token=meta["AccessToken"], user_id=user_id)
+        if not ok:
+            print(f"❌ Signed in to Epicor IdP, but Kinetic didn't accept the token ({reason}). Check that the "
+                  "IdP identity is mapped to an ERP user and the environment's API key is right.")
+            return None
+        slot = self._get_token_key(name, user_id, cfg.get("api_key", ""))
+        self.touch_session(slot, meta, name)
+        print(f"✅ Signed in to {name} as {user_id} through Epicor IdP (Co: {company_id}).")
+        return meta["AccessToken"]
+
+    def _refresh_idp(self, slot: str, meta: Dict, nickname: str, force: bool = False) -> Optional[str]:
+        """Refresh an IdP session without prompting; None when the refresh token is gone or expired."""
+        return idp.refresh_session(meta, reread=lambda: self._get_token_meta(slot),
+                                   store=lambda m: self.touch_session(slot, m, nickname), slot=slot, force=force)
+
+    def _renew_idp_or_raise(self, slot: str, meta: Dict, name: str, user_id: str, company: str,
+                            force: bool = False) -> Optional[str]:
+        """Expired IdP session: refresh; else sign in again in the browser when a person is at the terminal."""
+        token = self._refresh_idp(slot, meta, name, force=force)
+        if token:
+            return token
+        if sys.stdin.isatty():   # a person at the terminal (stdout may be piped): sign in again in the browser
+            return self.idp_login(name, user_id, company)
+        raise RuntimeError(
+            f"The Epicor IdP session for {name} ({user_id}) has expired and can't be refreshed. Run "
+            f"'uv run python -m kinetic_devops.auth idp-login {name} --user {user_id}' in a terminal, then retry."
+        )
+
     def renew(
         self,
         env_name: str = "",
@@ -1493,6 +1580,14 @@ class KineticConfigManager(KineticCore):
             "nickname": name,
             "company": company_id,
         }
+
+        slot_meta = self._get_token_meta(slot) or {}
+        if slot_meta.get("auth_method") == "idp":
+            token = self._renew_idp_or_raise(slot, slot_meta, name, user_id, company_id, force=True)
+            if token:
+                print(f"\n✅ IdP session renewed for {name}/{user_id} (Co: {company_id})")
+                self.use((name, user_id, company_id))
+            return
 
         if from_token:
             current_meta = self._get_token_meta(slot) or {}
@@ -1589,6 +1684,7 @@ class KineticConfigManager(KineticCore):
         for move in moves:
             if move["raw"]:
                 keyring.set_password(move["new_slot"], "current_token", move["raw"])
+                idp.move_secrets(move["old_slot"], move["new_slot"])
 
         # 2. Config entry, keeping its position and the vault's encryption.
         renamed = {(new_name if key == old_key else key): value for key, value in servers.items()}
@@ -1606,6 +1702,7 @@ class KineticConfigManager(KineticCore):
             if move["raw"] and move["old_slot"].lower() != move["new_slot"].lower():
                 try:
                     keyring.delete_password(move["old_slot"], "current_token")
+                    idp.delete_secrets(move["old_slot"])
                 except Exception:
                     pass
         return summary
@@ -1737,6 +1834,9 @@ class KineticConfigManager(KineticCore):
                     'company': company_id
                 }
                 token = self._fetch_token_kinetic(ctx)
+        elif meta and meta.get("auth_method") == "idp":
+            # IdP session: renew with the refresh token (no password exists to prompt for)
+            token = self._renew_idp_or_raise(slot, meta, name, user_id, company_id or meta.get("current_company", ""))
         else:
             # Pass the variables resolved earlier in the method
             ctx = {
@@ -1875,6 +1975,29 @@ class KineticConfigManager(KineticCore):
         # code/docs (refer to a Kinetic Cloud version instead). The NOTICE_ prefix
         # makes the scanner report these without failing. Case-sensitive, since
         # nicknames are often ordinary words.
+        # Epicor IdP: tenant IDs (from IdP sessions) and the registered client IDs stored per tenant.
+        # Tenant IDs are short numbers, so they are only matched in their endpoint form (".../tid/<n>").
+        tenants, client_ids = set(), set()
+        for name, config in servers.items():
+            for user in config.get("sessions", []) or []:
+                try:
+                    meta = self._get_token_meta(self._get_token_key(name, user, config.get("api_key", ""))) or {}
+                except Exception:
+                    meta = {}
+                if meta.get("idp_tenant"):
+                    tenants.add(str(meta["idp_tenant"]))
+        for tenant in tenants:
+            try:
+                cid = idp.get_client_id(tenant)
+            except Exception:
+                cid = ""
+            if cid:
+                client_ids.add(re.escape(cid))
+        if tenants:
+            patterns["IDP_TENANT_ENDPOINT"] = re.compile(r'tid/(' + '|'.join(map(re.escape, sorted(tenants))) + r')\b')
+        if client_ids:
+            patterns["IDP_CLIENT_IDS"] = re.compile(r'(?i)\b(' + '|'.join(sorted(client_ids)) + r')\b')
+
         nicknames = sorted({str(n).strip() for n in servers if len(str(n).strip()) >= 3}, key=len, reverse=True)
         if nicknames:
             patterns["NOTICE_ENV_NICKNAMES"] = re.compile(r'\b(' + '|'.join(map(re.escape, nicknames)) + r')\b')
@@ -1919,6 +2042,7 @@ class KineticConfigManager(KineticCore):
                 slot = f"{env_name}-{user.lower()}-{key_hash}"
                 try:
                     keyring.delete_password(slot, "current_token")
+                    idp.delete_secrets(slot)
                     deleted_count += 1
                 except:
                     pass
@@ -2092,6 +2216,7 @@ class KineticConfigManager(KineticCore):
             for _, _, slot in orphans_found:
                 try:
                     keyring.delete_password(slot, "current_token")
+                    idp.delete_secrets(slot)
                     print(f"   ✅ Deleted {slot}")
                 except: pass
             print("✨ Cleanup complete.")
@@ -2375,6 +2500,34 @@ def main():
         "--allow-password-fallback", action="store_true",
         help="With --from-token: if token renewal fails, fall back to the password prompt.",
     )
+
+    idp_login_p = subparsers.add_parser(
+        "idp-login",
+        help="Sign in through Epicor IdP in the browser (no password in the CLI); renewals use the refresh token.",
+        description=(
+            "Opens the browser at the environment's Epicor IdP sign-in (Azure AD, SAML, ... as the tenant allows),\n"
+            "receives the code on http://127.0.0.1:<port>/callback, checks the token against Kinetic, and stores the\n"
+            "session like a password sign-in. Needs the tenant's registered client ID ('idp-client') once.\n"
+            "Setup: Documents/EPICOR_IDP_SIGNIN.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n  python -m kinetic_devops.auth idp-login MyTestEnv --user jdoe --co ACME",
+    )
+    idp_login_p.add_argument("env", metavar="ENV", help="Environment nickname.")
+    idp_login_p.add_argument("--user", default="", metavar="USER_ID",
+                             help="Epicor user ID that names the session. Default: KIN_USER.")
+    idp_login_p.add_argument("--co", default="", metavar="COMPANY", help="Company. Default: the first configured.")
+    idp_login_p.add_argument("--port", type=int, default=0,
+                             help="Loopback redirect port registered on the client (default 8765).")
+
+    idp_client_p = subparsers.add_parser(
+        "idp-client",
+        help="Store the Epicor IdP client ID for ENV's IdP tenant (prompted, hidden).",
+        description="Stores the registered native client's ID in the keyring, keyed by IdP tenant, so every\n"
+                    "environment on that tenant uses it. See Documents/EPICOR_IDP_SIGNIN.md.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    idp_client_p.add_argument("env", metavar="ENV", help="Any environment on the IdP tenant.")
 
     subparsers.add_parser(
         "reset-pointer",
@@ -2660,6 +2813,10 @@ def main():
                 from_token=bool(args.from_token),
                 allow_password_fallback=bool(args.allow_password_fallback),
             )
+        elif args.command == "idp-login":
+            mgr.idp_login(args.env, args.user, args.co, port=args.port)
+        elif args.command == "idp-client":
+            mgr.idp_set_client(args.env)
         elif args.command == "reset-pointer": mgr.reset_pointer()
         elif args.command == "full-wipe": mgr.full_wipe()
         elif args.command == "dump": mgr.dump()
