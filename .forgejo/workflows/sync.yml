@@ -1,8 +1,7 @@
 # Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
 # Actions -> Sync to upstream -> Run workflow on main and type the branch to promote; it is a dry run unless
-# you type push into the confirm field (the dialog's branch picker also works, leaving the field blank). The button
-# works only for users listed in the SYNC_ACTORS variable (empty = button disabled). sync/dry-run/<name> runs
-# every check without pushing. Steps: .forgejo/actions/sync/sync.py.
+# you type push into the confirm field. The button works only for users listed in the SYNC_ACTORS variable
+# (empty = button disabled). sync/dry-run/<name> runs every check without pushing. Steps: .forgejo/actions/sync/sync.py.
 # SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
 # own files, so anyone with WRITE ACCESS to this repo can push a workflow that reads GH_PUSH_TOKEN. Who can
 # write here = who can publish upstream. Before granting anyone else write access, move the token out of
@@ -35,13 +34,8 @@ on:
         type: string
         required: false
         default: ""
-      mode:
-        description: "dry-run (check and test, push nothing) or push (promote for real; also type push below)"
-        type: choice
-        options: [dry-run, push]
-        default: dry-run
       confirm:
-        description: "With mode push: type push here as well"
+        description: "Type push to push to GitHub and open the PR; blank = dry run (check and test, push nothing)"
         type: string
         required: false
         default: ""
@@ -79,7 +73,7 @@ jobs:
           SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
           SYNC_CONFIRM: ${{ inputs.confirm }}
-          SYNC_INPUTS: ${{ toJSON(inputs) }}   # what the dialog actually sent: missing -> refuse (2026-11-02)
+          SYNC_INPUTS: ${{ toJSON(inputs) }}   # what the dialog actually sent (logged)
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
           FORGEJO_URL: ${{ github.server_url }}
