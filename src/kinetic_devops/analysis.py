@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -167,6 +168,58 @@ def _ai_client_settings(base_url: str) -> tuple[str, dict[str, str]]:
     return (style or "openai"), headers
 
 
+# Built-in review budget, sized for small (~4k-context) models; see auth.AI_BUDGET_PRESETS.
+DEFAULT_MAX_DIFF_CHARS = 4500
+DEFAULT_MAX_OUTPUT_TOKENS = 360
+DEFAULT_RETRY_OUTPUT_TOKENS = 220
+DEFAULT_TEMPERATURE = 0.15  # unless the profile sets sampling (auth ai-set --sampling)
+DEFAULT_MAX_CHUNKS = 20  # per reviewed item; beyond this the item is INCOMPLETE, never GO
+MIN_DIFF_CHARS = 200  # smaller chunks can't hold a file header plus any diff
+
+
+def _positive_int(value: Any, source: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} must be a positive integer, got {value!r}") from None
+    if number <= 0:
+        raise ValueError(f"{source} must be a positive integer, got {value!r}")
+    return number
+
+
+def resolve_ai_budget(
+    base_url: str,
+    max_diff_chars: int | None = None,
+    max_output_tokens: int | None = None,
+    max_chunks: int | None = None,
+) -> dict[str, int]:
+    """Review budget for this AI server. Each setting, highest first: explicit
+    argument (CLI flag) -> the matching stored profile's budget -> env
+    KINETIC_AI_MAX_DIFF_CHARS / KINETIC_AI_MAX_TOKENS / KINETIC_AI_MAX_CHUNKS -> built-in
+    default. Diffs larger than max_diff_chars are reviewed in chunks of that size, up to
+    max_chunks per item. The retry answer keeps the default ratio (360 -> 220)."""
+    budget = _profile_for_url(base_url).get("budget") or {}
+    chars = (_positive_int(max_diff_chars, "--ai-max-diff-chars")
+             or _positive_int(budget.get("max_diff_chars"), "profile max_diff_chars")
+             or _positive_int(os.getenv("KINETIC_AI_MAX_DIFF_CHARS"), "KINETIC_AI_MAX_DIFF_CHARS")
+             or DEFAULT_MAX_DIFF_CHARS)
+    if chars < MIN_DIFF_CHARS:
+        raise ValueError(f"The review diff budget must be at least {MIN_DIFF_CHARS} characters, got {chars}")
+    tokens =(_positive_int(max_output_tokens, "--ai-max-tokens")
+              or _positive_int(budget.get("max_output_tokens"), "profile max_output_tokens")
+              or _positive_int(os.getenv("KINETIC_AI_MAX_TOKENS"), "KINETIC_AI_MAX_TOKENS")
+              or DEFAULT_MAX_OUTPUT_TOKENS)
+    chunk_cap = (_positive_int(max_chunks, "--ai-max-chunks")
+                 or _positive_int(budget.get("max_chunks"), "profile max_chunks")
+                 or _positive_int(os.getenv("KINETIC_AI_MAX_CHUNKS"), "KINETIC_AI_MAX_CHUNKS")
+                 or DEFAULT_MAX_CHUNKS)
+    retry = max(1, round(tokens * DEFAULT_RETRY_OUTPUT_TOKENS / DEFAULT_MAX_OUTPUT_TOKENS))
+    return {"max_diff_chars": chars, "max_output_tokens": tokens, "retry_output_tokens": retry,
+            "max_chunks": chunk_cap}
+
+
 def select_model(models: list[str], base_url: str) -> str:
     """The matching profile's default model when the server offers it, else the first listed."""
     preferred = str(_profile_for_url(base_url).get("model") or "").strip()
@@ -210,33 +263,82 @@ def fetch_models(base_url: str, timeout: int) -> list[str]:
 
 def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: int = 360) -> dict[str, Any]:
     style, headers = _ai_client_settings(base_url)
-    if style == "openwebui":
-        # Open WebUI exposes the chat API only; the prompt becomes a single user message.
-        url = f"{normalize_base_url(base_url)}/api/chat/completions"
+    if style in ("openwebui", "openai-chat"):
+        # Chat API (Open WebUI only has this one; openai-chat suits chat-tuned models on any
+        # OpenAI-compatible server). The prompt becomes a single user message.
+        path = "/api/chat/completions" if style == "openwebui" else "/v1/chat/completions"
+        url = f"{normalize_base_url(base_url)}{path}"
         body = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.15,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
         }
     else:
         url = f"{normalize_base_url(base_url)}/v1/completions"
         body = {
             "model": model,
             "prompt": prompt,
-            "temperature": 0.15,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
         }
+    # Profile extras (thinking off, sampling, ...); the reserved fields above always win.
+    extra = _profile_for_url(base_url).get("extra_body") or {}
+    body = {**{k: v for k, v in extra.items() if k not in body}, **body}
+    body.setdefault("temperature", DEFAULT_TEMPERATURE)
     req = request.Request(
         url=url,
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
+    # Streamed so that giving up actually stops the work: closing the connection frees the server
+    # slot within seconds, while an abandoned non-streaming request runs on until it finishes.
+    # `timeout` is a deadline for the whole answer (urlopen's own timeout is per socket read).
+    deadline = time.monotonic() + timeout
     with request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+        return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"))
+
+
+def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
+    """Collect a server-sent-events answer into the non-streaming response shape.
+
+    A server that ignores ``stream`` and returns plain JSON is accepted as-is.
+    """
+    first = resp.readline()
+    while first and not first.strip():
+        first = resp.readline()
+    if not first.lstrip().startswith(b"data:"):
+        return json.loads((first + resp.read()).decode("utf-8", errors="replace"))
+    parts: list[str] = []
+    finish_reason = None
+    usage = None
+    line = first
+    while line:
+        if time.monotonic() > deadline:
+            raise TimeoutError("AI response exceeded the request deadline")
+        text = line.decode("utf-8", errors="replace").strip()
+        if text.startswith("data:"):
+            data = text[5:].strip()
+            if data == "[DONE]":
+                break
+            event = json.loads(data)
+            if event.get("error"):
+                raise RuntimeError(f"AI stream error: {event['error']}")
+            usage = event.get("usage") or usage
+            for choice in event.get("choices") or []:
+                piece = (choice.get("delta") or {}).get("content") if chat else choice.get("text")
+                if isinstance(piece, str):
+                    parts.append(piece)
+                finish_reason = choice.get("finish_reason") or finish_reason
+        line = resp.readline()
+    content = "".join(parts)
+    choice = {"message": {"role": "assistant", "content": content}} if chat else {"text": content}
+    choice["finish_reason"] = finish_reason
+    result: dict[str, Any] = {"choices": [choice]}
+    if usage:
+        result["usage"] = usage
+    return result
 
 
 def extract_text(ai_response: dict[str, Any]) -> str:
@@ -257,6 +359,120 @@ def truncate_text(text: str, max_chars: int = 4500) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n...[truncated]"
+
+
+def _hard_split(text: str, max_chars: int) -> list[str]:
+    """Split text into pieces of at most max_chars, at line ends where possible."""
+    if max_chars < 1:
+        raise ValueError(f"max_chars must be positive, got {max_chars}")
+    pieces: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > max_chars:  # a single overlong line (minified file, data blob)
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(line[:max_chars])
+            line = line[max_chars:]
+        if current and len(current) + len(line) > max_chars:
+            pieces.append(current)
+            current = ""
+        current += line
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def split_diff_chunks(patch_text: str, max_chars: int = DEFAULT_MAX_DIFF_CHARS) -> list[str]:
+    """Split a patch into chunks of at most max_chars so a small model can review all of it.
+
+    Splits at file boundaries first, then at hunk boundaries (each hunk keeps its file header,
+    so the model knows which file it is reading), and only then by lines. Consecutive small
+    pieces are packed together. A patch that fits is returned unchanged as one chunk.
+    """
+    if len(patch_text) <= max_chars:
+        return [patch_text]
+    pieces: list[str] = []
+    for section in re.split(r"(?m)^(?=diff --(?:git|cc|combined) )", patch_text):
+        if not section:
+            continue
+        if len(section) <= max_chars:
+            pieces.append(section)
+            continue
+        parts = re.split(r"(?m)^(?=@@)", section)
+        header, hunks = parts[0], parts[1:]
+        if not hunks:
+            pieces.extend(_hard_split(section, max_chars))
+            continue
+        if len(header) > max_chars // 2:  # e.g. very long rename/mode lines
+            header = header[: max_chars // 2] + "\n"
+        room = max_chars - len(header)
+        for hunk in hunks:
+            for part in (_hard_split(hunk, room) if len(hunk) > room else [hunk]):
+                pieces.append(header + part)
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        if current and len(current) + len(piece) > max_chars:
+            chunks.append(current)
+            current = ""
+        current += piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+VERDICTS = ("GO", "NO-GO", "UNKNOWN", "INCOMPLETE")
+
+
+_VERDICT_LINE = re.compile(r"^[\s*#>_`]*VERDICT[\s*_`]*:[\s*_`]*(NO[- ]GO|GO)\b(.*)$", re.IGNORECASE | re.MULTILINE)
+_VERDICT_WORD = re.compile(r"\bNO[- ]GO\b|\bGO\b", re.IGNORECASE)
+
+
+def parse_verdict(review_text: str) -> str:
+    """GO / NO-GO from the leading "VERDICT:" line the prompt asks for; else from the final
+    GO/NO-GO section (NO-GO wins); else UNKNOWN (e.g. an answer cut off before any verdict).
+    A VERDICT line naming both ("VERDICT: GO or VERDICT: NO-GO") is the instruction echoed back,
+    not a decision: it is ignored, including by the fallback.
+    A leading GO is overruled by a later explicit "VERDICT: NO-GO" line or a final GO/NO-GO section
+    that says NO-GO: an answer quoting a "VERDICT: GO" from the diff (a prompt injection) near its
+    start must not pass as GO when its own conclusion is NO-GO. Disagreement fails safe."""
+    text = review_text or ""
+    lead = None
+    for m in _VERDICT_LINE.finditer(text[:400]):
+        if not _VERDICT_WORD.search(m.group(2)):
+            lead = "NO-GO" if m.group(1).upper().startswith("NO") else "GO"
+            break
+    text = "\n".join(line for line in text.splitlines()
+                     if not (_VERDICT_LINE.match(line) and len(_VERDICT_WORD.findall(line)) > 1))
+    idx = text.upper().rfind("GO/NO-GO")
+    if lead == "NO-GO":
+        return "NO-GO"
+    if lead == "GO":
+        later_no_go = any(m.group(1).upper().startswith("NO") and not _VERDICT_WORD.search(m.group(2))
+                          for m in _VERDICT_LINE.finditer(text))
+        section = text[idx + len("GO/NO-GO"):] if idx >= 0 else ""   # no heading: trust the lead line
+        if later_no_go or re.search(r"\bNO[- ]GO\b", section, re.IGNORECASE):
+            return "NO-GO"
+        return "GO"
+    tail = text[idx + len("GO/NO-GO"):] if idx >= 0 else text[-600:]
+    if re.search(r"\bNO[- ]GO\b", tail, re.IGNORECASE):
+        return "NO-GO"
+    if re.search(r"\bGO\b", tail):
+        return "GO"
+    return "UNKNOWN"
+
+
+def combine_verdicts(verdicts: list[str], unreviewed_chunks: int = 0) -> str:
+    """Overall verdict for an item reviewed in chunks: any NO-GO -> NO-GO; any UNKNOWN -> UNKNOWN;
+    chunks left unreviewed (chunk cap) -> INCOMPLETE; GO only if every chunk said GO."""
+    if "NO-GO" in verdicts:
+        return "NO-GO"
+    if not verdicts or "UNKNOWN" in verdicts:
+        return "UNKNOWN"
+    if unreviewed_chunks:
+        return "INCOMPLETE"
+    return "GO"
 
 
 def parse_changed_paths_from_patch(patch_text: str) -> list[str]:
@@ -286,13 +502,14 @@ def is_rogue_commit(subject: str, paths: list[str]) -> bool:
     return risk_from_paths(paths) == "high"
 
 
-def build_snapshot_item(repo: Path) -> dict[str, Any]:
+def build_snapshot_item(repo: Path, max_chars: int = DEFAULT_MAX_DIFF_CHARS) -> dict[str, Any]:
     status = run_git(repo, ["status", "--porcelain=v1"], timeout=30)
     unstaged = run_git(repo, ["diff", "--", "."], timeout=60)
     staged = run_git(repo, ["diff", "--cached", "--", "."], timeout=60)
 
     snapshot_patch = (staged.out or "") + "\n" + (unstaged.out or "")
     paths = parse_changed_paths_from_patch(snapshot_patch)
+    chunks = split_diff_chunks(snapshot_patch or "No diff", max_chars)
 
     return {
         "id": "snapshot-working-tree",
@@ -300,11 +517,14 @@ def build_snapshot_item(repo: Path) -> dict[str, Any]:
         "status": status.out.strip(),
         "paths": paths,
         "risk_hint": risk_from_paths(paths),
-        "payload": truncate_text(snapshot_patch or "No diff"),
+        "payload": chunks[0],
+        "chunks": chunks,
     }
 
 
-def build_commit_items(repo: Path, base_ref: str, max_commits: int) -> list[dict[str, Any]]:
+def build_commit_items(
+    repo: Path, base_ref: str, max_commits: int, max_chars: int = DEFAULT_MAX_DIFF_CHARS
+) -> list[dict[str, Any]]:
     rev_range = f"{base_ref}..HEAD"
     revs = run_git(repo, ["rev-list", "--reverse", f"--max-count={max_commits}", rev_range], timeout=30)
     if revs.code != 0:
@@ -328,6 +548,7 @@ def build_commit_items(repo: Path, base_ref: str, max_commits: int) -> list[dict
         subject = meta_lines[4] if len(meta_lines) >= 5 else ""
         paths = parse_changed_paths_from_patch(patch.out)
         rogue = is_rogue_commit(subject, paths)
+        chunks = split_diff_chunks(patch.out or "", max_chars)
 
         items.append(
             {
@@ -341,7 +562,8 @@ def build_commit_items(repo: Path, base_ref: str, max_commits: int) -> list[dict
                 "paths": paths,
                 "risk_hint": risk_from_paths(paths),
                 "rogue_candidate": rogue,
-                "payload": truncate_text(patch.out or ""),
+                "payload": chunks[0],
+                "chunks": chunks,
             }
         )
     return items
@@ -350,9 +572,15 @@ def build_commit_items(repo: Path, base_ref: str, max_commits: int) -> list[dict
 def build_prompt(repo: str, base_ref: str, item: dict[str, Any]) -> str:
     common = (
         "You are reviewing one local git delta for regression and functionality-loss risk.\n"
-        "Policy context: D:/Kinetic_SDK is active authoritative root.\n"
+        f"Policy context: {_default_active_root().replace(chr(92), '/')} is active authoritative root.\n"
         "Do not request raw secrets or unrelated code. Use the provided git metadata and diff only.\n"
-        "Return concise markdown with these exact sections:\n"
+        + (
+            f"This is chunk {item['chunk_index']} of {item['chunk_count']} of this delta; judge what is shown "
+            "and name anything that depends on code outside this chunk.\n"
+            if item.get("chunk_count", 1) > 1 else ""
+        )
+        + "Start your answer with exactly one line: VERDICT: GO or VERDICT: NO-GO (your overall call,\n"
+        "so it survives if the answer is cut short). Then return concise markdown with these exact sections:\n"
         "1) Change Classification\n"
         "2) Functionality Loss Risk\n"
         "3) Regression Risk\n"
@@ -372,6 +600,8 @@ def build_prompt(repo: str, base_ref: str, item: dict[str, Any]) -> str:
         "paths": item.get("paths", []),
         "status": item.get("status", ""),
     }
+    if item.get("chunk_count", 1) > 1:
+        header["chunk"] = f"{item['chunk_index']}/{item['chunk_count']}"
 
     return common + "\nDelta metadata:\n" + json.dumps(header, indent=2) + "\n\nDiff payload:\n" + item.get("payload", "")
 
@@ -390,7 +620,8 @@ def build_retry_prompt(repo: str, base_ref: str, item: dict[str, Any]) -> str:
     }
     return (
         "Review this single git delta for regression/functionality-loss risk. "
-        "Return markdown with short bullets for: classification, risks, checks, go/no-go.\n\n"
+        "Start with one line: VERDICT: GO or VERDICT: NO-GO. "
+        "Then return markdown with short bullets for: classification, risks, checks, go/no-go.\n\n"
         + json.dumps(compact, indent=2)
     )
 
@@ -410,7 +641,18 @@ def render_master_summary(run_report: dict[str, Any]) -> str:
         ident = item.get("id")
         rogue = item.get("rogue_candidate", False)
         out_md = item.get("output_md")
-        lines.append(f"- {label}: {ident} | rogue_candidate={rogue} | report={out_md}")
+        verdict = item.get("verdict")
+        extra = f" | verdict={verdict}" if verdict else ""
+        if item.get("chunk_count", 1) > 1:
+            extra += f" | chunks={item.get('chunks_reviewed')}/{item.get('chunk_count')}"
+        if item.get("cut_off_answers"):
+            extra += f" | cut_off={item['cut_off_answers']}"
+        lines.append(f"- {label}: {ident} | rogue_candidate={rogue}{extra} | report={out_md}")
+    cut = sum(i.get("cut_off_answers", 0) for i in run_report["items"])
+    if cut:
+        lines.append("")
+        lines.append(f"- {cut} answer(s) hit max_tokens without a verdict (each retried once). If this is "
+                     "frequent, raise the output budget (--preset large-thinking) or turn thinking off.")
     lines.append("")
     lines.append("## Note")
     lines.append("- These are analysis-only outputs. No commit, push, or branch rewrite actions are performed.")
@@ -678,6 +920,66 @@ def _render_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _finish_reason(ai_resp: dict[str, Any]) -> str:
+    choices = ai_resp.get("choices") or [{}]
+    return str((choices[0] or {}).get("finish_reason") or "")
+
+
+def _review_chunk(base_url: str, timeout: int, model: str, budget: dict[str, int], repo: str,
+                  base_ref: str, item: dict[str, Any]) -> dict[str, Any]:
+    """Review one chunk: prompt, response, text, error, verdict, finish_reason, cut_off.
+    An answer cut off at max_tokens (finish_reason "length") without a verdict, typically a
+    thinking model that used the budget thinking or looped, is asked once more with the same
+    prompt (a fresh sample usually finishes). A failed call is retried once with the compact
+    prompt, which carries no diff, so that chunk's verdict is UNKNOWN whatever it says."""
+    prompt = build_prompt(repo, base_ref, item)
+    cut_off = 0
+    try:
+        ai_resp = call_ai(base_url, timeout, model, prompt, max_tokens=budget["max_output_tokens"])
+        ai_text = extract_text(ai_resp)
+        error = ""
+        if _finish_reason(ai_resp) == "length" and parse_verdict(ai_text) == "UNKNOWN":
+            cut_off = 1
+            ai_resp = call_ai(base_url, timeout, model, prompt, max_tokens=budget["max_output_tokens"])
+            ai_text = extract_text(ai_resp)
+            if _finish_reason(ai_resp) == "length" and parse_verdict(ai_text) == "UNKNOWN":
+                cut_off = 2
+                error = ("answer cut off at max_tokens twice without a verdict; raise the output budget "
+                         "(e.g. --preset large-thinking) or turn thinking off (ai-set --no-thinking)")
+    except Exception as exc:
+        retry_prompt = build_retry_prompt(repo, base_ref, item)
+        try:
+            ai_resp = call_ai(base_url, max(20, timeout // 2), model, retry_prompt,
+                              max_tokens=budget["retry_output_tokens"])
+            ai_text = extract_text(ai_resp)
+            error = f"retry_used_after: {exc}"
+            prompt = retry_prompt
+        except Exception as retry_exc:
+            ai_resp = {"error": str(retry_exc)}
+            ai_text = "(AI call failed for this item)"
+            error = f"initial: {exc}; retry: {retry_exc}"
+    verdict = parse_verdict(ai_text) if not error else "UNKNOWN"
+    return {"chunk_index": item.get("chunk_index", 1), "prompt": prompt, "response": ai_resp,
+            "text": ai_text, "error": error, "verdict": verdict,
+            "finish_reason": _finish_reason(ai_resp), "cut_off": cut_off}
+
+
+def render_chunked_review(results: list[dict[str, Any]], chunk_count: int, verdict: str, unreviewed: int) -> str:
+    """Markdown for an item reviewed in several chunks, with a deterministic overall verdict."""
+    lines: list[str] = []
+    for r in results:
+        lines += [f"## Chunk {r['chunk_index']} of {chunk_count} (verdict: {r['verdict']})", "", r["text"].strip(), ""]
+    counts = {v: sum(1 for r in results if r["verdict"] == v) for v in ("GO", "NO-GO", "UNKNOWN")}
+    lines += ["## Overall", "",
+              f"- Verdict: **{verdict}** (chunks: {counts['GO']} GO, {counts['NO-GO']} NO-GO, "
+              f"{counts['UNKNOWN']} UNKNOWN; not reviewed: {unreviewed})",
+              "- Rule: any NO-GO -> NO-GO; any UNKNOWN -> UNKNOWN; unreviewed chunks -> INCOMPLETE; "
+              "GO only if every chunk is GO."]
+    if unreviewed:
+        lines.append(f"- {unreviewed} chunk(s) exceeded the chunk cap (--ai-max-chunks / KINETIC_AI_MAX_CHUNKS).")
+    return "\n".join(lines) + "\n"
+
+
 def _run_diff_review(args: argparse.Namespace) -> int:
     repo = Path(args.repo)
     out_dir = Path(args.out_dir)
@@ -694,46 +996,51 @@ def _run_diff_review(args: argparse.Namespace) -> int:
     if not models:
         raise RuntimeError("No local AI models available")
     model = select_model(models, ai_base_url)
+    budget = resolve_ai_budget(ai_base_url, args.ai_max_diff_chars, args.ai_max_tokens, args.ai_max_chunks)
 
-    items = [build_snapshot_item(repo)]
-    items.extend(build_commit_items(repo, base_ref=base_ref, max_commits=args.max_commits))
+    items = [build_snapshot_item(repo, max_chars=budget["max_diff_chars"])]
+    items.extend(build_commit_items(repo, base_ref=base_ref, max_commits=args.max_commits,
+                                    max_chars=budget["max_diff_chars"]))
 
     reviewed_items: list[dict[str, Any]] = []
     for idx, item in enumerate(items, start=1):
-        prompt = build_prompt(str(repo), base_ref, item)
-        try:
-            ai_resp = call_ai(ai_base_url, args.ai_timeout, model, prompt, max_tokens=360)
-            ai_text = extract_text(ai_resp)
-            error = ""
-        except Exception as exc:
-            retry_prompt = build_retry_prompt(str(repo), base_ref, item)
-            try:
-                ai_resp = call_ai(ai_base_url, max(20, args.ai_timeout // 2), model, retry_prompt, max_tokens=220)
-                ai_text = extract_text(ai_resp)
-                error = f"retry_used_after: {exc}"
-                prompt = retry_prompt
-            except Exception as retry_exc:
-                ai_resp = {"error": str(retry_exc)}
-                ai_text = "(AI call failed for this item)"
-                error = f"initial: {exc}; retry: {retry_exc}"
+        chunks = item.get("chunks") or [item.get("payload", "")]
+        reviewed_chunks = chunks[: budget["max_chunks"]]
+        unreviewed = len(chunks) - len(reviewed_chunks)
+        results = [
+            _review_chunk(ai_base_url, args.ai_timeout, model, budget, str(repo), base_ref,
+                          {**item, "payload": chunk, "chunk_index": n, "chunk_count": len(chunks)})
+            for n, chunk in enumerate(reviewed_chunks, start=1)
+        ]
+        verdict = combine_verdicts([r["verdict"] for r in results], unreviewed)
+        error = "; ".join(f"chunk {n}: {r['error']}" if len(results) > 1 else r["error"]
+                          for n, r in enumerate(results, start=1) if r["error"])
 
         stem = f"{idx:03d}_{item['type']}_{item['id'].replace('/', '_').replace(':', '_')}"
         json_path = out_dir / f"{stem}.json"
         md_path = out_dir / f"{stem}.md"
 
-        json_payload = {
-            "item": item,
-            "prompt": prompt,
-            "response": ai_resp,
-            "error": error,
-        }
+        if len(results) == 1 and not unreviewed:
+            json_payload = {"item": item, "prompt": results[0]["prompt"], "response": results[0]["response"],
+                            "error": error, "verdict": verdict}
+            ai_text = results[0]["text"]
+        else:
+            json_payload = {"item": item, "chunks": results, "error": error, "verdict": verdict,
+                            "unreviewed_chunks": unreviewed}
+            ai_text = render_chunked_review(results, len(chunks), verdict, unreviewed)
         json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
         md_path.write_text(ai_text, encoding="utf-8")
 
-        enriched = dict(item)
+        enriched = {k: v for k, v in item.items() if k != "chunks"}
         enriched["output_json"] = str(json_path)
         enriched["output_md"] = str(md_path)
         enriched["ai_error"] = error
+        enriched["verdict"] = verdict
+        enriched["chunk_count"] = len(chunks)
+        enriched["chunks_reviewed"] = len(results)
+        enriched["finish_reasons"] = [r["finish_reason"] for r in results]
+        # Answers that hit max_tokens without a verdict (retried once each; 2 = cut off again).
+        enriched["cut_off_answers"] = sum(r["cut_off"] for r in results)
         reviewed_items.append(enriched)
 
     run_report = {
@@ -911,6 +1218,10 @@ def _run_legacy_intake(args: argparse.Namespace) -> int:
             ai_base_url=ai_base_url,
             ai_timeout=args.ai_timeout,
             out_dir=str(repo_out),
+            # legacy-intake has no budget flags: the profile / env / built-in budget applies
+            ai_max_diff_chars=getattr(args, "ai_max_diff_chars", None),
+            ai_max_tokens=getattr(args, "ai_max_tokens", None),
+            ai_max_chunks=getattr(args, "ai_max_chunks", None),
         )
 
         try:
@@ -1196,6 +1507,20 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument(
         "--ai-timeout", metavar="SECONDS", type=int, default=int(_env("KINETIC_AI_TIMEOUT", "180")),
         help="Per-request AI timeout in seconds (default: KINETIC_AI_TIMEOUT or 180)",
+    )
+    diff.add_argument(
+        "--ai-max-diff-chars", metavar="N", type=int, default=None,
+        help="Diff characters per AI request; larger diffs are reviewed in several chunks (default: AI "
+        "profile budget, else KINETIC_AI_MAX_DIFF_CHARS, else 4500 for small models; see auth ai-set --preset)",
+    )
+    diff.add_argument(
+        "--ai-max-tokens", metavar="N", type=int, default=None,
+        help="Maximum answer tokens per review (default: AI profile budget, else KINETIC_AI_MAX_TOKENS, else 360)",
+    )
+    diff.add_argument(
+        "--ai-max-chunks", metavar="N", type=int, default=None,
+        help="Diffs larger than the diff budget are reviewed in chunks; at most N per item, beyond that "
+        "the item is INCOMPLETE (default: AI profile budget, else KINETIC_AI_MAX_CHUNKS, else 20)",
     )
     diff.add_argument(
         "--out-dir", metavar="DIR", default=_env("KINETIC_ANALYSIS_DIFF_OUT_DIR", _default_temp_path("snapshot_commit_ai")),

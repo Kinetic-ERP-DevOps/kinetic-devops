@@ -84,7 +84,9 @@ Common environment variables:
 - `KINETIC_ACTIVE_ROOT` (default: `D:\Kinetic_SDK`)
 - `KINETIC_AI_PROFILE`: one AI profile for runners without a keyring, as JSON or the path to a JSON
   file (for example a mounted secret): `{"v": 1, "base_url": "https://ai.example/v1", "api_style":
-  "openai", "model": "my-model", "api_key": "..."}` (only `base_url` is required). Normally profiles are
+  "openai-chat", "model": "my-model", "api_key": "...", "budget": {"max_diff_chars": 120000}}` (only
+  `base_url` is required). API styles: `openwebui`, `openai` (completions), or `openai-chat` for chat-tuned
+  models on any OpenAI-compatible server; `budget` as for `ai-set --preset` (see below). Normally profiles are
   stored in the keyring with `uv run python -m kinetic_devops.auth ai-set`, each as one entry in the same
   format (server, API style, model and key together). Profiles are named (`ai-set --name fast`,
   `--name deep`), share one key per server (setting it updates them all), and are chosen with
@@ -94,6 +96,37 @@ Common environment variables:
   `KINETIC_AI_PROFILE` is an error, not silently ignored.
 - `KINETIC_AI_BASE_URL` (URL-only fallback, without key or style)
 - `KINETIC_AI_TIMEOUT` (default: `180`)
+- `KINETIC_AI_MAX_DIFF_CHARS` / `KINETIC_AI_MAX_TOKENS` / `KINETIC_AI_MAX_CHUNKS` (defaults `4500` / `360` /
+  `20`): review budget, i.e. how much diff goes into one AI request and how long answers may be. A
+  larger diff is **reviewed in chunks** (split at file, then hunk boundaries; each hunk keeps its file
+  header), every chunk gets its own GO/NO-GO, and the item's verdict combines them: any NO-GO -> NO-GO,
+  any unreadable answer -> UNKNOWN, more chunks than the cap -> INCOMPLETE, GO only if every chunk is GO.
+  The defaults suit small (~4k-context) models. Bigger hardware: store a budget in the AI profile with
+  `auth ai-set --preset medium|large` (or `--max-diff-chars N --max-tokens N`) for fewer, larger chunks
+  with more context each. Order: `analysis diff --ai-max-diff-chars/--ai-max-tokens/--ai-max-chunks`,
+  then the profile's budget, then these variables, then the defaults.
+
+  | Preset | Typical model | `max_diff_chars` | `max_output_tokens` |
+  |---|---|---|---|
+  | `small` (default) | 3-4B, ~4k context | 4500 | 360 |
+  | `medium` | 7-14B, ~16k context | 24000 | 800 |
+  | `large` | 30B+, 64k+ context | 120000 | 1500 |
+  | `large-thinking` | 30B+ thinking model, 64k+ context | 120000 | 6000 |
+
+  Rule of thumb: characters ~= 3.5 x tokens; keep diff + prompt + answer under ~80% of the server's context.
+
+  **Thinking models** count their thinking against `max_tokens`, so an answer can run out before its
+  `VERDICT:` line (or loop until the limit). Such a cut-off answer (`finish_reason` `length`, no verdict)
+  is asked once more with the same prompt; if it is cut off again the chunk is UNKNOWN, and the run summary
+  counts cut-off answers (`cut_off=N`). Either leave room (`--preset large-thinking`) or turn thinking off
+  for gate reviews: `auth ai-set --no-thinking` stores `{"chat_template_kwargs": {"enable_thinking":
+  false}}` as the profile's `extra_body` (honoured by llama.cpp, vLLM and LiteLLM pass-through); any other
+  extra request fields with `--extra-body JSON` (e.g. `'{"reasoning_effort": "low"}'`; `'{}'` clears).
+  Sampling is per profile too: requests use temperature 0.15 unless the profile sets its own
+  (`temperature`, `top_p`, `top_k`, ... in `extra_body`). Use the model's recommended thinking-mode
+  sampling for thinking reviews: `auth ai-set --sampling qwen-thinking` (temperature 0.6, top_p 0.95,
+  top_k 20) got about twice as many labelled review cases right as 0.15 on Qwen3.6-35B-A3B. `--sampling default`
+  goes back to 0.15.
 - `KINETIC_ANALYSIS_MAX_COMMITS` (default: `20`)
 - `KINETIC_ANALYSIS_LEGACY_OUT_DIR` (default: `D:\Kinetic_SDK\temp\legacy_intake_reviews`)
 

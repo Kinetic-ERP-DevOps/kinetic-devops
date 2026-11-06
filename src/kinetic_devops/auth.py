@@ -67,14 +67,43 @@ SERVICE_API_KEY = "epicor-kinetic-apikey"
 SERVICE_SERVERS = "epicor-kinetic-servers"
 # Named AI server profiles for kinetic_devops.analysis. Each profile is one
 # self-contained keyring entry, "profile:<name>" -> {"v": 1, "base_url",
-# "api_style", "model", "api_key"}, so a profile carries its server, API style,
-# model and key together. A non-secret index under "profiles" ({"v": 2,
+# "api_style", "model", "api_key"[, "budget"][, "extra_body"]}, so a profile carries its server,
+# API style, model, key, review budget and extra request fields (thinking, sampling) together. A non-secret index under "profiles" ({"v": 2,
 # "default": name, "names": [...]}) lists them. Profiles on the same server share
 # its key: setting a key updates every profile for that URL. KINETIC_AI_PROFILE
 # supplies one profile in the same JSON format (inline, or a path to a JSON file)
 # for runners without a keyring; it is used when no profile is selected by name.
 SERVICE_AI = "kinetic-devops-ai"
-AI_API_STYLES = ("openai", "openwebui")
+AI_API_STYLES = ("openai", "openai-chat", "openwebui")
+# Review budget per AI call (kinetic_devops.analysis): how much diff goes into one request and
+# how long the answer may be. Larger diffs are reviewed in several chunks of that size (cap:
+# max_chunks, default 20). "small" is the built-in default (sized for ~4k-context models);
+# larger presets need fewer, bigger chunks. Rule of thumb: chars ~= 3.5 x tokens; keep diff + prompt
+# + answer under ~80% of the server's context size.
+AI_BUDGET_KEYS = ("max_diff_chars", "max_output_tokens", "max_chunks")
+AI_BUDGET_PRESETS: Dict[str, Dict[str, int]] = {
+    "small": {"max_diff_chars": 4500, "max_output_tokens": 360},      # 3-4B models, ~4k context
+    "medium": {"max_diff_chars": 24000, "max_output_tokens": 800},    # 7-14B models, ~16k context
+    "large": {"max_diff_chars": 120000, "max_output_tokens": 1500},   # 30B+ models, 64k+ context
+    # Thinking models spend max_tokens on thinking before the answer: leave room for it.
+    "large-thinking": {"max_diff_chars": 120000, "max_output_tokens": 6000},
+}
+# Extra request fields per profile (e.g. {"chat_template_kwargs": {"enable_thinking": false}},
+# {"reasoning_effort": "low"} or sampling settings), merged into every AI request; they may not
+# replace these:
+AI_RESERVED_REQUEST_KEYS = ("model", "messages", "prompt", "stream", "max_tokens")
+AI_NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
+# Sampling per profile (stored in extra_body). Without any, requests use temperature 0.15
+# (analysis.DEFAULT_TEMPERATURE). Recommended settings are model-specific: "qwen-thinking" is Qwen3's
+# thinking-mode recommendation; on Qwen3.6-35B-A3B it got about twice as many labelled code-review
+# cases right as temperature 0.15 (34 vs 16 of 102), and adding presence_penalty 1.0 did not help.
+# "default" removes every sampling field from the profile.
+AI_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                    "repetition_penalty")
+AI_SAMPLING_PRESETS: Dict[str, Dict[str, Any]] = {
+    "default": {},
+    "qwen-thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+}
 AI_DEFAULT_PROFILE = "default"
 AI_PROFILE_ENV = "KINETIC_AI_PROFILE"
 AI_PROFILE_VERSION = 1
@@ -116,12 +145,22 @@ def _json_dict(raw: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def _clean_profile(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """The stored shape of a profile: settings plus api_key (omitted when empty)."""
-    profile = {
+    """The stored shape of a profile: settings, budget and api_key (both omitted
+    when empty). An invalid budget raises ValueError (see validate_ai_budget)."""
+    profile: Dict[str, Any] = {
         "base_url": str(raw.get("base_url") or ""),
         "api_style": str(raw.get("api_style") or "openai"),
         "model": str(raw.get("model") or "").strip(),
     }
+    budget = raw.get("budget")
+    if budget is not None and not isinstance(budget, dict):
+        raise ValueError("AI profile budget must be a JSON object")
+    budget = validate_ai_budget(budget)
+    if budget:
+        profile["budget"] = budget
+    extra = validate_ai_extra_body(raw.get("extra_body"))
+    if extra:
+        profile["extra_body"] = extra
     key = str(raw.get("api_key") or "").strip()
     if key:
         profile["api_key"] = key
@@ -212,7 +251,7 @@ def list_ai_profiles() -> Tuple[str, Dict[str, Dict[str, Any]]]:
 
 def get_ai_profile(name: Optional[str] = None) -> Dict[str, Any]:
     """Settings of the named profile; without a name, the KINETIC_AI_PROFILE
-    profile if set, else the default one: base_url, api_style, model. {} if
+    profile if set, else the default one: base_url, api_style, model and, if set, budget. {} if
     there is no such profile. Never includes the key."""
     if not name:
         env = _env_ai_profile()
@@ -240,6 +279,33 @@ def get_ai_api_key(base_url: str) -> str:
     return ""
 
 
+def validate_ai_budget(budget: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """Budget with only known keys, each a positive int. {} for None/empty."""
+    clean: Dict[str, int] = {}
+    for key, value in (budget or {}).items():
+        if key not in AI_BUDGET_KEYS:
+            raise ValueError(f"Unknown budget setting {key!r}; expected one of {AI_BUDGET_KEYS}")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"Budget setting {key} must be a positive integer, got {value!r}")
+        clean[key] = value
+    return clean
+
+
+def validate_ai_extra_body(extra: Any) -> Dict[str, Any]:
+    """Extra request fields: a JSON object without the reserved keys. {} for None/empty."""
+    if extra is None or extra == {}:
+        return {}
+    if not isinstance(extra, dict):
+        raise ValueError("AI profile extra_body must be a JSON object")
+    reserved = sorted(set(extra) & set(AI_RESERVED_REQUEST_KEYS))
+    if reserved:
+        raise ValueError(f"extra_body may not set {reserved}; those come from the review itself")
+    try:
+        return json.loads(json.dumps(extra))
+    except (TypeError, ValueError):
+        raise ValueError("extra_body must contain only JSON values") from None
+
+
 def set_ai_profile(
     base_url: str,
     api_style: str = "openai",
@@ -247,9 +313,13 @@ def set_ai_profile(
     api_key: Optional[str] = None,
     name: str = AI_DEFAULT_PROFILE,
     make_default: bool = False,
+    budget: Optional[Dict[str, Any]] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create or replace a named profile; api_key=None keeps any existing key
-    for the URL. The first profile stored becomes the default."""
+    for the URL. The first profile stored becomes the default. budget (see
+    AI_BUDGET_PRESETS) is stored only when non-empty, so profiles without one
+    keep the built-in defaults."""
     url = _normalize_ai_url(base_url)
     name = str(name or "").strip()
     if not name or any(ch.isspace() for ch in name):
@@ -258,6 +328,12 @@ def set_ai_profile(
     if api_style not in AI_API_STYLES:
         raise ValueError(f"api_style must be one of {AI_API_STYLES}")
     profile = {"base_url": url, "api_style": api_style, "model": str(model or "").strip()}
+    clean_budget = validate_ai_budget(budget)
+    if clean_budget:
+        profile["budget"] = clean_budget
+    clean_extra = validate_ai_extra_body(extra_body)
+    if clean_extra:
+        profile["extra_body"] = clean_extra
     store = _read_ai_store()
     profiles = store["profiles"]
     same_server = [p for p in profiles.values() if _normalize_ai_url(p.get("base_url", "")) == url]
@@ -273,6 +349,14 @@ def set_ai_profile(
         store["default"] = name
     _write_ai_store(store)
     return profile
+
+
+def _format_ai_budget(profile: Dict[str, Any]) -> str:
+    budget = profile.get("budget") or {}
+    text = "budget: " + (", ".join(f"{k}={v}" for k, v in budget.items()) if budget else "built-in default (small)")
+    if profile.get("extra_body"):
+        text += f", extra: {json.dumps(profile['extra_body'], separators=(',', ':'))}"
+    return text
 
 
 def set_default_ai_profile(name: str) -> None:
@@ -2681,6 +2765,7 @@ def main():
             "examples:\n"
             "  uv run python -m kinetic_devops.auth ai-set --name deep --url http://ai-host:3000 --api-style openwebui --model local/deep --default\n"
             "  uv run python -m kinetic_devops.auth ai-set --name fast --url http://ai-host:3000 --api-style openwebui --model local/fast\n"
+            "  uv run python -m kinetic_devops.auth ai-set --name big --url http://gpu-host:4000 --api-style openai-chat --model local/deep --preset large\n"
             "  uv run python -m kinetic_devops.auth ai-show"
         ),
     )
@@ -2688,11 +2773,33 @@ def main():
     ai_set_p.add_argument("--url", default="", metavar="URL", help="AI server base URL (prompted if omitted).")
     ai_set_p.add_argument(
         "--api-style", choices=AI_API_STYLES, default=None,
-        help="openwebui: /api/models + /api/chat/completions; openai: /v1/models + /v1/completions "
-        "(prompted if omitted; default openwebui).",
+        help="openwebui: /api/models + /api/chat/completions; openai: /v1/models + /v1/completions; "
+        "openai-chat: /v1/models + /v1/chat/completions (prompted if omitted; default openwebui).",
     )
     ai_set_p.add_argument("--model", default=None, metavar="MODEL", help="Default model ID (blank = first listed by the server).")
     ai_set_p.add_argument("--default", action="store_true", dest="make_default", help="Make this the default profile.")
+    ai_set_p.add_argument(
+        "--preset", choices=sorted(AI_BUDGET_PRESETS), default=None,
+        help="Review budget for the model's size: small (default; ~4k context), medium (~16k), large (64k+), "
+        "large-thinking (64k+, room for a thinking model's reasoning). "
+        "Sets how much diff is sent per review and how long answers may be.",
+    )
+    ai_set_p.add_argument("--max-diff-chars", type=int, default=None, metavar="N",
+                          help="Override: diff characters sent per reviewed item (applied after --preset).")
+    ai_set_p.add_argument("--max-tokens", type=int, default=None, metavar="N",
+                          help="Override: maximum answer tokens per review (applied after --preset).")
+    thinking = ai_set_p.add_mutually_exclusive_group()
+    thinking.add_argument("--no-thinking", action="store_true",
+                          help="Ask the server to skip the model's thinking (sends chat_template_kwargs "
+                          "enable_thinking=false; llama.cpp, vLLM, LiteLLM). For fast gate reviews.")
+    thinking.add_argument("--extra-body", default=None, metavar="JSON",
+                          help="Extra JSON fields for every request, e.g. '{\"reasoning_effort\": \"low\"}'; '{}' clears.")
+    ai_set_p.add_argument(
+        "--sampling", choices=sorted(AI_SAMPLING_PRESETS), default=None,
+        help="Sampling for this profile's model (applied after --no-thinking / --extra-body): qwen-thinking = "
+        "temperature 0.6, top_p 0.95, top_k 20 (Qwen3 thinking mode); default = remove sampling fields "
+        "(temperature 0.15).",
+    )
     subparsers.add_parser(
         "ai-show",
         help="List the stored AI server profiles (never the keys themselves).",
@@ -2837,26 +2944,51 @@ def main():
             existing_model = (profiles.get(name) or {}).get("model", "")
             model = args.model if args.model is not None else (
                 input(f"Default model (blank = first available) [{existing_model}]: ").strip() or existing_model)
+            # Budget: --preset, then --max-diff-chars / --max-tokens on top; editing keeps the stored budget.
+            budget = dict((profiles.get(name) or {}).get("budget") or {})
+            if args.preset:
+                budget = dict(AI_BUDGET_PRESETS[args.preset])
+            if args.max_diff_chars is not None:
+                budget["max_diff_chars"] = args.max_diff_chars
+            if args.max_tokens is not None:
+                budget["max_output_tokens"] = args.max_tokens
+            # Extra request fields: --no-thinking / --extra-body; editing keeps the stored ones.
+            extra = dict((profiles.get(name) or {}).get("extra_body") or {})
+            if args.no_thinking:
+                extra = {**extra, **AI_NO_THINKING}
+            elif args.extra_body is not None:
+                try:
+                    extra = json.loads(args.extra_body)
+                except ValueError:
+                    raise ValueError("--extra-body must be a JSON object") from None
+            if args.sampling is not None:
+                if not isinstance(extra, dict):
+                    raise ValueError("--extra-body must be a JSON object")
+                extra = {k: v for k, v in extra.items() if k not in AI_SAMPLING_KEYS}
+                extra.update(AI_SAMPLING_PRESETS[args.sampling])
             had_key = bool(get_ai_api_key(url))
             key = getpass.getpass("API key (hidden; blank keeps the stored one): " if had_key else "API key (hidden): ").strip()
-            profile = set_ai_profile(url, style, model, api_key=key or None, name=name, make_default=args.make_default)
+            profile = set_ai_profile(url, style, model, api_key=key or None, name=name, make_default=args.make_default,
+                                     budget=budget, extra_body=extra)
             stored = "updated" if key else ("kept" if had_key else "none stored")
             is_default = " (default)" if list_ai_profiles()[0] == name else ""
             print(f"✅ AI profile '{name}'{is_default} saved: {profile['base_url']} ({profile['api_style']}), "
-                  f"model={profile['model'] or '<first available>'}, key {stored}.")
+                  f"model={profile['model'] or '<first available>'}, {_format_ai_budget(profile)}, key {stored}.")
         elif args.command == "ai-show":
             default_name, profiles = list_ai_profiles()
             env_profile = get_ai_profile() if os.environ.get(AI_PROFILE_ENV, "").strip() else {}
             if env_profile:
                 has_key = "yes" if get_ai_api_key(env_profile["base_url"]) else "no"
                 print(f"* {AI_PROFILE_ENV} (used when no --ai-profile is given): {env_profile['base_url']} "
-                      f"({env_profile['api_style']}), model={env_profile['model'] or '<first available>'}, api key: {has_key}")
+                      f"({env_profile['api_style']}), model={env_profile['model'] or '<first available>'}, "
+                      f"{_format_ai_budget(env_profile)}, api key: {has_key}")
             if not profiles and not env_profile:
                 print("No AI profile stored. Run: uv run python -m kinetic_devops.auth ai-set")
             for pname, profile in profiles.items():
                 has_key = "yes" if get_ai_api_key(profile.get("base_url", "")) else "no"
                 print(f"{'*' if pname == default_name and not env_profile else ' '} {pname}: {profile.get('base_url')} "
-                      f"({profile.get('api_style')}), model={profile.get('model') or '<first available>'}, api key: {has_key}")
+                      f"({profile.get('api_style')}), model={profile.get('model') or '<first available>'}, "
+                      f"{_format_ai_budget(profile)}, api key: {has_key}")
         elif args.command == "ai-default":
             set_default_ai_profile(args.name)
             print(f"✅ Default AI profile: {args.name}")
