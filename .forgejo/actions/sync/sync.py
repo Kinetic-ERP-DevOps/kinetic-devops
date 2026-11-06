@@ -125,7 +125,7 @@ if E.get("SYNC_EVENT") == "workflow_dispatch":
         sys.exit(f"sync: mode must be dry-run or push, got {mode!r}. Nothing was pushed.")
     if (mode == "push") != (confirm == "push"):
         sys.exit(f"sync: mode {mode!r} but confirm {confirm or 'blank'!r}: for a push choose mode push AND type push in "
-                 "confirm; for a dry run leave confirm blank. Nothing was pushed.")
+                 f"confirm; for a dry run leave confirm blank. Nothing was pushed. The dialog sent: {raw}")
     dry = mode == "dry-run"
     print(f"sync: dialog inputs {json.dumps(inputs, sort_keys=True)} -> {'dry run' if dry else 'push'}")
     TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
