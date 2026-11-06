@@ -2,7 +2,7 @@
 
 Triggered by pushing a tag sync/<name> (only allowed users can; protect sync/* in Forgejo).
 sync/dry-run/<name> runs every step except the push and the PR. The same runs from the Actions tab
-(Run workflow on the branch to promote; inputs: name, dry run). Steps:
+(Run workflow on main; inputs: branch, name, confirm: type push to push, blank = dry run). Steps:
   0. stop if the commit under test isn't the branch's head now (a re-run of an old run, a tag left behind)
   1. fetch GitHub main; rebase the tagged commits onto it (conflict -> stop, list files)
   2. guards: .github/workflows changes (push those from a workstation); "Closes/Fixes #N" must be open
@@ -106,28 +106,17 @@ if E.get("SYNC_EVENT") == "workflow_dispatch":
         sh("git", "checkout", "-q", "--detach", f"refs/remotes/origin/{src}")
         print(f"sync: checked out {src} at {sh('git', 'rev-parse', '--short', 'HEAD').strip()} (checks from {ref})")
     name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
-    # What the dialog sent. 2026-11-02: three runs recorded no inputs at all, so a push that was asked for ran as a
-    # dry run and reported success. `mode` has a non-empty default, so it is always sent by this workflow's dialog;
-    # without it the run can't know what was asked for and stops. A push needs mode=push AND "push" typed in
-    # confirm (a checkbox once arrived as false when ticked, 2026-11-01); any disagreement stops, nothing pushed.
+    # One control (owner, 2026-11-06): typing push in confirm pushes, blank is a dry run, anything else stops.
+    # Replaces mode + confirm (added after inputs went missing, 2026-11-01/02). Fail-safe direction: inputs that
+    # don't arrive mean a dry run, never a push; the log says DRY RUN. Forgejo drops blank fields, so a dry run
+    # may record no inputs at all.
     raw = (E.get("SYNC_INPUTS") or "").strip()
-    try:
-        inputs = json.loads(raw) if raw else None
-    except ValueError:
-        inputs = None
-    if not isinstance(inputs, dict) or "mode" not in inputs:
-        sys.exit(f"sync: the Run workflow dialog sent no usable inputs (received {raw or 'nothing'!r}), so it is unknown "
-                 "whether a dry run or a push was asked for. Nothing was pushed. Run it again from Actions -> Sync to "
-                 "upstream -> Run workflow, or use a sync/dry-run/<name> or sync/<name> tag.")
-    mode = str(inputs.get("mode") or "").strip().lower()
     confirm = (E.get("SYNC_CONFIRM") or "").strip().lower()
-    if mode not in ("dry-run", "push"):
-        sys.exit(f"sync: mode must be dry-run or push, got {mode!r}. Nothing was pushed.")
-    if (mode == "push") != (confirm == "push"):
-        sys.exit(f"sync: mode {mode!r} but confirm {confirm or 'blank'!r}: for a push choose mode push AND type push in "
-                 f"confirm; for a dry run leave confirm blank. Nothing was pushed. The dialog sent: {raw}")
-    dry = mode == "dry-run"
-    print(f"sync: dialog inputs {json.dumps(inputs, sort_keys=True)} -> {'dry run' if dry else 'push'}")
+    if confirm not in ("", "push"):
+        sys.exit(f"sync: confirm must be push (push for real) or blank (dry run), got {confirm!r}. Nothing was pushed. "
+                 f"The dialog sent: {raw or 'nothing'}")
+    dry = confirm != "push"
+    print(f"sync: dialog inputs {raw or 'none'} -> {'DRY RUN (confirm blank): nothing will be pushed' if dry else 'push'}")
     TAG = f"sync/{'dry-run/' if dry else ''}{name}"   # same label as the tag route, for messages and the PR
 else:
     name = TAG[len("sync/"):]
