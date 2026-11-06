@@ -4,7 +4,8 @@ Triggered by pushing a tag sync/<name> (only allowed users can; protect sync/* i
 sync/dry-run/<name> runs every step except the push and the PR. The same runs from the Actions tab
 (Run workflow, pick the branch; inputs: name, confirm: type push to push, blank = dry run). Steps:
   0. stop if the commit under test isn't the branch's head now (a re-run of an old run, a tag left behind)
-  1. fetch GitHub main; rebase the tagged commits onto it (conflict -> stop, list files)
+  1. fetch GitHub main; rebase the tagged commits onto it, only if the branch isn't already on it
+     (conflict -> stop, list files)
   2. guards: .github/workflows changes (push those from a workstation); "Closes/Fixes #N" must be open
      GitHub issues; mentions of a *draft* security advisory (undisclosed fix -> use its private fork);
      open secret-scanning alerts; dependency vulnerabilities introduced (pip-audit on uv.lock, main vs
@@ -147,15 +148,24 @@ commits = sh("git", "rev-list", "--reverse", f"{base}..HEAD").split()
 if not commits:
     raise SystemExit("nothing to sync: the tagged commit is already on GitHub main")
 sh("git", "config", "user.name", "forgejo-sync"); sh("git", "config", "user.email", E.get("SYNC_COMMITTER_EMAIL") or "forgejo-sync@users.noreply.github.com")
-r = subprocess.run(["git", "rebase", "-q", "github/main"], capture_output=True, text=True)
-if r.returncode:
-    conflicts = sh("git", "diff", "--name-only", "--diff-filter=U", check=False).split()
-    subprocess.run(["git", "rebase", "--abort"])
-    raise SystemExit("rebase onto GitHub main failed (resolve on the branch and re-tag): " +
-                     (", ".join(conflicts) if conflicts else r.stderr.strip()[-400:]))
+# Rebase only when GitHub main has moved past the branch's base: a branch already on main goes up as is
+# (same commits as Forgejo, nothing rewritten, nothing that can conflict).
+main_sha = sh("git", "rev-parse", "github/main").strip()
+rebased = base != main_sha
+if rebased:
+    print(f"rebase needed: branch is based on {base[:7]}, GitHub main is at {main_sha[:7]}")
+    r = subprocess.run(["git", "rebase", "-q", "github/main"], capture_output=True, text=True)
+    if r.returncode:
+        conflicts = sh("git", "diff", "--name-only", "--diff-filter=U", check=False).split()
+        subprocess.run(["git", "rebase", "--abort"])
+        raise SystemExit(f"rebase of {base[:7]}..HEAD onto GitHub main {main_sha[:7]} failed "
+                         "(rebase the branch on Forgejo and re-tag): " +
+                         (", ".join(conflicts) if conflicts else r.stderr.strip()[-400:]))
+else:
+    print(f"no rebase needed: branch is already on GitHub main {main_sha[:7]}")
 changed = sh("git", "diff", "--name-only", "github/main..HEAD").split()
 log = sh("git", "log", "--format=%H%n%B%n---", "github/main..HEAD")
-print(f"{len(commits)} commit(s), {len(changed)} file(s) changed after rebase")
+print(f"{len(commits)} commit(s), {len(changed)} file(s) changed{' after rebase' if rebased else ''}")
 
 # 2. guards
 # Outbound privacy: nothing may reveal the fork's private host, the tailnet, private addresses or a personal
@@ -247,7 +257,7 @@ if t.returncode:
 # No Forgejo URL in the PR: it would publish the fork's private host name upstream (log only).
 if E.get("RUN_URL"):
     print(f"run: {E['RUN_URL']}")
-summary = [f"Promoted from the maintainer's fork by `{TAG}` ({len(commits)} commit(s), rebased onto main, tested in a throwaway VM).",
+summary = [f"Promoted from the maintainer's fork by `{TAG}` ({len(commits)} commit(s), {'rebased onto' if rebased else 'already on'} main, tested in a throwaway VM).",
            ""] + closes + fixes_ghsa + vuln_lines
 if notes:
     summary += ["", "Notes:"] + [f"- {n}" for n in notes]
