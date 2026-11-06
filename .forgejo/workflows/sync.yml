@@ -22,13 +22,17 @@ on:
   push:
     tags: ["sync/**"]
   workflow_dispatch:
+    # Every input needs an explicit type: Forgejo's dialog draws no field for an input without one (GitHub
+    # defaults to string). Without it branch, name and confirm had no box to type in (2026-11-06).
     inputs:
       branch:
         description: "Branch to promote (start the run on main and type the branch here)"
+        type: string
         required: false
         default: ""
       name:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
+        type: string
         required: false
         default: ""
       mode:
@@ -38,6 +42,7 @@ on:
         default: dry-run
       confirm:
         description: "With mode push: type push here as well"
+        type: string
         required: false
         default: ""
 
