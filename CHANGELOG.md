@@ -48,6 +48,18 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   larger hardware can review whole diffs.
 - `openai-chat` AI API style: `/v1/models` + `/v1/chat/completions`, for chat-tuned models on any
   OpenAI-compatible server (LiteLLM, vLLM, llama.cpp server).
+- AI review budget per AI profile: `auth ai-set --preset small|medium|large` or `--max-diff-chars` /
+  `--max-tokens`, stored with the profile and shown by `ai-show`; `analysis diff --ai-max-diff-chars` /
+  `--ai-max-tokens` and `KINETIC_AI_MAX_DIFF_CHARS` / `KINETIC_AI_MAX_TOKENS` override it. Defaults are
+  unchanged (4500 diff characters, 360 answer tokens, 220 on retry), so small local models keep working;
+  larger hardware can review whole diffs.
+- `openai-chat` AI API style: `/v1/models` + `/v1/chat/completions`, for chat-tuned models on any
+  OpenAI-compatible server (LiteLLM, vLLM, llama.cpp server).
+- Sampling per AI profile: `auth ai-set --sampling qwen-thinking` stores temperature 0.6, top_p 0.95,
+  top_k 20 (Qwen3's thinking-mode recommendation) in the profile's `extra_body`; `--sampling default`
+  removes the sampling fields again. `temperature` is no longer a reserved request field, so a profile may
+  set it; without one, requests still use 0.15. On Qwen3.6-35B-A3B, thinking reviews with Qwen's sampling
+  got 34 of 102 labelled review cases right vs 16 at temperature 0.15 (#47).
 
 ### Changed
 - `analysis diff` reviews a diff larger than the budget **in chunks** instead of truncating it (before:
@@ -77,20 +89,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   answers are in the run report and summary. New preset `large-thinking` (6000 answer tokens). Per-profile
   `extra_body` request fields: `auth ai-set --no-thinking` (thinking off via `chat_template_kwargs`) or
   `--extra-body JSON`; also accepted in `KINETIC_AI_PROFILE`.
-
-### Added
-- AI review budget per AI profile: `auth ai-set --preset small|medium|large` or `--max-diff-chars` /
-  `--max-tokens`, stored with the profile and shown by `ai-show`; `analysis diff --ai-max-diff-chars` /
-  `--ai-max-tokens` and `KINETIC_AI_MAX_DIFF_CHARS` / `KINETIC_AI_MAX_TOKENS` override it. Defaults are
-  unchanged (4500 diff characters, 360 answer tokens, 220 on retry), so small local models keep working;
-  larger hardware can review whole diffs.
-- `openai-chat` AI API style: `/v1/models` + `/v1/chat/completions`, for chat-tuned models on any
-  OpenAI-compatible server (LiteLLM, vLLM, llama.cpp server).
-- Sampling per AI profile: `auth ai-set --sampling qwen-thinking` stores temperature 0.6, top_p 0.95,
-  top_k 20 (Qwen3's thinking-mode recommendation) in the profile's `extra_body`; `--sampling default`
-  removes the sampling fields again. `temperature` is no longer a reserved request field, so a profile may
-  set it; without one, requests still use 0.15. On Qwen3.6-35B-A3B, thinking reviews with Qwen's sampling
-  got 34 of 102 labelled review cases right vs 16 at temperature 0.15 (#47).
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
