@@ -89,8 +89,8 @@ def audit(lock_text):
 
 
 if E.get("SYNC_EVENT") == "workflow_dispatch":
-    # "Run workflow" button: the branch picked in the dialog's "Use workflow from" (these checks come from that
-    # branch's own sync.py). The typed branch field is gone: the picker works (2026-11-07).
+    # "Run workflow" button: the branch picked in the dialog's "Use workflow from". This script itself comes from
+    # main (or the checks_from input), not from that branch: see sync.yml.
     src = E.get("SYNC_BRANCH", "")
     if src in ("", "main", "master"):
         sys.exit("sync: pick the branch to promote in the Run workflow dialog's \"Use workflow from\" "
