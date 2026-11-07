@@ -69,6 +69,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - `scripts/install-hook.sh` installs the hooks from Git Bash, with no PowerShell script execution.
   The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
   installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
+- `scripts/sync-main.sh`: after a PR merges, fast-forwards the local `main` and the fork's `main` to
+  `public/main` (stops if either has a commit that isn't there) and tags each merged `sync/<name>` PR as
+  `synced/<name>` on the fork, at the PR head that was merged. The branch guard already pointed to it.
 
 ### Changed
 - `analysis diff` reviews a diff larger than the budget **in chunks** instead of truncating it (before:

@@ -64,6 +64,7 @@ SCRIPT_MODULE_MATRIX = {
     "run_timings.py",
     "stash_dangling_commit.py",
     "stash_dangling_objects.py",
+    "sync_main.py",
     "tax_clear.py",
 }
 
