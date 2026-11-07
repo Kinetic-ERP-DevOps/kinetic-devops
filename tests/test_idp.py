@@ -17,7 +17,7 @@ import urllib.request
 from unittest.mock import MagicMock, patch
 
 from kinetic_devops import idp
-from kinetic_devops.auth import KineticConfigManager
+from kinetic_devops.auth import KineticConfigManager, SessionResolutionError
 
 CONFIG = {"IdentityProvider": {"Enabled": True, "Endpoint": "https://idp.example/tid/42/",
                                "ApiScope": "epicor_erp idp_access"}}
@@ -496,6 +496,121 @@ class TestIdpLoginIdentity(unittest.TestCase):
         self.assertEqual(token, "AT")
         self.assertIn("bsmith@corp.example", printed)
         self.assertIn("--user jdoe", printed)
+
+
+class TestIdpLoginPrompts(unittest.TestCase):
+    """idp_login asks for what isn't passed when a person is at the terminal; without one it stops before the browser."""
+
+    def setUp(self):
+        self.mgr = KineticConfigManager.__new__(KineticConfigManager)
+        self.cfg = {"url": "https://pilot.example", "api_key": "key", "companies": "ACME,BETA", "sessions": []}
+        self.stored = {}
+        tok = {"access_token": "AT", "refresh_token": "RT",
+               "idp_identity": {"sub": "s-1", "username": "JDoe@corp.example"}}
+        self.login = MagicMock(return_value=tok)
+        self.patches = [
+            patch.object(self.mgr, "_get_server_dict", return_value={"pilot": self.cfg}),
+            patch.object(self.mgr, "_find_env", side_effect=lambda servers, n: ("pilot", self.cfg) if n == "pilot" else (None, None)),
+            patch.object(idp, "discover", return_value=SETTINGS),
+            patch.object(idp, "get_client_id", return_value="cid"),
+            patch.object(idp, "login_browser", self.login),
+            patch.object(self.mgr, "_validate_bearer_access", return_value=(True, "ok")),
+            patch.object(self.mgr, "_get_token_key", return_value="slot"),
+            patch.object(self.mgr, "set_current_company"),
+            patch.object(self.mgr, "touch_session", side_effect=lambda slot, meta, name: self.stored.update(meta)),
+            patch("builtins.print"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def run_login(self, *args, tty=True, answers=(), **kw):
+        with patch.object(sys.stdin, "isatty", return_value=tty), \
+             patch("builtins.input", side_effect=list(answers)) as ask, \
+             patch.object(self.mgr, "prompt_for_env", return_value=("pilot", "", "")) as pick:
+            token = self.mgr.idp_login(*args, **kw)
+        return token, ask, pick
+
+    def test_everything_passed_asks_nothing(self):
+        token, ask, pick = self.run_login("pilot", "jdoe", "BETA")
+        self.assertEqual((token, self.stored["user_id"], self.stored["current_company"]), ("AT", "jdoe", "BETA"))
+        ask.assert_not_called()
+        pick.assert_not_called()
+
+    def test_no_env_without_terminal_stops_before_the_browser(self):
+        with self.assertRaises(SessionResolutionError) as ctx:
+            self.run_login(tty=False, user_id="jdoe")
+        self.assertIn("ENV", str(ctx.exception))
+        self.login.assert_not_called()
+
+    def test_no_user_without_terminal_stops_before_the_browser(self):
+        with patch.dict(os.environ, {"KIN_USER": ""}), self.assertRaises(SessionResolutionError) as ctx:
+            self.run_login("pilot", tty=False)
+        self.assertIn("--user", str(ctx.exception))
+        self.login.assert_not_called()
+
+    def test_kin_user_still_counts_without_terminal(self):
+        with patch.dict(os.environ, {"KIN_USER": "JDoe"}):
+            token, ask, _ = self.run_login("pilot", tty=False)
+        self.assertEqual((self.stored["user_id"], self.stored["current_company"]), ("jdoe", "ACME"))  # first company
+        ask.assert_not_called()
+
+    def test_no_env_with_terminal_picks_from_the_list_without_quick_connect(self):
+        token, _, pick = self.run_login(user_id="jdoe", company_id="ACME")
+        pick.assert_called_once_with(passive=True)
+        self.assertEqual(token, "AT")
+
+    def test_no_user_offers_the_idp_name_and_asks_the_company(self):
+        with patch.dict(os.environ, {"KIN_USER": ""}):
+            token, ask, _ = self.run_login("pilot", answers=["", "2"])   # Enter = take the suggestion; company 2
+        prompts = [c.args[0] for c in ask.call_args_list]
+        self.assertIn("[jdoe]", prompts[0])
+        self.assertEqual((self.stored["user_id"], self.stored["current_company"]), ("jdoe", "BETA"))
+        self.login.assert_called_once()   # the user was asked after the sign-in
+
+    def test_typed_user_overrides_the_suggestion(self):
+        with patch.dict(os.environ, {"KIN_USER": ""}):
+            self.run_login("pilot", company_id="ACME", answers=["BSmith"])
+        self.assertEqual(self.stored["user_id"], "bsmith")
+
+    def test_user_given_company_asked_only_with_a_terminal(self):
+        self.run_login("pilot", "jdoe", answers=["BETA"])
+        self.assertEqual(self.stored["current_company"], "BETA")
+        _, ask, _ = self.run_login("pilot", "jdoe", tty=False)
+        self.assertEqual(self.stored["current_company"], "ACME")
+        ask.assert_not_called()
+
+
+class TestSelectSessionForEnv(unittest.TestCase):
+    """The shared session/company picker (password sign-in uses it too) after splitting out the company choice."""
+
+    def pick(self, answers, cfg=None, **kw):
+        mgr = KineticConfigManager.__new__(KineticConfigManager)
+        cfg = cfg or {"sessions": [], "companies": "ACME,BETA"}
+        with patch("builtins.input", side_effect=list(answers)), patch("builtins.print"), \
+             patch.object(mgr, "set_current_company") as setco:
+            got = mgr._select_session_for_env("pilot", cfg, **kw)
+        return got, setco
+
+    def test_suggestion_is_the_default_for_a_new_user(self):
+        got, setco = self.pick(["", "BETA"], suggested_user="jdoe")
+        self.assertEqual(got, ("jdoe", "BETA"))
+        setco.assert_called_once_with("pilot", "jdoe", "BETA")
+
+    def test_without_suggestion_an_empty_user_id_is_asked_again(self):
+        got, _ = self.pick(["", "alice", "1"])
+        self.assertEqual(got, ("alice", "ACME"))
+
+    def test_existing_session_and_single_company_unchanged(self):
+        got, _ = self.pick(["2"], cfg={"sessions": ["alice", "bob"], "companies": "ACME"})
+        self.assertEqual(got, ("bob", "ACME"))
+
+    def test_preferred_company_skips_the_company_prompt(self):
+        got, _ = self.pick(["1"], cfg={"sessions": ["alice"], "companies": "ACME,BETA"}, preferred_company="BETA")
+        self.assertEqual(got, ("alice", "BETA"))
 
 
 class FakeKeyring:

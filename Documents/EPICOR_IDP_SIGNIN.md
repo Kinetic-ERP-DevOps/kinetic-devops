@@ -73,12 +73,20 @@ uv run python -m kinetic_devops.auth idp-client MyEnv
 # sign in (opens the browser); --user names the session, as with password sign-in
 uv run python -m kinetic_devops.auth idp-login MyEnv --user jdoe --co ACME
 
+# or let it ask: the environment from the configured list, then (after the browser sign-in) the Epicor User ID,
+# offering your IdP sign-in name (jdoe for jdoe@corp.example), and the company if there are several
+uv run python -m kinetic_devops.auth idp-login
+
 # from then on, everything works as with a password session, e.g.
 KIN_USER=jdoe uv run python -m kinetic_devops.baq ...
 uv run python -m kinetic_devops.auth renew MyEnv --user jdoe   # forces a refresh now
 ```
 
 Use `--port` if 8765 is taken. The port must be one of the client's registered redirect URIs.
+
+Anything passed on the command line (or `KIN_USER`) is used without asking. Without a terminal, a missing
+environment or user stops at once with what to pass (before the browser opens); the company then defaults to the
+first configured.
 
 ## Troubleshooting
 
