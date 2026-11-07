@@ -1,6 +1,8 @@
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -389,10 +391,35 @@ class TestModeMatrix(unittest.TestCase):
             ["redact-inplace", "redact-only", "trim", "trim-context"],
         )
 
-    def test_redact_mode_flag_removed(self):
-        with patch("sys.argv", ["trim_trace_paths.py", "trace.json", "--redact-mode", "aggressive"]):
-            with self.assertRaises(SystemExit):
-                trim_trace_paths.parse_args()
+    def _parse(self, *argv):
+        err = io.StringIO()
+        with patch("sys.argv", ["trim_trace_paths.py", "trace.json", *argv]), redirect_stderr(err):
+            args = trim_trace_paths.parse_args()
+        return args, err.getvalue()
+
+    def test_deprecated_redact_mode_maps_to_mode_and_warns(self):
+        """0.2.0.0a8 scripts keep working: --redact-mode picks the mode with the same redaction profile."""
+        for value, mode, profile in (("aggressive", "trim", "aggressive"), ("context-only", "trim-context", "context-only")):
+            args, err = self._parse("--redact-mode", value)
+            self.assertEqual(args.mode, mode)
+            self.assertIn("deprecated", err)
+            self.assertIn(f"--mode {mode}", err)
+            self.assertFalse(hasattr(args, "redact_mode"))
+            _, redact_mode = trim_trace_paths.apply_mode_defaults(args)
+            self.assertEqual(redact_mode, profile)
+
+    def test_deprecated_redact_mode_with_matching_mode_is_fine(self):
+        args, _ = self._parse("--mode", "trim-context", "--redact-mode", "context-only")
+        self.assertEqual(args.mode, "trim-context")
+
+    def test_deprecated_redact_mode_conflicting_with_mode_is_an_error(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--mode", "redact-only", "--redact-mode", "aggressive")
+
+    def test_no_warning_without_redact_mode(self):
+        args, err = self._parse("--mode", "trim-context")
+        self.assertEqual((args.mode, err), ("trim-context", ""))
+        self.assertIn("--mode", args._explicit_flags)
 
     def test_redact_inplace_bundle_applies_defaults(self):
         import argparse

@@ -10,7 +10,7 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 ## [Unreleased]
 
 ### Added
-- `trim_trace_paths --mode` matrix replaces `--redact-mode` (removed, no compatibility alias).
+- `trim_trace_paths --mode` matrix replaces `--redact-mode`, which stays as a deprecated alias (see Deprecated).
   Each mode is a bundle of flag defaults that explicit command-line flags always override:
   `trim` (aggressive redaction profile, the default), `trim-context` (context-only drops),
   `redact-inplace` (sensitive-values redaction with `--in-place`, `--no-backup`, `--pretty`), and
@@ -92,6 +92,11 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   answers are in the run report and summary. New preset `large-thinking` (6000 answer tokens). Per-profile
   `extra_body` request fields: `auth ai-set --no-thinking` (thinking off via `chat_template_kwargs`) or
   `--extra-body JSON`; also accepted in `KINETIC_AI_PROFILE`.
+
+### Deprecated
+- `trim_trace_paths --redact-mode`: use `--mode` (`aggressive` = `--mode trim`, `context-only` =
+  `--mode trim-context`). It still works, with the same behaviour as in 0.2.0.0a8, and prints a warning; it
+  will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with

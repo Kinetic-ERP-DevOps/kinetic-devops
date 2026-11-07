@@ -231,6 +231,11 @@ MODE_MATRIX: dict[str, dict[str, Any]] = {
     },
 }
 
+# --redact-mode, the 0.2.0.0a8 flag the --mode matrix replaced: kept as a deprecated alias (prints a warning) so
+# existing scripts keep working until a breaking release removes it. Each value maps to the mode with the same
+# redaction profile and nothing else, so the behaviour is unchanged.
+REDACT_MODE_ALIASES = {"aggressive": "trim", "context-only": "trim-context"}
+
 # Flags a mode may override, with the legacy CLI default used when neither the
 # user nor the mode specifies the flag.
 _MODE_FLAG_FALLBACKS: dict[str, Any] = {
@@ -429,12 +434,19 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=sorted(MODE_MATRIX.keys()),
         default="trim",
+        action=_ExplicitStore,
         help=(
             "Composable mode bundle (explicit flags override mode defaults): "
             "trim (aggressive redaction profile, default), trim-context (context-only drops), "
             "redact-inplace (sensitive-values redaction; in place, no backup, pretty), "
             "redact-only (sensitive-values redaction; writes to --out-dir redacted/)."
         ),
+    )
+    parser.add_argument(
+        "--redact-mode",
+        choices=sorted(REDACT_MODE_ALIASES),
+        default=None,
+        help="Deprecated, use --mode: aggressive = --mode trim, context-only = --mode trim-context.",
     )
     parser.add_argument(
         "--call-context-policy",
@@ -503,7 +515,17 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Redact delta old/new values by default; use --no-delta-redact-values to expose truncated values.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.redact_mode is not None:
+        mode = REDACT_MODE_ALIASES[args.redact_mode]
+        if "--mode" in getattr(args, "_explicit_flags", set()) and args.mode != mode:
+            parser.error(f"--redact-mode {args.redact_mode} means --mode {mode}, but --mode {args.mode} was given; "
+                         "use --mode only")
+        print(f"warning: --redact-mode is deprecated and will be removed in a later breaking release; "
+              f"use --mode {mode}", file=sys.stderr)
+        args.mode = mode
+    del args.redact_mode
+    return args
 
 
 def try_parse_json_with_light_repair(raw: str, enable_repair: bool) -> tuple[Any | None, str | None, str | None]:
