@@ -32,4 +32,7 @@ runs:
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
         REVIEW_SCRIPT: ${{ github.action_path }}/../ai-review/ai_review.py
-      run: python3 "${{ github.action_path }}/ci_bot.py"
+      # System Python if there is one, else uv's (native distro runners ship none).
+      run: |
+        if command -v python3 >/dev/null; then python3 "${{ github.action_path }}/ci_bot.py"
+        else uv run --no-project --python 3.12 python "${{ github.action_path }}/ci_bot.py"; fi

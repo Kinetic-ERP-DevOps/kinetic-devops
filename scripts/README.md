@@ -240,8 +240,9 @@ README's *Supported Python versions*; a test keeps this list equal to both CI ma
 - `Sensitive Data Gate`
 - `Python Test Gate (required, py3.11)` ... `(required, py3.14)`
 
-Forgejo names checks `<workflow> / <job> (<event>)`, so the example's Forgejo target lists them as globs
-(`CI Tests / Python Test Gate (required, py3.11) *`). Keep advisory checks (Windows, wheel smoke, EFx build)
+Forgejo names checks `<workflow> / <job> (<event>)`, and its Python gates run every version on every native
+distro (`Python Test Gate (required, py3.11, alpine)`), so the example's Forgejo target lists them as globs
+(`CI Tests / Python Test Gate (required, py3.11, *`: that version on all distros). Keep advisory checks (Windows, wheel smoke, EFx build)
 non-required so merges can proceed while still flagging problems.
 
 The same GitHub rulesets as JSON for the web UI (Settings > Rules > Rulesets > New ruleset > Import):

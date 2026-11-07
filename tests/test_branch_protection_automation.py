@@ -43,11 +43,12 @@ class TestBranchProtectionAutomation(unittest.TestCase):
             targets[0].required_checks,
             ["Sensitive Data Gate"] + [f"Python Test Gate (required, py{v})" for v in supported],
         )
-        # Forgejo names checks "<workflow> / <job> (<event>)"; its target matches them with globs.
+        # Forgejo names checks "<workflow> / <job> (<event>)" and its gates carry the distro
+        # ("py3.11, alpine"); its target matches each version on every distro with a glob.
         self.assertEqual(
             targets[1].required_checks,
             ["CI Tests / Sensitive Data Gate *"]
-            + [f"CI Tests / Python Test Gate (required, py{v}) *" for v in supported],
+            + [f"CI Tests / Python Test Gate (required, py{v}, *" for v in supported],
         )
         self.assertEqual(targets[0].github_mode, "ruleset")
         self.assertEqual(targets[0].protect_tags, ["v*"])

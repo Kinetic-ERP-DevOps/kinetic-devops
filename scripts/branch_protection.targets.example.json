@@ -32,10 +32,10 @@
       "forgejo_api_base": "",
       "required_checks": [
         "CI Tests / Sensitive Data Gate *",
-        "CI Tests / Python Test Gate (required, py3.11) *",
-        "CI Tests / Python Test Gate (required, py3.12) *",
-        "CI Tests / Python Test Gate (required, py3.13) *",
-        "CI Tests / Python Test Gate (required, py3.14) *"
+        "CI Tests / Python Test Gate (required, py3.11, *",
+        "CI Tests / Python Test Gate (required, py3.12, *",
+        "CI Tests / Python Test Gate (required, py3.13, *",
+        "CI Tests / Python Test Gate (required, py3.14, *"
       ]
     }
   ]
