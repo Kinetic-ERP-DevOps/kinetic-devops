@@ -1,5 +1,5 @@
 # Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
-# Actions -> Sync to upstream -> Run workflow on main and type the branch to promote; it is a dry run unless
+# Actions -> Sync to upstream -> Run workflow, pick the branch in "Use workflow from"; it is a dry run unless
 # you type push into the confirm field. The button works only for users listed in the SYNC_ACTORS variable
 # (empty = button disabled). sync/dry-run/<name> runs every check without pushing. Steps: .forgejo/actions/sync/sync.py.
 # SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
@@ -22,13 +22,9 @@ on:
     tags: ["sync/**"]
   workflow_dispatch:
     # Every input needs an explicit type: Forgejo's dialog draws no field for an input without one (GitHub
-    # defaults to string). Without it branch, name and confirm had no box to type in (2026-11-06).
+    # defaults to string). Without it name and confirm had no box to type in (2026-11-06).
+    # The branch to promote is the one picked in "Use workflow from" (the picker works, 2026-11-07).
     inputs:
-      branch:
-        description: "Branch to promote (start the run on main and type the branch here)"
-        type: string
-        required: false
-        default: ""
       name:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
         type: string
@@ -70,7 +66,6 @@ jobs:
           TAG: ${{ github.ref_name }}
           SYNC_EVENT: ${{ github.event_name }}
           SYNC_BRANCH: ${{ github.ref_name }}
-          SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
           SYNC_CONFIRM: ${{ inputs.confirm }}
           SYNC_INPUTS: ${{ toJSON(inputs) }}   # what the dialog actually sent (logged)
