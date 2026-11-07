@@ -63,6 +63,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   removes the sampling fields again. `temperature` is no longer a reserved request field, so a profile may
   set it; without one, requests still use 0.15. On Qwen3.6-35B-A3B, thinking reviews with Qwen's sampling
   got 34 of 102 labelled review cases right vs 16 at temperature 0.15 (#47).
+- Local branch guard in the git hooks: no commits (merge commits included) on `main`; `main` is pushed
+  only as exactly `public/main` and never to `public`; the scratch `dev` branch is never pushed.
+  `KINETIC_ALLOW_MAIN=1` skips it once. See CONTRIBUTING.md, "Local branch guard".
+- `scripts/install-hook.sh` installs the hooks from Git Bash, with no PowerShell script execution.
+  The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
+  installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
 
 ### Changed
 - `analysis diff` reviews a diff larger than the budget **in chunks** instead of truncating it (before:
@@ -105,12 +111,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - `trim` / `trim-context` no longer silently drop `ImportLayers`, `ImportApp` and `ExportApp` calls with the
   rest of the MetaFX service (dropped by default as UI-metadata noise). A dropped service that contains a kept
   call stays, trimmed to the kept calls. New `--keep-node-name PATTERN` (repeatable) and `--no-default-keep`.
-- Local branch guard in the git hooks: no commits (merge commits included) on `main`; `main` is pushed
-  only as exactly `public/main` and never to `public`; the scratch `dev` branch is never pushed.
-  `KINETIC_ALLOW_MAIN=1` skips it once. See CONTRIBUTING.md, "Local branch guard".
-- `scripts/install-hook.sh` installs the hooks from Git Bash, with no PowerShell script execution.
-  The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
-  installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
 - **`find_sensitive_data` no longer skips committed content because of a folder name.** The built-in exclusion
   list (`temp`, `reports`, `templates`, `Apps`, `layers`, `schemas`, `bin`, `build`, ...) matched any path part,
   so tracked files in such folders, and their changes in `--staged`, `--commit`, `--diff`, `--history` and
