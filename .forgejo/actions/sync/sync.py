@@ -2,7 +2,7 @@
 
 Triggered by pushing a tag sync/<name> (only allowed users can; protect sync/* in Forgejo).
 sync/dry-run/<name> runs every step except the push and the PR. The same runs from the Actions tab
-(Run workflow on main; inputs: branch, name, confirm: type push to push, blank = dry run). Steps:
+(Run workflow, pick the branch; inputs: name, confirm: type push to push, blank = dry run). Steps:
   0. stop if the commit under test isn't the branch's head now (a re-run of an old run, a tag left behind)
   1. fetch GitHub main; rebase the tagged commits onto it (conflict -> stop, list files)
   2. guards: .github/workflows changes (push those from a workstation); "Closes/Fixes #N" must be open
@@ -89,22 +89,14 @@ def audit(lock_text):
 
 
 if E.get("SYNC_EVENT") == "workflow_dispatch":
-    # "Run workflow" button: the branch typed into the dialog (run started on main, so these checks come
-    # from main, not from the branch being promoted), else the branch the run was started on.
-    ref, typed = E.get("SYNC_BRANCH", ""), (E.get("SYNC_INPUT_BRANCH") or "").strip()
-    if typed and ref not in ("main", "master", typed):
-        sys.exit(f"sync: branch '{typed}' typed, but the run was started on '{ref}': start it on main, or leave "
-                 "the branch field blank")
-    src = typed or ref
+    # "Run workflow" button: the branch picked in the dialog's "Use workflow from". This script itself comes from
+    # main (or the checks_from input), not from that branch: see sync.yml.
+    src = E.get("SYNC_BRANCH", "")
     if src in ("", "main", "master"):
-        sys.exit("sync: type the branch to promote into the Run workflow dialog's branch field "
+        sys.exit("sync: pick the branch to promote in the Run workflow dialog's \"Use workflow from\" "
                  f"(got '{src or '?'}')")
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", src) or ".." in src or src.startswith(("-", "/")):
         sys.exit(f"sync: bad branch name {src!r}")
-    if typed and typed != ref:
-        sh("git", "fetch", "--no-tags", "-q", "origin", f"refs/heads/{src}:refs/remotes/origin/{src}")
-        sh("git", "checkout", "-q", "--detach", f"refs/remotes/origin/{src}")
-        print(f"sync: checked out {src} at {sh('git', 'rev-parse', '--short', 'HEAD').strip()} (checks from {ref})")
     name = (E.get("SYNC_NAME") or "").strip() or src.replace("/", "-")
     # One control (owner, 2026-11-06): typing push in confirm pushes, blank is a dry run, anything else stops.
     # Replaces mode + confirm (added after inputs went missing, 2026-11-01/02). Fail-safe direction: inputs that

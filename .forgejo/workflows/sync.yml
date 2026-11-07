@@ -1,5 +1,5 @@
 # Promote a branch to the GitHub upstream: push a tag sync/<name> (protect sync/* so only you can), or use
-# Actions -> Sync to upstream -> Run workflow on main and type the branch to promote; it is a dry run unless
+# Actions -> Sync to upstream -> Run workflow, pick the branch in "Use workflow from"; it is a dry run unless
 # you type push into the confirm field. The button works only for users listed in the SYNC_ACTORS variable
 # (empty = button disabled). sync/dry-run/<name> runs every check without pushing. Steps: .forgejo/actions/sync/sync.py.
 # SECURITY: SYNC_ACTORS and tag protection are guard rails, not a boundary. Workflows run from the branch's
@@ -22,13 +22,10 @@ on:
     tags: ["sync/**"]
   workflow_dispatch:
     # Every input needs an explicit type: Forgejo's dialog draws no field for an input without one (GitHub
-    # defaults to string). Without it branch, name and confirm had no box to type in (2026-11-06).
+    # defaults to string). Without it name and confirm had no box to type in (2026-11-06).
+    # The branch to promote is the one picked in "Use workflow from" (the picker works, 2026-11-07). The checks
+    # (sync.py) come from main whichever branch is picked, so a branch made before a sync.py fix gets the fix.
     inputs:
-      branch:
-        description: "Branch to promote (start the run on main and type the branch here)"
-        type: string
-        required: false
-        default: ""
       name:
         description: "Upstream branch sync/<name> (blank: the branch name with / as -)"
         type: string
@@ -36,6 +33,11 @@ on:
         default: ""
       confirm:
         description: "Type push to push to GitHub and open the PR; blank = dry run (check and test, push nothing)"
+        type: string
+        required: false
+        default: ""
+      checks_from:
+        description: "Run the checks (sync.py) from this branch; blank = main. Only for testing a sync.py change"
         type: string
         required: false
         default: ""
@@ -70,13 +72,25 @@ jobs:
           TAG: ${{ github.ref_name }}
           SYNC_EVENT: ${{ github.event_name }}
           SYNC_BRANCH: ${{ github.ref_name }}
-          SYNC_INPUT_BRANCH: ${{ inputs.branch }}
           SYNC_NAME: ${{ inputs.name }}
           SYNC_CONFIRM: ${{ inputs.confirm }}
           SYNC_INPUTS: ${{ toJSON(inputs) }}   # what the dialog actually sent (logged)
+          SYNC_CHECKS_FROM: ${{ inputs.checks_from }}
           SYNC_TEST_CMD: ${{ vars.SYNC_TEST_CMD }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
           FORGEJO_URL: ${{ github.server_url }}
           SYNC_PRIVATE_PATTERNS: ${{ vars.SYNC_PRIVATE_PATTERNS }}
           SYNC_ALLOWED_EMAILS: ${{ vars.SYNC_ALLOWED_EMAILS }}
-        run: uv run --no-project --python 3.12 python .forgejo/actions/sync/sync.py   # needs 3.11+ (tomllib); the image has 3.10
+        # sync.py from main (or the checks_from branch), not from the branch being promoted. The input reaches the
+        # shell only through the environment and must be a plain branch name.
+        run: |
+          set -euo pipefail
+          src="${SYNC_CHECKS_FROM:-main}"
+          if ! [[ "$src" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$src" == *..* || "$src" == -* ]]; then
+            echo "sync: bad checks_from branch name: $src"; exit 1
+          fi
+          git fetch --no-tags -q origin "refs/heads/$src:refs/remotes/checks/$src"
+          script="$(mktemp --suffix=.py)"
+          git show "refs/remotes/checks/$src:.forgejo/actions/sync/sync.py" > "$script"
+          echo "sync: checks from $src at $(git rev-parse --short "refs/remotes/checks/$src"); promoting $(git rev-parse --short HEAD)"
+          uv run --no-project --python 3.12 python "$script"   # needs 3.11+ (tomllib); the image has 3.10
