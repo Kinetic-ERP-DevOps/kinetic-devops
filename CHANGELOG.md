@@ -108,6 +108,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- Forgejo sync failed on its first line since #66 (`mktemp: unrecognized option: suffix=.py`): the runner
+  image's BusyBox `mktemp` has no long options. It now uses `mktemp -d`; a test keeps GNU-only `mktemp`
+  options out of `.forgejo/workflows`.
 - `trim_trace_paths --mode redact-only` / `redact-inplace` no longer refuses traces with
   "structure=changed: 0 element(s) removed": pruning relinked `prevSibling`/`nextSibling` on every call
   list, adding keys the trace never had. Siblings are now relinked only when a call was removed.
