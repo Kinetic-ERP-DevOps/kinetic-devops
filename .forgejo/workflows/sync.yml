@@ -90,7 +90,7 @@ jobs:
             echo "sync: bad checks_from branch name: $src"; exit 1
           fi
           git fetch --no-tags -q origin "refs/heads/$src:refs/remotes/checks/$src"
-          script="$(mktemp --suffix=.py)"
+          script="$(mktemp -d)/sync.py"   # BusyBox mktemp in the runner image: POSIX options only
           git show "refs/remotes/checks/$src:.forgejo/actions/sync/sync.py" > "$script"
           echo "sync: checks from $src at $(git rev-parse --short "refs/remotes/checks/$src"); promoting $(git rev-parse --short HEAD)"
           uv run --no-project --python 3.12 python "$script"   # needs 3.11+ (tomllib); the image has 3.10
