@@ -4,7 +4,10 @@
 # other way: it stops if either main has a commit that isn't on public/main.
 #
 # Usage (Git Bash on Windows, or any POSIX shell), from anywhere in the clone:
-#   sh scripts/sync-main.sh [--dry-run] [--no-tags]
+#   sh scripts/sync-main.sh [--fork REMOTE] [--branch NAME] [--save] [--dry-run] [--no-tags]
+# The fork is the remote `origin` and the branch `main` unless given; --save keeps the given
+# --fork/--branch in this clone's git config (sync-main.fork, sync-main.branch), e.g. once:
+#   sh scripts/sync-main.sh --fork myfork --save
 # Details: scripts/sync_main.py.
 here="$(cd "$(dirname "$0")" && pwd)" || exit 1   # sync_main.py sits next to this script
 cd "$(git rev-parse --show-toplevel)" || exit 1
