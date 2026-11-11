@@ -365,27 +365,58 @@ class TestRefreshSession(unittest.TestCase):
             idp.refresh(SETTINGS["token"], "cid", "RT")
         self.assertIn("malformed JSON", str(ctx.exception))
 
-    def test_lock_waits_and_times_out_when_the_lock_cant_be_checked(self):
-        """Regression: an OSError while checking a held lock used to retry at once, forever (no sleep, no deadline)."""
-        path = os.path.join(idp.lock_dir(), "kinetic-idp-" + hashlib.sha256(self.slot.encode()).hexdigest()[:16] + ".lock")
-        open(path, "w").close()
+    def _lock_path(self):
+        return os.path.join(idp.lock_dir(), "kinetic-idp-" + hashlib.sha256(self.slot.encode()).hexdigest()[:16] + ".lock")
+
+    def _try(self, wait=0.5):
+        """Try the slot lock in a thread: 'locked' or the IdPError text; fails if it spins past its deadline."""
         outcome = []
 
         def worker():
             try:
-                with patch.object(idp.os.path, "getmtime", side_effect=OSError("gone")):
-                    with idp.slot_lock(self.slot, wait=0.5):
-                        outcome.append("locked")
+                with idp.slot_lock(self.slot, wait=wait):
+                    outcome.append("locked")
             except idp.IdPError as exc:
                 outcome.append(str(exc))
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(wait + 5)
+        self.assertFalse(t.is_alive(), "slot_lock spun past its deadline")
+        return outcome[0]
+
+    def test_lock_waits_and_times_out_when_the_lock_file_cant_be_opened(self):
+        """Regression: an OSError on a lock used to retry at once, forever (no sleep, no deadline)."""
+        with patch.object(idp.os, "open", side_effect=PermissionError("denied")):
+            self.assertIn("Timed out", self._try())
+
+    def test_slow_holder_is_never_taken_over(self):
+        """Review finding #10: a holder older than the stale limit was taken over, and its clean-up then deleted
+        the new holder's lock. An OS lock has no stale limit: an old lock file that is held stays held."""
+        with idp.slot_lock(self.slot):
+            os.utime(self._lock_path(), (0, 0))   # looks hours old
+            self.assertIn("Timed out", self._try())
+        self.assertEqual(self._try(), "locked")   # released when the holder is done
+
+    def test_leftover_lock_file_is_not_a_held_lock(self):
+        """A lock file left by a crashed process (or an older version) is taken at once: nothing holds it."""
+        open(self._lock_path(), "w").close()
+        self.assertEqual(self._try(wait=0), "locked")
+
+    def test_lock_of_a_process_that_died_is_released(self):
+        import subprocess
+        code = ("import sys, time; from kinetic_devops import idp\n"
+                "with idp.slot_lock(sys.argv[1]):\n"
+                "    print('held', flush=True); time.sleep(60)\n")
+        child = subprocess.Popen([sys.executable, "-c", code, self.slot], stdout=subprocess.PIPE, text=True)
         try:
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            t.join(5)
-            self.assertFalse(t.is_alive(), "slot_lock spun past its deadline")
-            self.assertIn("Timed out", outcome[0])
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            self.assertIn("Timed out", self._try())
+            child.kill()
+            child.wait(10)
+            self.assertEqual(self._try(wait=5), "locked")
         finally:
-            os.remove(path)
+            child.kill()
+            child.stdout.close()
 
     def test_lock_serialises_refreshes(self):
         inside, overlap = [], []

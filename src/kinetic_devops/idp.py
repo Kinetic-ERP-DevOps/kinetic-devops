@@ -38,7 +38,6 @@ SERVICE_IDP = "kinetic-idp"
 DEFAULT_PORT = 8765
 BASE_SCOPES = "openid profile offline_access"
 LOGIN_TIMEOUT_SEC = 300
-LOCK_STALE_SEC = 60
 CLOCK_SKEW_SEC = 120
 
 
@@ -434,32 +433,60 @@ def lock_dir() -> str:
     return path
 
 
+def _try_lock(fd: int) -> bool:
+    """Take an exclusive OS lock on the open file without waiting; False if another holder has it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # byte 0 (the file is empty: locking past EOF is allowed)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:   # BlockingIOError / PermissionError: held by another open of the file
+        return False
+
+
+def _unlock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
-    """Cross-process lock around a refresh, so a rotated refresh token is used exactly once."""
+    """Cross-process lock around a refresh, so a rotated refresh token is used exactly once.
+
+    An OS file lock (flock on POSIX, msvcrt.locking on Windows) on a per-slot file that is never deleted. The OS
+    drops the lock when its holder closes the file or dies, so a crashed process can't leave a stale lock and no
+    one ever has to guess that a lock is stale and take it over: a slow holder keeps its lock however long it
+    takes (a takeover after a timeout would let two processes use the same refresh token, and the old holder's
+    clean-up would delete the new holder's lock). Each acquisition opens the file anew, so threads exclude each
+    other too.
+    """
     name = "kinetic-idp-" + hashlib.sha256(slot.encode()).hexdigest()[:16] + ".lock"
     path = os.path.join(lock_dir(), name)
     deadline = time.time() + wait
     while True:
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            # A lock older than LOCK_STALE_SEC is left over from a crashed process: take it over. If it can't be
-            # checked or removed (just released, or not ours), wait like for any held lock; never retry at once.
-            with contextlib.suppress(OSError):
-                if time.time() - os.path.getmtime(path) > LOCK_STALE_SEC:
-                    os.remove(path)
-                    continue
+        fd = None
+        with contextlib.suppress(OSError):   # can't open it now: wait like for a held lock; never retry at once
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            if _try_lock(fd):
+                break
+            os.close(fd)
         if time.time() > deadline:
             raise IdPError("Timed out waiting for another process to finish refreshing the IdP session.")
         time.sleep(0.2)
     try:
-        os.close(fd)
         yield
     finally:
-        with contextlib.suppress(OSError):
-            os.remove(path)
+        _unlock(fd)
+        os.close(fd)
 
 
 def refresh_session(meta: Dict, reread: Callable[[], Optional[Dict]], store: Callable[[Dict], None],
