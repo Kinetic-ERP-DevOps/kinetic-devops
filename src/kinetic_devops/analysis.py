@@ -660,7 +660,8 @@ def build_commit_items(
     are listed in a final "unreviewed" item (verdict INCOMPLETE) instead of being dropped silently."""
     rev_range = f"{base_ref}..HEAD"
     # Not --max-count: git limits before --reverse, which kept the newest N and hid the oldest.
-    revs = run_git(repo, ["rev-list", "--reverse", rev_range], timeout=30)
+    # --topo-order: parents before children (date order isn't), so the "resume from" hint is an ancestor.
+    revs = run_git(repo, ["rev-list", "--reverse", "--topo-order", rev_range], timeout=30)
     if revs.code != 0:
         return []
 

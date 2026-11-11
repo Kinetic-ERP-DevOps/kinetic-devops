@@ -227,6 +227,38 @@ class TestCommitCap(unittest.TestCase):
             self.assertEqual(analysis._run_verify_report(verify_args), 1)   # a capped run never verifies clean
 
 
+def git_dated(cwd, date, *args):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=cwd,
+                          check=True, capture_output=True, text=True, env=env).stdout
+
+
+@unittest.skipUnless(shutil.which("git"), "git not available")
+class TestCommitOrder(unittest.TestCase):
+    """The capped review takes the oldest commits in topological order, so the commits it skips are
+    never ancestors of the ones it reviewed (date order breaks with skewed commit dates)."""
+
+    def test_skewed_dates_keep_parents_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git(repo, "init", "-q", "-b", "main")
+            git_dated(repo, "2021-01-01T00:00:00", "commit", "-q", "--allow-empty", "-m", "base")
+            git(repo, "tag", "base")
+            git_dated(repo, "2021-06-01T00:00:00", "commit", "-q", "--allow-empty", "-m", "feat: x")
+            git(repo, "branch", "side")
+            git_dated(repo, "2020-01-01T00:00:00", "commit", "-q", "--allow-empty", "-m", "feat: a1")
+            git_dated(repo, "2020-06-01T00:00:00", "commit", "-q", "--allow-empty", "-m", "feat: a2")
+            git(repo, "switch", "-q", "side")
+            git_dated(repo, "2022-01-01T00:00:00", "commit", "-q", "--allow-empty", "-m", "feat: b1")
+            git(repo, "switch", "-q", "main")
+            git_dated(repo, "2030-01-01T00:00:00", "merge", "-q", "--no-ff", "-m", "chore: merge side", "side")
+            items = analysis.build_commit_items(repo, "base", max_commits=2)
+            reviewed = [it["subject"] for it in items if it["type"] == "commit"]
+            self.assertEqual(reviewed[0], "feat: x")   # date order put a1, a2 (children of x) first
+            self.assertEqual(len(reviewed), 2)
+
+
 @unittest.skipUnless(shutil.which("git"), "git not available")
 class TestVerifyRogueRule(unittest.TestCase):
     """verify-report: a report that misses a rogue flag always fails; one that has an extra flag from the

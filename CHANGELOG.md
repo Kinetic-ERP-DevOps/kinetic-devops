@@ -122,8 +122,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   read is now capped at the time left and, once the answer flows, at 30 s (`KINETIC_AI_READ_TIMEOUT`).
 - `analysis diff` / `legacy-intake`: with more commits than `--max-commits`, the oldest were silently skipped
   (git applied the cap before `--reverse`, keeping the newest N) and the run could still read as all GO. The
-  oldest N are now reviewed; the rest are listed in an `unreviewed` item with verdict INCOMPLETE, a warning in
-  the run summary and output (with the `--base-ref` to resume from), and `verify-report` fails on it.
+  oldest N (in topological order, parents first) are now reviewed; the rest are listed in an `unreviewed` item
+  with verdict INCOMPLETE, a warning in the run summary and output (with the `--base-ref` to resume from), and
+  `verify-report` fails on it.
 - `analysis diff`: an answer without its leading `VERDICT:` line no longer passes as GO from a bare "GO" in
   its last section, so "Do NOT GO: ..." is no longer read as GO. GO now needs the explicit `VERDICT: GO`
   line; otherwise the chunk is UNKNOWN. NO-GO, including a negated GO ("not a GO", "don't GO", "don’t GO"),
