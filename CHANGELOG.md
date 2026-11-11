@@ -162,7 +162,13 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - Repo host detection (`repo_context`, branch protection, repo maker) took the host from the URL's netloc, so
   `ssh://git@github.com/...` was classified as Forgejo and a `user:token@` in the remote URL could reach the host
   value (keyring account names, messages). The host is now the bare host name; a web port is kept only for API
-  URLs and port-qualified keyring accounts (still tried first, then the bare host). SSH ports are ignored.
+  URLs and the keyring accounts, which stay as before: a server on a non-default port uses only
+  `host:port/owner` and `host:port` (never the bare host's accounts, which belong to the default-port server),
+  then the legacy account. SSH ports are ignored. scp-like remotes follow git's rule (no `://` and a `:` before
+  any `/`): ssh-config aliases (`myalias:owner/repo`) and bracketed hosts (`git@[::1]:o/r`,
+  `[git@host:2222]:o/r`) parse, and `./a@b:c/...` is a local path. Error messages never show the URL's user
+  info or query (a password containing `/` or `@` is cut whole), and a malformed URL (e.g. an unclosed IPv6
+  bracket) raises the command's own error instead of a bare `ValueError` traceback.
 - IdP: a network error or malformed JSON during a token request (e.g. a refresh with the network down) was a
   traceback; it now takes the "sign in again" path.
 - IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
