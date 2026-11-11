@@ -69,6 +69,51 @@ class TestSyncTestEnvironment(unittest.TestCase):
         self.assertIn("env=test_env(E)", runs[0])
 
 
+class TestSyncPrTitle(unittest.TestCase):
+    """Finding 4: after a rebase the PR title came from HEAD~N with N counted before it, so a branch with a merge
+    commit went up titled after a commit already on main (#68 and #69 got #66's title)."""
+
+    def repo_with_merge(self, d):
+        git(d, "init", "-q", "-b", "main")
+        Path(d, "a").write_text("0"); git(d, "add", "."); git(d, "commit", "-q", "-m", "main: base")
+        git(d, "checkout", "-q", "-b", "sync/x")
+        Path(d, "b").write_text("1"); git(d, "add", "."); git(d, "commit", "-q", "-m", "feat: first branch commit")
+        git(d, "checkout", "-q", "main")
+        Path(d, "c").write_text("2"); git(d, "add", "."); git(d, "commit", "-q", "-m", "main: upstream change")
+        git(d, "checkout", "-q", "sync/x")
+        git(d, "merge", "-q", "--no-edit", "main")            # "Merge branch 'main' into sync/x"
+        Path(d, "e").write_text("3"); git(d, "add", "."); git(d, "commit", "-q", "-m", "fix: second")
+
+    def outgoing(self, d):
+        fn = sync_defs("redact", "sh", "outgoing", TOKEN="")["outgoing"]
+        cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            return fn("github/main")
+        finally:
+            os.chdir(cwd)
+
+    def test_title_after_rebase_is_first_branch_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.repo_with_merge(d)
+            git(d, "checkout", "-q", "main")
+            Path(d, "f").write_text("4"); git(d, "add", "."); git(d, "commit", "-q", "-m", "main: moved on")
+            git(d, "branch", "github/main")
+            git(d, "checkout", "-q", "sync/x")
+            git(d, "rebase", "-q", "github/main")                 # drops the merge commit
+            commits, title = self.outgoing(d)
+            self.assertEqual(title, "feat: first branch commit")
+            self.assertEqual(len(commits), 2)
+
+    def test_title_without_rebase_skips_merged_in_commits(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.repo_with_merge(d)
+            git(d, "branch", "github/main", "main")               # branch already on main: goes up as is
+            commits, title = self.outgoing(d)
+            self.assertEqual(title, "feat: first branch commit")
+            self.assertEqual(len(commits), 2)
+
+
 VERSIONS = ["0.9", "1.0.dev1", "1.0a1.dev1", "1.0a1", "1.0a2", "1.0b1", "1.0rc1", "1.0rc2.post1", "1.0", "1.0.0",
             "1.0+local.a", "1.0+local.1", "1.0.post1.dev1", "1.0.post1", "1.0-2", "1.0.1", "1.1", "2.0.0rc1",
             "2.0.0", "2.0.0.post0", "10.0", "1!0.1"]

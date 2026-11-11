@@ -162,6 +162,16 @@ def at_least(have, patched):
         return False
 
 
+def outgoing(upstream="github/main"):
+    """(commits, PR title) for what goes up: HEAD's commits not on upstream, taken after any rebase.
+
+    No merge commits (a rebase drops them). The title is the branch's own first commit: follow first parents so a
+    merged-in branch's commits don't supply it."""
+    commits = sh("git", "rev-list", "--reverse", "--no-merges", f"{upstream}..HEAD").split()
+    own = sh("git", "rev-list", "--reverse", "--first-parent", "--no-merges", f"{upstream}..HEAD").split() or commits
+    return commits, (sh("git", "log", "-1", "--format=%s", own[0]).strip() if own else "")
+
+
 def audit(lock_text):
     """Vulnerability IDs (pip-audit, OSV/PyPI advisories) for the packages pinned in a uv.lock."""
     vers = locked_versions(lock_text)
@@ -253,11 +263,9 @@ else:
     print(f"no rebase needed: branch is already on GitHub main {main_sha[:7]}")
 # Count and name what actually goes up, after any rebase: a rebase drops merge commits and commits already on
 # main, so the count from before it can be too high (2026-11-11: #68 and #69 got #66's title from HEAD~N).
-commits = sh("git", "rev-list", "--reverse", "--no-merges", "github/main..HEAD").split()
+commits, title = outgoing()
 if not commits:
     raise SystemExit("nothing to sync: every commit on the branch is already on GitHub main")
-# The PR title is the branch's own first commit: follow first parents so a merged-in branch's commits don't count.
-own = sh("git", "rev-list", "--reverse", "--first-parent", "--no-merges", "github/main..HEAD").split() or commits
 changed = sh("git", "diff", "--name-only", "github/main..HEAD").split()
 log = sh("git", "log", "--format=%H%n%B%n---", "github/main..HEAD")
 print(f"{len(commits)} commit(s), {len(changed)} file(s) changed{' after rebase' if rebased else ''}")
@@ -363,7 +371,6 @@ summary = [f"Promoted from the maintainer's fork by `{TAG}` ({len(commits)} comm
            ""] + closes + fixes_ghsa + vuln_lines
 if notes:
     summary += ["", "Notes:"] + [f"- {n}" for n in notes]
-title = sh("git", "log", "-1", "--format=%s", own[0]).strip()   # the branch's first own commit
 body = "\n".join(summary) + "\n"
 for where, text in (("PR title", title), ("PR body", body)):
     if leaks(text):
