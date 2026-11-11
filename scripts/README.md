@@ -76,6 +76,12 @@ real hooks directory (shared by all worktrees of the clone).
   once without enabling it). Commits that already passed are skipped, so you can run
   `uv run python scripts/sandbox_test.py` before pushing.
 
+After a PR merges upstream, bring `main` up to date with `sh scripts/sync-main.sh` (`--dry-run` to see what
+it would do). It fast-forwards the local `main` and your fork's `main` (`origin`) to `public/main`, and stops
+if either has a commit that isn't on `public/main`. It then tags each merged PR from a `sync/<name>` branch as
+`synced/<name>` on `origin`, at the PR head that was merged, with the PR number and the commit it became on
+`main` in the tag message; existing `synced/` tags are never moved. Details: `scripts/sync_main.py`.
+
 ### Native checks and enterprise endpoint security
 
 Managed Windows machines may block or kill **newly built or edited unsigned code**: the console-script
