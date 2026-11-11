@@ -147,6 +147,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   now refuses promotion, as does a failed issue lookup for "Closes #N". Lists follow GitHub's `Link` pagination
   past the first 100 results.
 
+- GitHub workflows pin every action to a full commit SHA (the version in a comment) instead of a movable tag
+  or branch: the PyPI publish job holds `id-token: write`, so a moved or compromised upstream ref could have
+  published as kinetic-devops. Dependabot now updates the pins (`github-actions` ecosystem).
 
 ## [0.2.0.0a8] - 2026-11-01
 
