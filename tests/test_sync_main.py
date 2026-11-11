@@ -152,6 +152,76 @@ class TestSyncMain(unittest.TestCase):
         self.assertIn("don't match their PR", r.stderr)
         self.assertEqual(self.ref("origin.git", "synced/feat-a^{commit}"), other)
 
+    def rename_fork(self, name):
+        """The fork's remote under another name than origin (e.g. a second fork in the same clone)."""
+        self.git(self.repo, "remote", "rename", "origin", name)
+
+    def test_fork_option_names_the_fork_remote(self):
+        self.rename_fork("myfork")
+        prs = [self.merge_pr(7, "feat-a")]
+        r = self.sync("--no-tags")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no remote 'origin'", r.stderr)
+        self.assertIn("--fork REMOTE", r.stderr)
+        r = self.sync("--fork", "myfork", "--prs-json", self.prs_file(prs))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.ref("origin.git", "main"), self.ref("public.git", "main"))
+        self.assertEqual(self.ref("origin.git", "synced/feat-a^{commit}"), prs[0]["head"]["sha"])
+        self.assertIn("myfork/main: pushed", r.stdout)
+        saved = subprocess.run(["git", "config", "--get", "sync-main.fork"], cwd=str(self.repo), env=self.env,
+                               capture_output=True, text=True)
+        self.assertEqual(saved.returncode, 1, saved.stdout)                         # not saved without --save
+
+    def test_save_keeps_the_fork_as_the_default(self):
+        self.rename_fork("myfork")
+        r = self.sync("--fork", "myfork", "--save", "--dry-run", "--no-tags")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.git(self.repo, "config", "--get", "sync-main.fork"), "myfork")
+        self.merge_pr(7, "feat-a")
+        r = self.sync("--no-tags")                                                   # no --fork: from config
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.ref("origin.git", "main"), self.ref("public.git", "main"))
+
+    def test_save_needs_something_to_save(self):
+        r = self.sync("--save", "--no-tags")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("--save stores --fork and/or --branch", r.stderr)
+
+    def test_refuses_the_upstream_as_the_fork(self):
+        r = self.sync("--fork", "public", "--no-tags")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("the fork can't be public", r.stderr)
+
+    def test_branch_option_brings_up_another_branch_and_tags_only_its_prs(self):
+        for repo in ("../public.git", "../origin.git"):
+            self.git(self.up, "push", "-q", repo, "main:release")
+        self.git(self.up, "checkout", "-q", "-b", "release", "main")
+        self.git(self.up, "checkout", "-q", "-b", "sync/rel-fix", "release")
+        head = self.commit(self.up, "fix: rel")
+        self.git(self.up, "checkout", "-q", "release")
+        merged = self.commit(self.up, "fix: rel (#11)")
+        self.git(self.up, "push", "-q", "../public.git", "release", f"{head}:refs/pull/11/head")
+        self.git(self.up, "checkout", "-q", "main")
+        rel_pr = {"number": 11, "title": "fix: rel", "merged_at": "2026-11-08T00:00:00Z",
+                  "merge_commit_sha": merged, "head": {"ref": "sync/rel-fix", "sha": head}, "base": {"ref": "release"}}
+        main_pr = self.merge_pr(7, "feat-a")
+        main_pr["base"] = {"ref": "main"}
+        main_before = self.ref("origin.git", "main")
+        r = self.sync("--branch", "release", "--prs-json", self.prs_file([main_pr, rel_pr]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.ref("origin.git", "release"), merged)
+        self.assertEqual(self.git(self.repo, "rev-parse", "release"), merged)
+        self.assertEqual(self.ref("origin.git", "main"), main_before)                # main untouched
+        tags = self.git(self.root / "origin.git", "tag", "-l", "synced/*").split()
+        self.assertEqual(tags, ["synced/rel-fix"])                                   # only the release PR
+        self.assertIn("on release", self.git(self.root / "origin.git", "tag", "-l", "--format=%(contents)",
+                                             "synced/rel-fix"))
+
+    def test_refuses_a_branch_the_upstream_does_not_have(self):
+        r = self.sync("--branch", "nope", "--no-tags")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("failed", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

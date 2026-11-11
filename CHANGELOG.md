@@ -74,6 +74,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - `scripts/sync-main.sh`: after a PR merges, fast-forwards the local `main` and the fork's `main` to
   `public/main` (stops if either has a commit that isn't there) and tags each merged `sync/<name>` PR as
   `synced/<name>` on the fork, at the PR head that was merged. The branch guard already pointed to it.
+  `--fork REMOTE` names the fork's remote (default `origin`) and `--branch NAME` the branch to bring up
+  (default `main`; only PRs merged into that branch are tagged); `--save` keeps the given values in the
+  clone's git config (`sync-main.fork`, `sync-main.branch`) as the defaults from then on.
 
 ### Changed
 - `analysis diff` reviews a diff larger than the budget **in chunks** instead of truncating it (before:
@@ -103,6 +106,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   answers are in the run report and summary. New preset `large-thinking` (6000 answer tokens). Per-profile
   `extra_body` request fields: `auth ai-set --no-thinking` (thinking off via `chat_template_kwargs`) or
   `--extra-body JSON`; also accepted in `KINETIC_AI_PROFILE`.
+- Forgejo sync rebases only when GitHub main has moved past the branch (#68): a branch already on GitHub
+  main goes up as is, with the same commits as on Forgejo and nothing rewritten. When a rebase is needed,
+  the log names the base and the main it rebases onto; the PR text says "already on main" or "rebased
+  onto main".
 
 ### Deprecated
 - `trim_trace_paths --redact-mode`: use `--mode` (`aggressive` = `--mode trim`, `context-only` =
@@ -110,6 +117,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- Forgejo sync's Dependabot check crashed on a pre-release version (`2.0.0` vs `2.0.0rc1` compared an int
+  with a string), refusing promotion with a traceback. Versions now compare by PEP 440; one that isn't PEP 440
+  is not counted as resolving an alert.
+- Forgejo sync gave a PR the title of a commit already on main when the branch had a merge commit (#68 and #69
+  went up titled as #66): the title came from `HEAD~N` with N counted before the rebase. The title is now the
+  branch's own first commit, and the commit count is taken after any rebase.
 - Forgejo sync failed on its first line since #66 (`mktemp: unrecognized option: suffix=.py`): the runner
   image's BusyBox `mktemp` has no long options. It now uses `mktemp -d`; a test keeps GNU-only `mktemp`
   options out of `.forgejo/workflows`.
@@ -148,6 +161,21 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   A typed vault passphrase is kept in memory until the command ends (said once; never stored);
   `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
 
+### Security
+- ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
+  into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
+  copied out of the workspace before it runs.
+- Forgejo sync runs the branch's tests (`SYNC_TEST_CMD`) without `GH_TOKEN`: they run the promoted branch's
+  code and got the whole environment. They now get an allowlist (`PATH`, `HOME`, locale, proxy, CA, `UV_*`, ...)
+  with secret-looking names dropped; set anything else inline in `SYNC_TEST_CMD`.
+- Forgejo sync's draft-advisory and secret-scanning guards passed silently when GitHub answered HTTP 403 (a
+  token without the permission read as "nothing found"). A guard that can't read its list (403, network error)
+  now refuses promotion, as does a failed issue lookup for "Closes #N". Lists follow GitHub's `Link` pagination
+  past the first 100 results.
+
+- GitHub workflows pin every action to a full commit SHA (the version in a comment) instead of a movable tag
+  or branch: the PyPI publish job holds `id-token: write`, so a moved or compromised upstream ref could have
+  published as kinetic-devops. Dependabot now updates the pins (`github-actions` ecosystem).
 
 ## [0.2.0.0a8] - 2026-11-01
 
