@@ -14,44 +14,80 @@ from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
 
-def parse_git_remote(url: str, error_type: type[Exception] = RuntimeError) -> Dict[str, str]:
-    """Parse git remote URL and extract host/owner/repo/scheme."""
-    value = str(url or "").strip()
-    if not value:
-        raise error_type("Empty git remote URL")
+_SSH_SCHEMES = ("ssh", "git+ssh", "ssh+git")
 
-    # SCP-like syntax: git@host:owner/repo.git
-    if "@" in value and ":" in value and not value.startswith(("http://", "https://", "ssh://")):
-        _, right = value.split("@", 1)
-        host, path = right.split(":", 1)
-        owner_repo = path.rstrip("/")
-        if owner_repo.endswith(".git"):
-            owner_repo = owner_repo[:-4]
-        parts = [p for p in owner_repo.split("/") if p]
-        if len(parts) < 2:
-            raise error_type(f"Unable to parse owner/repo from git remote: {value}")
-        return {
-            "host": host.lower(),
-            "owner": parts[-2],
-            "repo": parts[-1],
-            "scheme": "https",
-        }
 
-    parsed = urlparse(value)
-    if not parsed.netloc or not parsed.path:
-        raise error_type(f"Unable to parse git remote URL: {value}")
-
-    owner_repo = parsed.path.rstrip("/")
+def _owner_repo(path: str, value: str, error_type: type[Exception]) -> Tuple[str, str]:
+    owner_repo = path.rstrip("/")
     if owner_repo.endswith(".git"):
         owner_repo = owner_repo[:-4]
     parts = [p for p in owner_repo.split("/") if p]
     if len(parts) < 2:
-        raise error_type(f"Unable to parse owner/repo from git remote: {value}")
+        raise error_type(f"Unable to parse owner/repo from git remote: {redact_url(value)}")
+    return parts[-2], parts[-1]
+
+
+def redact_url(value: str) -> str:
+    """Return URL with any user info (user[:password]@) removed, for error messages and logs."""
+    text = str(value or "")
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        authority, sep, tail = rest.partition("/")
+        if "@" in authority:
+            authority = authority.rsplit("@", 1)[1]
+        return f"{scheme}://{authority}{sep}{tail}"
+    # SCP-like: [user@]host:path
+    head, sep, tail = text.partition("/")
+    if "@" in head:
+        head = head.rsplit("@", 1)[1]
+    return f"{head}{sep}{tail}"
+
+
+def parse_git_remote(url: str, error_type: type[Exception] = RuntimeError) -> Dict[str, str]:
+    """Parse git remote URL and extract host/owner/repo/scheme.
+
+    ``host`` is the bare lower-cased host name (no user info, no port): the identity used for provider
+    detection and keyring lookups. ``port`` is the explicit web port ("" when none), and ``authority`` is
+    ``host`` or ``host:port`` for building API URLs. SSH remotes (scp-like or ssh://) report scheme
+    "https" and no port: an SSH port is not the web/API port.
+    """
+    value = str(url or "").strip()
+    if not value:
+        raise error_type("Empty git remote URL")
+
+    # SCP-like syntax: [user@]host:owner/repo.git (no scheme, so no "://")
+    if "://" not in value and "@" in value and ":" in value:
+        left, path = value.split(":", 1)
+        host = left.rpartition("@")[2].strip().lower()
+        if not host:
+            raise error_type(f"Unable to parse git remote URL: {redact_url(value)}")
+        owner, repo = _owner_repo(path, value, error_type)
+        return {"host": host, "port": "", "authority": host, "owner": owner, "repo": repo, "scheme": "https"}
+
+    parsed = urlparse(value)
+    try:
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError as exc:  # invalid port
+        raise error_type(f"Unable to parse git remote URL: {redact_url(value)}") from exc
+    if not host or not parsed.path:
+        raise error_type(f"Unable to parse git remote URL: {redact_url(value)}")
+
+    owner, repo = _owner_repo(parsed.path, value, error_type)
+    scheme = (parsed.scheme or "https").lower()
+    if scheme in _SSH_SCHEMES:
+        scheme, port = "https", None
+    port_text = str(port) if port is not None else ""
+    authority = f"[{host}]" if ":" in host else host  # IPv6 literal
+    if port_text:
+        authority = f"{authority}:{port_text}"
     return {
-        "host": parsed.netloc.lower(),
-        "owner": parts[-2],
-        "repo": parts[-1],
-        "scheme": parsed.scheme or "https",
+        "host": host,
+        "port": port_text,
+        "authority": authority,
+        "owner": owner,
+        "repo": repo,
+        "scheme": scheme,
     }
 
 
@@ -93,11 +129,28 @@ def normalize_forgejo_api_base(base_url: str, error_type: type[Exception] = Runt
 
 
 def host_from_url(url_value: str, error_type: type[Exception] = RuntimeError) -> str:
-    """Extract hostname/netloc from URL value."""
+    """Extract the bare lower-cased host name from a URL (no user info, no port)."""
     parsed = urlparse(str(url_value or "").strip())
-    if not parsed.netloc:
-        raise error_type(f"Unable to parse host from URL: {url_value}")
-    return parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise error_type(f"Unable to parse host from URL: {redact_url(url_value)}")
+    return host
+
+
+def authority_from_url(url_value: str, error_type: type[Exception] = RuntimeError) -> str:
+    """Extract ``host`` or ``host:port`` from a URL, never the user info.
+
+    Used as the keyring host for self-hosted servers so a server on a non-default port keeps the
+    account names it always had (``host:port/owner``); resolve_token also tries the bare host.
+    """
+    parsed = urlparse(str(url_value or "").strip())
+    host = host_from_url(url_value, error_type=error_type)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise error_type(f"Unable to parse port from URL: {redact_url(url_value)}") from exc
+    authority = f"[{host}]" if ":" in host else host
+    return f"{authority}:{port}" if port is not None else authority
 
 
 def scoped_account(host: str, owner: str) -> str:
@@ -122,6 +175,9 @@ def resolve_token(
     3) host/owner scoped account
     4) host-only account
     5) legacy provider account (github|forgejo)
+
+    ``host`` may be ``host:port`` (see authority_from_url): the port-qualified accounts are tried
+    first, then the same accounts with the bare host name. User info is never part of an account.
     """
     env_var = str(env_name or "").strip()
     token = str(os.getenv(env_var, "") or "").strip()
@@ -130,7 +186,8 @@ def resolve_token(
 
     service = str(token_service or "").strip()
     explicit_account = str(token_account or "").strip()
-    host_value = str(host or "").strip().lower()
+    host_value = str(host or "").strip().lower().rpartition("@")[2]
+    bare_host = (urlparse(f"//{host_value}").hostname or "") if host_value else ""
     owner_value = str(owner or "").strip()
     legacy = str(legacy_account or "").strip()
 
@@ -138,12 +195,15 @@ def resolve_token(
     if explicit_account:
         accounts.append(explicit_account)
 
-    scoped = scoped_account(host_value, owner_value)
-    if scoped and scoped not in accounts:
-        accounts.append(scoped)
+    host_values = [h for h in dict.fromkeys((host_value, bare_host)) if h]
+    for value in host_values:
+        scoped = scoped_account(value, owner_value)
+        if scoped and scoped not in accounts:
+            accounts.append(scoped)
 
-    if host_value and host_value not in accounts:
-        accounts.append(host_value)
+    for value in host_values:
+        if value not in accounts:
+            accounts.append(value)
 
     if legacy and legacy not in accounts:
         accounts.append(legacy)

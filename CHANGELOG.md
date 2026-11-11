@@ -129,6 +129,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
 
+### Security
+- Repo host detection (`repo_context`, branch protection, repo maker) took the host from the URL's netloc, so
+  `ssh://git@github.com/...` was classified as Forgejo and a `user:token@` in the remote URL could reach the host
+  value (keyring account names, messages). The host is now the bare host name; a web port is kept only for API
+  URLs and port-qualified keyring accounts (still tried first, then the bare host). SSH ports are ignored.
+
 
 ## [0.2.0.0a8] - 2026-11-01
 
