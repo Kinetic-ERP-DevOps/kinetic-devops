@@ -1,6 +1,7 @@
 """Review-hardening tests for the AI diff review (analysis.py): verdict parsing, untrusted input,
 the commit cap and the request deadline. No model is called."""
 import argparse
+import importlib.util
 import io
 import json
 import os
@@ -12,6 +13,8 @@ from pathlib import Path
 from unittest import mock
 
 from kinetic_devops import analysis
+
+AI_REVIEW = Path(__file__).resolve().parents[1] / ".forgejo" / "actions" / "ai-review" / "ai_review.py"
 
 
 def git(cwd, *args):
@@ -161,6 +164,145 @@ class TestCommitCap(unittest.TestCase):
                                          json_out=str(self.tmp / "v.json"), md_out=str(self.tmp / "v.md"), strict=True)
         with mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(analysis._run_verify_report(verify_args), 1)   # a capped run never verifies clean
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class FakeSocket:
+    def __init__(self):
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+
+class FakeResponse:
+    """Stands in for urllib's HTTPResponse: every read takes `step` seconds of the fake clock, and
+    `fp.raw._sock` records the socket timeout set before each read. After `lines`, read(n) returns
+    `body` piece by piece, or trickles one byte at a time for ever when body is None."""
+
+    def __init__(self, clock, lines, step=1.0, body=None):
+        self.clock, self.lines, self.step = clock, list(lines), step
+        self.body = None if body is None else list(body)
+        self.sock = FakeSocket()
+        self.fp = mock.Mock(raw=mock.Mock(_sock=self.sock))
+        self.reads = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def readline(self):
+        self.clock.now += self.step
+        self.reads += 1
+        return self.lines.pop(0) if self.lines else b""
+
+    def read(self, size=-1):
+        if size is None or size < 0:   # one unbounded read of the whole body (what the old code did)
+            self.clock.now += 1000 * self.step
+            return b"".join(self.body or [b" ]}"])
+        self.clock.now += self.step
+        self.reads += 1
+        if self.body is None:
+            return b" "
+        return self.body.pop(0) if self.body else b""
+
+
+SSE = [b'data: {"choices": [{"delta": {"content": "VERDICT: GO"}}]}\n', b"\n",
+       b'data: {"choices": [{"delta": {"content": "!"}, "finish_reason": "stop"}]}\n', b"\n", b"data: [DONE]\n"]
+
+
+class TestRequestDeadline(unittest.TestCase):
+    """Each read is bounded by the time left (and a short idle cap once data flows); the plain-JSON
+    fallback is held to the same deadline."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        patcher = mock.patch.object(analysis.time, "monotonic", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"KINETIC_AI_READ_TIMEOUT": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_stream_reads_are_capped_by_time_left_then_idle_timeout(self):
+        resp = FakeResponse(self.clock, SSE, step=1.0)
+        out = analysis._read_ai_stream(resp, self.clock.now + 100, chat=True)
+        self.assertEqual(analysis.extract_text(out), "VERDICT: GO!")
+        first, *rest = resp.sock.timeouts
+        self.assertEqual(first, 100)                       # before any data: the whole time left
+        self.assertTrue(rest and all(t == analysis.AI_READ_TIMEOUT for t in rest), rest)
+
+    def test_read_timeout_never_exceeds_the_time_left(self):
+        resp = FakeResponse(self.clock, SSE, step=4.0)
+        with self.assertRaises(TimeoutError):
+            analysis._read_ai_stream(resp, self.clock.now + 10, chat=True)
+        self.assertEqual(resp.sock.timeouts, [10, 6, 2])
+
+    def test_idle_timeout_comes_from_the_environment(self):
+        os.environ["KINETIC_AI_READ_TIMEOUT"] = "7"
+        resp = FakeResponse(self.clock, SSE)
+        analysis._read_ai_stream(resp, self.clock.now + 100, chat=True)
+        self.assertEqual(max(resp.sock.timeouts[1:]), 7)
+
+    def test_plain_json_fallback_is_held_to_the_deadline(self):
+        resp = FakeResponse(self.clock, [b'{"choices": [\n'], step=2.0)
+        with self.assertRaises(TimeoutError):
+            analysis._read_ai_stream(resp, self.clock.now + 60, chat=True)
+        self.assertLess(resp.reads, 40)
+
+    def test_plain_json_fallback_within_the_deadline_is_accepted(self):
+        resp = FakeResponse(self.clock, [b'{"choices": [{"message":\n'], body=[b' {"content": ', b'"VERDICT: GO"}}]}'])
+        out = analysis._read_ai_stream(resp, self.clock.now + 60, chat=True)
+        self.assertEqual(analysis.extract_text(out), "VERDICT: GO")
+
+
+class TestForgejoAIReviewDeadline(TestRequestDeadline):
+    """The Forgejo ai-review action has the same read loop; it must honour the deadline the same way."""
+
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location("forgejo_ai_review", AI_REVIEW)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)   # main() only runs as a script
+
+    def chat(self, resp, deadline_s):
+        with mock.patch.object(self.mod.urllib.request, "urlopen", return_value=resp):
+            return self.mod.chat("http://llm.example.invalid/v1/chat/completions", {"model": "m"}, {}, deadline_s)
+
+    def test_stream_reads_are_capped_by_time_left_then_idle_timeout(self):
+        resp = FakeResponse(self.clock, SSE, step=1.0)
+        self.assertEqual(self.chat(resp, 100), "VERDICT: GO!")
+        first, *rest = resp.sock.timeouts
+        self.assertEqual(first, 100)
+        self.assertTrue(rest and all(t == self.mod.READ_TIMEOUT for t in rest), rest)
+
+    def test_read_timeout_never_exceeds_the_time_left(self):
+        resp = FakeResponse(self.clock, SSE, step=4.0)
+        with self.assertRaises(TimeoutError):
+            self.chat(resp, 10)
+        self.assertEqual(resp.sock.timeouts, [10, 6, 2])
+
+    def test_idle_timeout_comes_from_the_environment(self):
+        self.skipTest("the action has a fixed idle timeout")
+
+    def test_plain_json_fallback_is_held_to_the_deadline(self):
+        resp = FakeResponse(self.clock, [b'{"choices": [\n'], step=2.0)
+        with self.assertRaises(TimeoutError):
+            self.chat(resp, 60)
+        self.assertLess(resp.reads, 40)
+
+    def test_plain_json_fallback_within_the_deadline_is_accepted(self):
+        resp = FakeResponse(self.clock, [b'{"choices": [{"message":\n'], body=[b' {"content": ', b'"VERDICT: GO"}}]}'])
+        self.assertEqual(self.chat(resp, 60), "VERDICT: GO")
 
 
 if __name__ == "__main__":

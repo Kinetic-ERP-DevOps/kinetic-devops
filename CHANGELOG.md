@@ -108,6 +108,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- `analysis diff` and the Forgejo `ai-review` action: the AI request deadline was only checked between lines,
+  so one slow read could run a full timeout past it, and the plain-JSON fallback had no deadline at all. Every
+  read is now capped at the time left and, once the answer flows, at 30 s (`KINETIC_AI_READ_TIMEOUT`).
 - `analysis diff` / `legacy-intake`: with more commits than `--max-commits`, the oldest were silently skipped
   (git applied the cap before `--reverse`, keeping the newest N) and the run could still read as all GO. The
   oldest N are now reviewed; the rest are listed in an `unreviewed` item with verdict INCOMPLETE, a warning in

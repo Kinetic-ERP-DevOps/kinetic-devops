@@ -26,19 +26,48 @@ def post(url, payload, headers):
         return json.load(r)
 
 
-def chat(url, payload, headers, deadline_s=900):
+READ_TIMEOUT = 30  # seconds one read may stall once the answer is flowing
+
+
+def bound_next_read(r, deadline, idle=None):
+    """Past the deadline raise TimeoutError; else cap the next socket read at the time left (and at
+    `idle` once data flows), so one slow or trickling read can't outlast the deadline."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("review exceeded its deadline")
+    sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)  # HTTPResponse's socket
+    if sock is not None and hasattr(sock, "settimeout"):
+        sock.settimeout(min(left, idle) if idle else left)
+
+
+def chat(url, payload, headers, deadline_s=900, idle_s=READ_TIMEOUT):
     """Streamed chat completion: giving up (deadline, error) closes the connection, which frees the
-    server slot at once; an abandoned non-streaming request keeps the GPU busy until it finishes."""
+    server slot at once; an abandoned non-streaming request keeps the GPU busy until it finishes.
+    Every read, plain-JSON fallback included, is bounded by the deadline."""
     req = urllib.request.Request(url, json.dumps(dict(payload, stream=True)).encode(), headers, method="POST")
-    deadline, parts = time.monotonic() + deadline_s, []
+    deadline, parts, idle = time.monotonic() + deadline_s, [], None
     with urllib.request.urlopen(req, timeout=deadline_s) as r:
-        for line in r:
+        while True:
+            bound_next_read(r, deadline, idle)
+            raw = r.readline()
             if time.monotonic() > deadline:
                 raise TimeoutError("review exceeded its deadline")
-            line = line.decode("utf-8", "replace").strip()
+            if not raw:
+                break
+            idle = idle_s
+            line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:") or line == "data: [DONE]":
-                if line.startswith("{"):  # server ignored stream: plain JSON
-                    return json.loads(line + r.read().decode())["choices"][0]["message"]["content"]
+                if line.startswith("{"):  # server ignored stream: plain JSON, read under the same deadline
+                    body = [raw]
+                    while True:
+                        bound_next_read(r, deadline, idle)
+                        piece = r.read(65536)
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("review exceeded its deadline")
+                        if not piece:
+                            break
+                        body.append(piece)
+                    return json.loads(b"".join(body).decode("utf-8", "replace"))["choices"][0]["message"]["content"]
                 continue
             for c in json.loads(line[5:]).get("choices") or []:
                 parts.append((c.get("delta") or {}).get("content") or "")

@@ -294,29 +294,68 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
     )
     # Streamed so that giving up actually stops the work: closing the connection frees the server
     # slot within seconds, while an abandoned non-streaming request runs on until it finishes.
-    # `timeout` is a deadline for the whole answer (urlopen's own timeout is per socket read).
+    # `timeout` is a deadline for the whole answer; urlopen's own timeout is per socket read, so
+    # _read_ai_stream also bounds each read by the time left (see _bound_next_read).
     deadline = time.monotonic() + timeout
     with request.urlopen(req, timeout=timeout) as resp:
         return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"))
 
 
+AI_READ_TIMEOUT = 30.0  # seconds one read may stall once the answer is flowing (KINETIC_AI_READ_TIMEOUT)
+
+
+def _ai_read_timeout() -> float:
+    return float(_positive_int(os.getenv("KINETIC_AI_READ_TIMEOUT"), "KINETIC_AI_READ_TIMEOUT") or AI_READ_TIMEOUT)
+
+
+def _bound_next_read(resp: Any, deadline: float, idle: float | None) -> None:
+    """Raise TimeoutError past the deadline; else cap the socket timeout of the next read at the time
+    left and, once data flows, at `idle` (a stalled or trickling server can't outlast the deadline).
+    Before the first data the read may wait for the whole deadline (a queued request on a busy server)."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("AI response exceeded the request deadline")
+    # urllib's HTTPResponse -> BufferedReader -> SocketIO -> socket; absent on test doubles.
+    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    if sock is not None and hasattr(sock, "settimeout"):
+        sock.settimeout(min(left, idle) if idle else left)
+
+
 def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
     """Collect a server-sent-events answer into the non-streaming response shape.
 
-    A server that ignores ``stream`` and returns plain JSON is accepted as-is.
+    A server that ignores ``stream`` and returns plain JSON is accepted as-is. Every read, in the
+    stream and in the plain-JSON fallback, is bounded by the deadline (see _bound_next_read).
     """
-    first = resp.readline()
+    idle: float | None = None
+
+    def readline() -> bytes:
+        _bound_next_read(resp, deadline, idle)
+        line = resp.readline()
+        if time.monotonic() > deadline:
+            raise TimeoutError("AI response exceeded the request deadline")
+        return line
+
+    first = readline()
+    idle = _ai_read_timeout()
     while first and not first.strip():
-        first = resp.readline()
+        first = readline()
     if not first.lstrip().startswith(b"data:"):
-        return json.loads((first + resp.read()).decode("utf-8", errors="replace"))
+        body = [first]
+        while True:
+            _bound_next_read(resp, deadline, idle)
+            piece = resp.read(65536)
+            if time.monotonic() > deadline:
+                raise TimeoutError("AI response exceeded the request deadline")
+            if not piece:
+                break
+            body.append(piece)
+        return json.loads(b"".join(body).decode("utf-8", errors="replace"))
     parts: list[str] = []
     finish_reason = None
     usage = None
     line = first
     while line:
-        if time.monotonic() > deadline:
-            raise TimeoutError("AI response exceeded the request deadline")
         text = line.decode("utf-8", errors="replace").strip()
         if text.startswith("data:"):
             data = text[5:].strip()
@@ -331,7 +370,7 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
                 if isinstance(piece, str):
                     parts.append(piece)
                 finish_reason = choice.get("finish_reason") or finish_reason
-        line = resp.readline()
+        line = readline()
     content = "".join(parts)
     choice = {"message": {"role": "assistant", "content": content}} if chat else {"text": content}
     choice["finish_reason"] = finish_reason
