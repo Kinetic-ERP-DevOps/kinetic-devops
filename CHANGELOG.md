@@ -101,6 +101,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   answers are in the run report and summary. New preset `large-thinking` (6000 answer tokens). Per-profile
   `extra_body` request fields: `auth ai-set --no-thinking` (thinking off via `chat_template_kwargs`) or
   `--extra-body JSON`; also accepted in `KINETIC_AI_PROFILE`.
+- Forgejo sync rebases only when GitHub main has moved past the branch (#68): a branch already on GitHub
+  main goes up as is, with the same commits as on Forgejo and nothing rewritten. When a rebase is needed,
+  the log names the base and the main it rebases onto; the PR text says "already on main" or "rebased
+  onto main".
 
 ### Deprecated
 - `trim_trace_paths --redact-mode`: use `--mode` (`aggressive` = `--mode trim`, `context-only` =
