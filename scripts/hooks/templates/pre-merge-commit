@@ -3,8 +3,15 @@
 # This file is managed by scripts/install-hook.sh (source: scripts/hooks/templates/). Do not edit directly.
 
 # Local branch guard: no merge commits on main (merge into dev to try branches together).
+# Fails closed: a missing guard refuses the merge (KINETIC_ALLOW_MAIN=1 skips it once).
 GUARD="$(git rev-parse --git-path hooks)/branch-guard.sh"
 if [ -f "$GUARD" ]; then
     exec sh "$GUARD" commit
+fi
+if [ "$KINETIC_ALLOW_MAIN" != "1" ]; then
+    echo "pre-merge-commit: REFUSED: the branch guard is not installed ($GUARD)." >&2
+    echo "pre-merge-commit: reinstall the hooks: sh scripts/install-hook.sh (or scripts/install-hook.ps1)." >&2
+    echo "pre-merge-commit: (deliberate repair only: KINETIC_ALLOW_MAIN=1 skips this guard once)" >&2
+    exit 1
 fi
 exit 0

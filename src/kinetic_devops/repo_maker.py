@@ -186,14 +186,14 @@ def _resolve_context(provider: str, args: argparse.Namespace):
                 "Current git remote appears to be GitHub. Use --provider github or pass Forgejo URL/owner explicitly."
             )
         if not url_value:
-            url_value = f"{detected.get('scheme', 'https')}://{detected['host']}/api/v1"
+            url_value = f"{detected.get('scheme', 'https')}://{detected.get('authority') or detected['host']}/api/v1"
         if not owner:
             owner = detected["owner"]
-        host = detected["host"]
+        host = detected.get("authority") or detected["host"]
 
     api_base = repo_context.normalize_forgejo_api_base(url_value, error_type=RepoMakerError)
     if not host:
-        host = repo_context.host_from_url(api_base, error_type=RepoMakerError)
+        host = repo_context.authority_from_url(api_base, error_type=RepoMakerError)
     return owner, host, api_base
 
 

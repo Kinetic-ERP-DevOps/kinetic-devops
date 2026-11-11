@@ -3,9 +3,15 @@
 # This file is managed by scripts/install-hook.sh (source: scripts/hooks/templates/). Do not edit directly.
 
 # Local branch guard first (no commits on main); see branch-guard.sh next to this hook.
+# Fails closed: a missing guard refuses the commit (KINETIC_ALLOW_MAIN=1 skips it once).
 GUARD="$(git rev-parse --git-path hooks)/branch-guard.sh"
 if [ -f "$GUARD" ]; then
     sh "$GUARD" commit || exit 1
+elif [ "$KINETIC_ALLOW_MAIN" != "1" ]; then
+    echo "pre-commit: REFUSED: the branch guard is not installed ($GUARD)." >&2
+    echo "pre-commit: reinstall the hooks: sh scripts/install-hook.sh (or scripts/install-hook.ps1)." >&2
+    echo "pre-commit: (deliberate repair only: KINETIC_ALLOW_MAIN=1 skips this guard once)" >&2
+    exit 1
 fi
 
 echo "Running pre-commit checks..."

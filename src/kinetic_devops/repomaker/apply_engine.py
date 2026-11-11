@@ -10,7 +10,6 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 import requests
 from kinetic_devops import repo_context
@@ -51,39 +50,10 @@ class BranchProtectionError(RuntimeError):
 
 
 def _parse_git_remote(url: str) -> Dict[str, str]:
-    """Parse origin remote URL into host/owner/repo components."""
-    value = str(url or "").strip()
-    if not value:
+    """Parse origin remote URL into host/port/authority/owner/repo/scheme (see repo_context)."""
+    if not str(url or "").strip():
         raise BranchProtectionError("Unable to parse empty git remote URL")
-
-    # SCP-like syntax: git@host:owner/repo.git
-    if "@" in value and ":" in value and not value.startswith(("http://", "https://", "ssh://")):
-        _, right = value.split("@", 1)
-        host, path = right.split(":", 1)
-        owner_repo = path.rstrip("/")
-        if owner_repo.endswith(".git"):
-            owner_repo = owner_repo[:-4]
-        parts = [p for p in owner_repo.split("/") if p]
-        if len(parts) < 2:
-            raise BranchProtectionError(f"Unable to parse owner/repo from git remote: {value}")
-        return {"host": host.lower(), "owner": parts[-2], "repo": parts[-1], "scheme": "https"}
-
-    parsed = urlparse(value)
-    if not parsed.netloc or not parsed.path:
-        raise BranchProtectionError(f"Unable to parse git remote URL: {value}")
-
-    owner_repo = parsed.path.rstrip("/")
-    if owner_repo.endswith(".git"):
-        owner_repo = owner_repo[:-4]
-    parts = [p for p in owner_repo.split("/") if p]
-    if len(parts) < 2:
-        raise BranchProtectionError(f"Unable to parse owner/repo from git remote: {value}")
-    return {
-        "host": parsed.netloc.lower(),
-        "owner": parts[-2],
-        "repo": parts[-1],
-        "scheme": parsed.scheme or "https",
-    }
+    return repo_context.parse_git_remote(url, error_type=BranchProtectionError)
 
 
 def _detect_current_repo_from_git() -> Dict[str, str]:
@@ -110,7 +80,7 @@ def _detect_current_repo_from_git() -> Dict[str, str]:
     }
     if provider == "forgejo":
         scheme = parsed.get("scheme") or "https"
-        result["forgejo_api_base"] = f"{scheme}://{host}/api/v1"
+        result["forgejo_api_base"] = f"{scheme}://{parsed['authority']}/api/v1"
 
     return result
 
@@ -220,7 +190,7 @@ def _resolve_token(target: Target) -> tuple[str, str, str, str]:
     if target.provider == "github":
         host = "github.com"
     else:
-        host = repo_context.host_from_url(target.forgejo_api_base, error_type=BranchProtectionError)
+        host = repo_context.authority_from_url(target.forgejo_api_base, error_type=BranchProtectionError)
 
     token, source, accounts = repo_context.resolve_token(
         env_name=env_name,

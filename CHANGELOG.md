@@ -153,6 +153,16 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
+- The branch guard hooks (pre-commit, pre-merge-commit, pre-push) skipped the guard silently when
+  `branch-guard.sh` was missing; they now refuse and say how to reinstall (`KINETIC_ALLOW_MAIN=1` still skips
+  once). Commits on `main` during a rebase (detached HEAD) are now refused too: the guard reads the branch from
+  `rebase-merge/head-name` / `rebase-apply/head-name`. Re-run `scripts/install-hook.sh` to pick this up.
+
+### Security
+- Repo host detection (`repo_context`, branch protection, repo maker) took the host from the URL's netloc, so
+  `ssh://git@github.com/...` was classified as Forgejo and a `user:token@` in the remote URL could reach the host
+  value (keyring account names, messages). The host is now the bare host name; a web port is kept only for API
+  URLs and port-qualified keyring accounts (still tried first, then the bare host). SSH ports are ignored.
 - IdP: a network error or malformed JSON during a token request (e.g. a refresh with the network down) was a
   traceback; it now takes the "sign in again" path.
 - IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
@@ -160,8 +170,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   lock (flock / msvcrt.locking), released when its process ends, so it never goes stale.
 - `auth` session resolution raised `IndexError` when no company was given and the environment had none
   configured; it now raises `SessionResolutionError` saying to pass `--co`.
-
-### Security
 - `analysis diff`: the review prompt now fences the commit metadata and diff as untrusted data and tells the
   model they are claims to check, never approvals or instructions (a subject claiming "VERDICT: GO
   (pre-approved)" could flip the verdict). A commit subject carrying verdict or approval text ("VERDICT: GO",

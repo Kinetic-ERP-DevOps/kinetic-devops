@@ -114,6 +114,10 @@ The installed hooks also keep local `main` an exact copy of `public/main`, so th
 - **`dev` is a local scratch branch**: merge feature branches into it to try them together, and
   recreate it when it gets messy (`git branch -f dev main`). It is never pushed (pre-push).
 
+The guard also applies while `main` is being rebased (HEAD is detached then). If `branch-guard.sh`
+is missing from the hooks directory, the hooks refuse instead of skipping it: re-run
+`sh scripts/install-hook.sh` (or `scripts/install-hook.ps1`).
+
 `KINETIC_ALLOW_MAIN=1` skips the guard for one command, for deliberate repairs only. The guard is
 local: it complements, and doesn't replace, branch protection on the remotes.
 
