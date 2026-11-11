@@ -118,8 +118,13 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 
 ### Fixed
 - `analysis diff` and the Forgejo `ai-review` action: the AI request deadline was only checked between lines,
-  so one slow read could run a full timeout past it, and the plain-JSON fallback had no deadline at all. Every
-  read is now capped at the time left and, once the answer flows, at 30 s (`KINETIC_AI_READ_TIMEOUT`).
+  so one slow read could run a full timeout past it, and the plain-JSON fallback had no deadline at all. The
+  deadline now bounds the whole answer: a watchdog shuts the connection down when it passes, so a server
+  trickling bytes without a newline can't hold one read open, and each socket read is capped at the time left
+  and, once answer content flows (not keep-alive or role-only events), at 30 s (`KINETIC_AI_READ_TIMEOUT`,
+  checked before the request is sent). The `ai-review` action now stops at `data: [DONE]` instead of waiting
+  for the server to close the connection. The time to receive the response headers is still bounded only
+  per read.
 - `analysis diff` / `legacy-intake`: with more commits than `--max-commits`, the oldest were silently skipped
   (git applied the cap before `--reverse`, keeping the newest N) and the run could still read as all GO. The
   oldest N (in topological order, parents first) are now reviewed; the rest are listed in an `unreviewed` item

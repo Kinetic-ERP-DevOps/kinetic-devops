@@ -2,8 +2,11 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -294,39 +297,76 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
     )
     # Streamed so that giving up actually stops the work: closing the connection frees the server
     # slot within seconds, while an abandoned non-streaming request runs on until it finishes.
-    # `timeout` is a deadline for the whole answer; urlopen's own timeout is per socket read, so
-    # _read_ai_stream also bounds each read by the time left (see _bound_next_read).
+    # `timeout` is a deadline for the whole answer. urlopen's own timeout is per socket recv, and one
+    # readline() can make many recvs, so a watchdog shuts the socket down at the deadline (see
+    # _deadline_watchdog) and _read_ai_stream also caps each recv by the time left and an idle timeout.
+    idle = _ai_read_timeout()   # a bad KINETIC_AI_READ_TIMEOUT fails before the request is sent
     deadline = time.monotonic() + timeout
-    with request.urlopen(req, timeout=timeout) as resp:
-        return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"))
+    with request.urlopen(req, timeout=timeout) as resp, _deadline_watchdog(resp, deadline):
+        return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"), idle_timeout=idle)
 
 
-AI_READ_TIMEOUT = 30.0  # seconds one read may stall once the answer is flowing (KINETIC_AI_READ_TIMEOUT)
+AI_READ_TIMEOUT = 30.0  # seconds one recv may stall once the answer is flowing (KINETIC_AI_READ_TIMEOUT)
 
 
 def _ai_read_timeout() -> float:
     return float(_positive_int(os.getenv("KINETIC_AI_READ_TIMEOUT"), "KINETIC_AI_READ_TIMEOUT") or AI_READ_TIMEOUT)
 
 
+def _response_socket(resp: Any) -> Any:
+    # urllib's HTTPResponse -> BufferedReader -> SocketIO -> socket; absent on test doubles.
+    return getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+
+
+@contextmanager
+def _deadline_watchdog(resp: Any, deadline: float):
+    """Shut the response's socket down at the deadline, so a read that keeps receiving a byte now and
+    then (one readline() is many recvs, each within the socket timeout) still ends there: the pending
+    recv returns EOF and the caller's deadline check raises TimeoutError. shutdown(), not close(), is
+    safe while another thread is blocked in recv."""
+    sock = _response_socket(resp)
+    if sock is None or not hasattr(sock, "shutdown"):
+        yield
+        return
+
+    def fire() -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    timer = threading.Timer(max(deadline - time.monotonic(), 0.0), fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
 def _bound_next_read(resp: Any, deadline: float, idle: float | None) -> None:
-    """Raise TimeoutError past the deadline; else cap the socket timeout of the next read at the time
-    left and, once data flows, at `idle` (a stalled or trickling server can't outlast the deadline).
-    Before the first data the read may wait for the whole deadline (a queued request on a busy server)."""
+    """Raise TimeoutError past the deadline; else cap the socket timeout of the next recv at the time
+    left and, once content flows, at `idle`. This bounds each recv, not a whole readline() (a trickle
+    of bytes without a newline is many recvs): _deadline_watchdog enforces the deadline for those.
+    Before the first content a recv may wait for the whole deadline (a queued request on a busy server)."""
     left = deadline - time.monotonic()
     if left <= 0:
         raise TimeoutError("AI response exceeded the request deadline")
-    # urllib's HTTPResponse -> BufferedReader -> SocketIO -> socket; absent on test doubles.
-    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    sock = _response_socket(resp)
     if sock is not None and hasattr(sock, "settimeout"):
         sock.settimeout(min(left, idle) if idle else left)
 
 
-def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
+def _read_ai_stream(resp: Any, deadline: float, chat: bool, idle_timeout: float | None = None) -> dict[str, Any]:
     """Collect a server-sent-events answer into the non-streaming response shape.
 
-    A server that ignores ``stream`` and returns plain JSON is accepted as-is. Every read, in the
-    stream and in the plain-JSON fallback, is bounded by the deadline (see _bound_next_read).
+    A server that ignores ``stream`` and returns plain JSON is accepted as-is. Reads past the deadline
+    raise TimeoutError; each recv waits at most the time left and, once answer content (or a plain-JSON
+    body) has arrived, at most `idle_timeout` (KINETIC_AI_READ_TIMEOUT). Blank, keep-alive and role-only
+    events don't start the idle timer. The stream ends at ``data: [DONE]`` even if the server keeps the
+    connection open. With call_ai's watchdog, the deadline also bounds a read that trickles bytes.
     """
+    idle_after_content = _ai_read_timeout() if idle_timeout is None else idle_timeout
     idle: float | None = None
 
     def readline() -> bytes:
@@ -337,10 +377,10 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
         return line
 
     first = readline()
-    idle = _ai_read_timeout()
     while first and not first.strip():
         first = readline()
-    if not first.lstrip().startswith(b"data:"):
+    if not first.lstrip().startswith((b"data:", b":", b"event:", b"id:", b"retry:")):
+        idle = idle_after_content   # a plain-JSON body has started
         body = [first]
         while True:
             _bound_next_read(resp, deadline, idle)
@@ -366,9 +406,12 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
                 raise RuntimeError(f"AI stream error: {event['error']}")
             usage = event.get("usage") or usage
             for choice in event.get("choices") or []:
-                piece = (choice.get("delta") or {}).get("content") if chat else choice.get("text")
+                delta = choice.get("delta") or {}
+                piece = delta.get("content") if chat else choice.get("text")
                 if isinstance(piece, str):
                     parts.append(piece)
+                if piece or delta.get("reasoning_content") or delta.get("reasoning"):
+                    idle = idle_after_content   # content is flowing: from now on a stall is an error
                 finish_reason = choice.get("finish_reason") or finish_reason
         line = readline()
     content = "".join(parts)

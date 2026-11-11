@@ -6,8 +6,11 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -382,6 +385,24 @@ class TestRequestDeadline(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"KINETIC_AI_READ_TIMEOUT": ""})
         env.start()
         self.addCleanup(env.stop)
+        self.idle_default = analysis.AI_READ_TIMEOUT
+
+    def read(self, resp, deadline_s):
+        return analysis.extract_text(analysis._read_ai_stream(resp, self.clock.now + deadline_s, chat=True))
+
+    def test_done_ends_the_stream_while_the_connection_stays_open(self):
+        # a server that keeps the connection open after [DONE] (here: keep-alives until the deadline)
+        resp = FakeResponse(self.clock, SSE + [b": keep-alive\n"] * 1000, step=1.0)
+        self.assertEqual(self.read(resp, 100), "VERDICT: GO!")
+        self.assertEqual(resp.reads, len(SSE))
+
+    def test_idle_timer_starts_with_the_first_content(self):
+        preamble = [b": keep-alive\n", b"\n", b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n', b"\n"]
+        resp = FakeResponse(self.clock, preamble + SSE, step=1.0)
+        self.assertEqual(self.read(resp, 100), "VERDICT: GO!")
+        before, after = resp.sock.timeouts[:5], resp.sock.timeouts[5:]
+        self.assertEqual(before, [100, 99, 98, 97, 96])   # keep-alive / role-only lines: no idle cap yet
+        self.assertTrue(after and all(t == self.idle_default for t in after), after)
 
     def test_stream_reads_are_capped_by_time_left_then_idle_timeout(self):
         resp = FakeResponse(self.clock, SSE, step=1.0)
@@ -424,9 +445,13 @@ class TestForgejoAIReviewDeadline(TestRequestDeadline):
         self.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.mod)   # main() only runs as a script
 
+        self.idle_default = self.mod.READ_TIMEOUT
+
     def chat(self, resp, deadline_s):
         with mock.patch.object(self.mod.urllib.request, "urlopen", return_value=resp):
             return self.mod.chat("http://llm.example.invalid/v1/chat/completions", {"model": "m"}, {}, deadline_s)
+
+    read = chat
 
     def test_stream_reads_are_capped_by_time_left_then_idle_timeout(self):
         resp = FakeResponse(self.clock, SSE, step=1.0)
@@ -453,6 +478,80 @@ class TestForgejoAIReviewDeadline(TestRequestDeadline):
     def test_plain_json_fallback_within_the_deadline_is_accepted(self):
         resp = FakeResponse(self.clock, [b'{"choices": [{"message":\n'], body=[b' {"content": ', b'"VERDICT: GO"}}]}'])
         self.assertEqual(self.chat(resp, 60), "VERDICT: GO")
+
+
+def load_ai_review():
+    spec = importlib.util.spec_from_file_location("forgejo_ai_review", AI_REVIEW)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TrickleServer:
+    """A local HTTP server that sends headers, then one byte at a time without a newline, for ever:
+    each recv gets data well within the socket timeout, so only the deadline can end the read."""
+
+    def __init__(self, interval=0.05):
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        self.interval, self.stop = interval, threading.Event()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        conn, _ = self.sock.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                         b'data: {"choices": [{"delta": {"content": "')
+            try:
+                while not self.stop.wait(self.interval):
+                    conn.sendall(b"x")
+            except OSError:
+                pass
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+        self.thread.join(5)
+
+
+class TestDeadlineAgainstATrickle(unittest.TestCase):
+    """Real sockets: a byte every 50 ms without a newline keeps one readline() busy for ever; the
+    watchdog must still end the read at the deadline, in analysis.call_ai and in the Forgejo action."""
+
+    def setUp(self):
+        self.server = TrickleServer()
+        self.addCleanup(self.server.close)
+
+    def test_call_ai_stops_at_the_deadline(self):
+        with mock.patch.object(analysis, "_ai_client_settings", return_value=("openai-chat", {})), \
+                mock.patch.object(analysis, "_profile_for_url", return_value={}), \
+                mock.patch.dict(os.environ, {"KINETIC_AI_READ_TIMEOUT": ""}):
+            start = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                analysis.call_ai(self.server.url, 1, "m", "p")
+        self.assertLess(time.monotonic() - start, 3)
+
+    def test_forgejo_chat_stops_at_the_deadline(self):
+        mod = load_ai_review()
+        start = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            mod.chat(self.server.url + "/v1/chat/completions", {"model": "m"}, {}, deadline_s=1)
+        self.assertLess(time.monotonic() - start, 3)
+
+
+class TestReadTimeoutSetting(unittest.TestCase):
+    def test_bad_read_timeout_fails_before_the_request(self):
+        for value in ("abc", "0", "-5"):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"KINETIC_AI_READ_TIMEOUT": value}), \
+                    mock.patch.object(analysis, "_ai_client_settings", return_value=("openai-chat", {})), \
+                    mock.patch.object(analysis, "_profile_for_url", return_value={}), \
+                    mock.patch.object(analysis.request, "urlopen") as urlopen:
+                with self.assertRaises(ValueError):
+                    analysis.call_ai("http://ai.example.invalid", 5, "m", "p")
+                urlopen.assert_not_called()
 
 
 if __name__ == "__main__":
