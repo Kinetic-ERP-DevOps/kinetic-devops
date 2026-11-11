@@ -136,11 +136,13 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   chunk NO-GO, so an answer that quotes an injected "VERDICT: GO" (from a commit subject, the diff, a code
   block, a quoted `</think>`) can't pass when it says NO-GO; naming the choice ("GO/NO-GO") doesn't count. A
   negated GO on a VERDICT line or anywhere in the GO/NO-GO section ("NOT GO", "do not go ahead") is NO-GO.
-  A hedged or withheld GO/NO-GO section ("Conditional GO", "HOLD", "not yet") is NO-GO. GO needs an
+  A hedged, withheld or refused GO/NO-GO section ("Conditional GO", "on hold", "Not yet", "Do not promote",
+  "REJECT.") is NO-GO. GO needs an
   unconditional `VERDICT: GO` line the answer leads with: its first line (one title line may come before it;
   leading `<think>` reasoning is skipped, but never a NO-GO before a lone `</think>`), not in a code fence,
   indented or quoted with `>`, and not the instruction echoed back; "VERDICT: GO if/pending/until/but ..." is
-  not a pass. Anything else is UNKNOWN; before, a bare "GO" in the last section passed, so "Do
+  not a pass, nor is a GO after a verdict line that isn't GO/NO-GO ("VERDICT: REJECT"). Headings in
+  any case ("Go/No-Go") name the choice, not a NO-GO. Anything else is UNKNOWN; before, a bare "GO" in the last section passed, so "Do
   NOT GO: ..." read as GO. The cost: some answers that mention NO-GO in passing ("no NO-GO risks") now read
   as NO-GO, never a false GO.
 - Forgejo sync's Dependabot check crashed on a pre-release version (`2.0.0` vs `2.0.0rc1` compared an int

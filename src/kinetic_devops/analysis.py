@@ -522,21 +522,29 @@ _VERDICT_LINE = re.compile(
     re.IGNORECASE)
 # The choice itself, as the prompt and its headings name it ("GO/NO-GO", "GO or NO-GO", "GO|NO-GO"): naming the
 # choice is not a NO-GO, so it is blanked out before NO-GO is looked for.
-_CHOICE = re.compile(r"\bGO[ \t]*(?:/|\||(?i:\bor\b))[ \t]*(?:VERDICT\W{0,4}:\W{0,4})?NO[- ]GO\b")
+_CHOICE = re.compile(r"\bGO[ \t]*(?:/|\||\bor\b)[ \t]*(?:VERDICT\W{0,4}:\W{0,4})?NO[- ]GO\b", re.IGNORECASE)
 _NO_GO_WORD = re.compile(r"\bNO[- ]GO\b", re.IGNORECASE)
 # Negated GO in any case ("NOT GO", "do not go ahead", "don’t GO"): looked for only in the GO/NO-GO section, where
 # it is the verdict, and on VERDICT lines.
 _NEGATED_GO = re.compile(r"\b(?:NOT|DON['’]?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
-_SECTION_HEADING = re.compile(r"^[ \t#*_\d.)]*GO\s*/\s*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
+_SECTION_HEADING = re.compile(r"^[^\n]{0,60}?\bGO[ \t]*/[ \t]*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
 # A numbered section heading ("1) Change Classification", "## 2. Risk", "**3)"): the lead must come before one.
+_VERDICT_WORD = re.compile(r"^[ *#_`]*VERDICT\b", re.IGNORECASE)   # any verdict line, GO/NO-GO or not
 _NUMBERED_HEADING = re.compile(r"^[ \t#*_]*\d+[.)]\s")
 # A GO with a condition is not a pass: "VERDICT: GO if/unless/pending/once/after/until/but ...".
 _CONDITION = re.compile(r"\b(?:if|unless|pending|once|after|until|provided|assuming|conditional(?:ly)?|subject\s+to|"
-                        r"but|except|caveats?)\b", re.IGNORECASE)
+                        r"but|except|caveats?|however|though|although|when|reservations?|tentative(?:ly)?|"
+                        r"provisional(?:ly)?)\b|^\s*\?|^\*(?!\*)|^-\w", re.IGNORECASE)   # "GO?", "GO*" footnote, "GO-ish"
 # A hedged or withheld verdict in the GO/NO-GO section ("Conditional GO", "HOLD", "not yet", "isn't a GO").
-_WITHHELD = re.compile(r"\bconditional(?:ly)?\s+GO\b|\bGO\s+with\s+(?:conditions|caveats)\b|\bHOLD\b|\bnot\s+yet\b|"
-                       r"\bisn['’]?t\s+a\s+GO\b|\bwon['’]?t\s+GO\b|\bcan(?:no|['’])t\s+go\b|\bshould\s+not\s+be\s+promoted\b",
-                       re.IGNORECASE)
+_WITHHELD = re.compile(
+    r"\bconditional(?:ly)?\s+GO\b|\bGO\s+with\s+(?:conditions|caveats|reservations)\b|\bon\s+hold\b|\bhold\s+off\b|"
+    r"\bhold\s+(?:until|for|pending)\b|^\W*not\s+yet\b|"
+    # a refusal word opening a line, followed by punctuation or the line end ("NO.", "FAIL — needs rework")
+    r"^\W*(?:HOLD|STOP|NO|NOGO|FAIL(?:ED)?|BLOCK(?:ED)?|REJECT(?:ED)?)(?:\s*[.:!—–]|\s+-\s|\s*$)|"
+    r"\bnot\s+yet\s+(?:ready|safe|a\s+GO)\b|\bisn['’]?t\s+a\s+GO\b|\bwon['’]?t\s+GO\b|\bcan(?:no|['’])t\s+go\b|"
+    r"\b(?:should|must)\s+not\s+be\s+(?:promoted|merged)\b|\b(?:do\s+not|don['’]?t)\s+(?:promote|merge)\b|\bNOGO\b",
+    re.IGNORECASE | re.MULTILINE)
+
 _DASHES = re.compile(r"[\u2010-\u2015\u2212]|\\-")   # Unicode dashes, and a markdown-escaped "\-"
 LEAD_WINDOW = 400   # the prompt asks for the VERDICT line first
 
@@ -596,7 +604,7 @@ def parse_verdict(review_text: str) -> str:
         m = _VERDICT_LINE.match(line)
         if m:
             return "GO" if m.group(1).upper() == "GO" and not _CONDITION.search(m.group(2)) else "UNKNOWN"
-        if title_seen or _NUMBERED_HEADING.match(line):
+        if title_seen or _NUMBERED_HEADING.match(line) or _VERDICT_WORD.match(line):
             return "UNKNOWN"   # the review started without its verdict line
         title_seen = True
     return "UNKNOWN"
@@ -654,7 +662,7 @@ _REVIEW_STEERING = re.compile(
 
 def steers_review(text: str) -> bool:
     """True when text (a commit subject) carries verdict or approval claims aimed at the reviewer."""
-    return bool(_REVIEW_STEERING.search((text or "").strip()[:2000]))
+    return bool(_REVIEW_STEERING.search((text or "").strip()))
 
 
 def is_rogue_commit(subject: str, paths: list[str]) -> bool:
