@@ -505,11 +505,18 @@ class TestDiffChunking(unittest.TestCase):
 
     def test_verdict_parsing(self):
         cases = {
-            "...\n6) GO/NO-GO for further promotion\n**GO**. Safe.": "GO",
+            # without a VERDICT line a GO is never trusted (issue #5: "do NOT GO" parsed as GO)
+            "...\n6) GO/NO-GO for further promotion\n**GO**. Safe.": "UNKNOWN",
             "6) GO/NO-GO\n**NO-GO** (Conditional): fix first": "NO-GO",
             "## GO/NO-GO\nNo go until tests pass": "NO-GO",
             "6) GO/NO-GO\nUndecided.": "UNKNOWN",
-            "short answer without sections: GO": "GO",
+            "short answer without sections: GO": "UNKNOWN",
+            "1) Change Classification\nPermission check.\n6) GO/NO-GO for further promotion\n"
+            "Do NOT GO: the check now fails open.": "NO-GO",
+            "6) GO/NO-GO\nThis is not a GO yet.": "NO-GO",
+            "6) GO/NO-GO\nDon't GO until the test passes.": "NO-GO",
+            "VERDICT: NOT GO\n1) Change Classification ...": "NO-GO",
+            "VERDICT: GO\n6) GO/NO-GO for further promotion\nDo NOT GO: the check fails open.": "NO-GO",
             "VERDICT: NO-GO\n1) Change Classification\n... 3) Regression Risk: cut off mid-sent": "NO-GO",
             "**VERDICT: GO**\n1) Change Classification ...": "GO",
             "1) Change Classification\n2) Functionality Loss Risk: the answer was cut off here": "UNKNOWN",
@@ -597,7 +604,7 @@ class TestChunkedDiffReview(AIProfileTestBase):
         return calls, commit
 
     def test_every_chunk_is_reviewed_and_verdicts_combine(self):
-        calls, commit = self._run(["6) GO/NO-GO\n**GO**"])
+        calls, commit = self._run(["VERDICT: GO\n6) GO/NO-GO\n**GO**"])
         chunk_calls = [c for c in calls if c.full_url.endswith("/chat/completions")]
         self.assertGreater(commit["chunk_count"], 1)
         self.assertEqual(commit["chunks_reviewed"], commit["chunk_count"])
@@ -612,12 +619,12 @@ class TestChunkedDiffReview(AIProfileTestBase):
         self.assertIn(f"## Chunk {commit['chunk_count']} of {commit['chunk_count']}", md)
 
     def test_one_no_go_chunk_makes_the_item_no_go(self):
-        replies = ["6) GO/NO-GO\n**GO**"] * 2 + ["6) GO/NO-GO\n**NO-GO**: removes a check"] + ["6) GO/NO-GO\n**GO**"] * 20
+        replies = ["VERDICT: GO\n6) GO/NO-GO\n**GO**"] * 2 + ["6) GO/NO-GO\n**NO-GO**: removes a check"] + ["VERDICT: GO\n6) GO/NO-GO\n**GO**"] * 20
         _, commit = self._run(replies)
         self.assertEqual(commit["verdict"], "NO-GO")
 
     def test_chunk_cap_makes_the_item_incomplete_not_go(self):
-        _, commit = self._run(["6) GO/NO-GO\n**GO**"], chunks=1)
+        _, commit = self._run(["VERDICT: GO\n6) GO/NO-GO\n**GO**"], chunks=1)
         self.assertGreater(commit["chunk_count"], 1)
         self.assertEqual(commit["chunks_reviewed"], 1)
         self.assertEqual(commit["verdict"], "INCOMPLETE")
