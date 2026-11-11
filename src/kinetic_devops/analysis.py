@@ -2,8 +2,11 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -294,39 +297,83 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
     )
     # Streamed so that giving up actually stops the work: closing the connection frees the server
     # slot within seconds, while an abandoned non-streaming request runs on until it finishes.
-    # `timeout` is a deadline for the whole answer; urlopen's own timeout is per socket read, so
-    # _read_ai_stream also bounds each read by the time left (see _bound_next_read).
+    # `timeout` is a deadline for the whole answer. urlopen's own timeout is per socket recv, and one
+    # readline() can make many recvs, so a watchdog shuts the socket down at the deadline (see
+    # _deadline_watchdog) and _read_ai_stream also caps each recv by the time left and an idle timeout.
+    idle = _ai_read_timeout()   # a bad KINETIC_AI_READ_TIMEOUT fails before the request is sent
     deadline = time.monotonic() + timeout
-    with request.urlopen(req, timeout=timeout) as resp:
-        return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"))
+    try:
+        with request.urlopen(req, timeout=timeout) as resp, _deadline_watchdog(resp, deadline):
+            return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"), idle_timeout=idle)
+    except (OSError, ValueError, AttributeError) as exc:
+        # Over TLS the watchdog's shutdown surfaces as "Broken pipe" (or a closed-file error) in the blocked
+        # read; past the deadline that is the deadline, so say so.
+        if not isinstance(exc, TimeoutError) and time.monotonic() >= deadline:
+            raise TimeoutError("AI response exceeded the request deadline") from exc
+        raise
 
 
-AI_READ_TIMEOUT = 30.0  # seconds one read may stall once the answer is flowing (KINETIC_AI_READ_TIMEOUT)
+AI_READ_TIMEOUT = 30.0  # seconds one recv may stall once the answer is flowing (KINETIC_AI_READ_TIMEOUT)
 
 
 def _ai_read_timeout() -> float:
     return float(_positive_int(os.getenv("KINETIC_AI_READ_TIMEOUT"), "KINETIC_AI_READ_TIMEOUT") or AI_READ_TIMEOUT)
 
 
+def _response_socket(resp: Any) -> Any:
+    # urllib's HTTPResponse -> BufferedReader -> SocketIO -> socket; absent on test doubles.
+    return getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+
+
+@contextmanager
+def _deadline_watchdog(resp: Any, deadline: float):
+    """Shut the response's socket down at the deadline, so a read that keeps receiving a byte now and
+    then (one readline() is many recvs, each within the socket timeout) still ends there: the pending
+    recv returns EOF and the caller's deadline check raises TimeoutError. shutdown(), not close(), is
+    safe while another thread is blocked in recv."""
+    sock = _response_socket(resp)
+    if sock is None or not hasattr(sock, "shutdown"):
+        yield
+        return
+
+    def fire() -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    timer = threading.Timer(max(deadline - time.monotonic(), 0.0), fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
 def _bound_next_read(resp: Any, deadline: float, idle: float | None) -> None:
-    """Raise TimeoutError past the deadline; else cap the socket timeout of the next read at the time
-    left and, once data flows, at `idle` (a stalled or trickling server can't outlast the deadline).
-    Before the first data the read may wait for the whole deadline (a queued request on a busy server)."""
+    """Raise TimeoutError past the deadline; else cap the socket timeout of the next recv at the time
+    left and, once content flows, at `idle`. This bounds each recv, not a whole readline() (a trickle
+    of bytes without a newline is many recvs): _deadline_watchdog enforces the deadline for those.
+    Before the first content a recv may wait for the whole deadline (a queued request on a busy server)."""
     left = deadline - time.monotonic()
     if left <= 0:
         raise TimeoutError("AI response exceeded the request deadline")
-    # urllib's HTTPResponse -> BufferedReader -> SocketIO -> socket; absent on test doubles.
-    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    sock = _response_socket(resp)
     if sock is not None and hasattr(sock, "settimeout"):
         sock.settimeout(min(left, idle) if idle else left)
 
 
-def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
+def _read_ai_stream(resp: Any, deadline: float, chat: bool, idle_timeout: float | None = None) -> dict[str, Any]:
     """Collect a server-sent-events answer into the non-streaming response shape.
 
-    A server that ignores ``stream`` and returns plain JSON is accepted as-is. Every read, in the
-    stream and in the plain-JSON fallback, is bounded by the deadline (see _bound_next_read).
+    A server that ignores ``stream`` and returns plain JSON is accepted as-is. Reads past the deadline
+    raise TimeoutError; each recv waits at most the time left and, once answer content (or a plain-JSON
+    body) has arrived, at most `idle_timeout` (KINETIC_AI_READ_TIMEOUT). Blank, keep-alive and role-only
+    events don't start the idle timer. The stream ends at ``data: [DONE]`` even if the server keeps the
+    connection open. With call_ai's watchdog, the deadline also bounds a read that trickles bytes.
     """
+    idle_after_content = _ai_read_timeout() if idle_timeout is None else idle_timeout
     idle: float | None = None
 
     def readline() -> bytes:
@@ -337,10 +384,10 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
         return line
 
     first = readline()
-    idle = _ai_read_timeout()
     while first and not first.strip():
         first = readline()
-    if not first.lstrip().startswith(b"data:"):
+    if not first.lstrip().startswith((b"data:", b":", b"event:", b"id:", b"retry:")):
+        idle = idle_after_content   # a plain-JSON body has started
         body = [first]
         while True:
             _bound_next_read(resp, deadline, idle)
@@ -366,9 +413,12 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool) -> dict[str, Any]:
                 raise RuntimeError(f"AI stream error: {event['error']}")
             usage = event.get("usage") or usage
             for choice in event.get("choices") or []:
-                piece = (choice.get("delta") or {}).get("content") if chat else choice.get("text")
+                delta = choice.get("delta") or {}
+                piece = delta.get("content") if chat else choice.get("text")
                 if isinstance(piece, str):
                     parts.append(piece)
+                if piece or delta.get("reasoning_content") or delta.get("reasoning"):
+                    idle = idle_after_content   # content is flowing: from now on a stall is an error
                 finish_reason = choice.get("finish_reason") or finish_reason
         line = readline()
     content = "".join(parts)
@@ -464,44 +514,119 @@ def split_diff_chunks(patch_text: str, max_chars: int = DEFAULT_MAX_DIFF_CHARS) 
 VERDICTS = ("GO", "NO-GO", "UNKNOWN", "INCOMPLETE")
 
 
-_VERDICT_LINE = re.compile(r"^[\s*#>_`]*VERDICT[\s*_`]*:[\s*_`]*(NO[- ]GO|GO)\b(.*)$", re.IGNORECASE | re.MULTILINE)
-_VERDICT_WORD = re.compile(r"\bNO[- ]GO\b|\bGO\b", re.IGNORECASE)
-# NO-GO in words: "NO-GO", "no go", and negated GO ("NOT GO", "not a GO", "don't GO", "do not go").
-_NO_GO = re.compile(r"\bNO[- ]GO\b|\b(?:NOT|DON'?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
+# A VERDICT line as the prompt asks for it: at the line start, after optional markdown (`**`, `#`, `_`, a
+# backtick). The value is GO, NO-GO or a negated GO.
+_VERDICT_LINE = re.compile(
+    r"^[ *#_`]*VERDICT[\s*_`]*:[\s*_`<\[]*"
+    r"(NO[- ]GO|(?:NOT|DON['’]?T|DO\s+NOT)\s+(?:A\s+)?GO|GO)\b(.*)$",
+    re.IGNORECASE)
+# The choice itself, as the prompt and its headings name it ("GO/NO-GO", "GO or NO-GO", "GO|NO-GO"): naming the
+# choice is not a NO-GO, so it is blanked out before NO-GO is looked for.
+_CHOICE = re.compile(r"\bGO[ \t]*(?:/|\||\bor\b)[ \t]*(?:VERDICT\W{0,4}:\W{0,4})?NO[- ]GO\b", re.IGNORECASE)
+_NO_GO_WORD = re.compile(r"\bNO[- ]GO\b", re.IGNORECASE)
+# Negated GO in any case ("NOT GO", "do not go ahead", "don’t GO"): looked for only in the GO/NO-GO section, where
+# it is the verdict, and on VERDICT lines.
+_NEGATED_GO = re.compile(r"\b(?:NOT|DON['’]?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
+_SECTION_HEADING = re.compile(r"^[^\n]{0,60}?\bGO[ \t]*/[ \t]*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
+# A numbered section heading ("1) Change Classification", "## 2. Risk", "**3)"): the lead must come before one.
+_VERDICT_WORD = re.compile(r"^[ *#_`]*VERDICT\b", re.IGNORECASE)   # any verdict line, GO/NO-GO or not
+_NUMBERED_HEADING = re.compile(r"^[ \t#*_]*\d+[.)]\s")
+# A GO with a condition is not a pass: "VERDICT: GO if/unless/pending/once/after/until/but ...".
+_CONDITION = re.compile(r"\b(?:if|unless|pending|once|after|until|provided|assuming|conditional(?:ly)?|subject\s+to|"
+                        r"but|except|caveats?|however|though|although|only\s+when|reservations?|tentative(?:ly)?|"
+                        r"provisional(?:ly)?|contingent|barring|(?:as|so)\s+long\s+as|likely|probably|confidence|"
+                        r"HOLD|needs?|follow-ups?\s+required|with\s+(?:minor\s+)?(?:conditions|concerns|caveats))\b"
+                        r"|^\s*\?|^\*(?!\*)|^-ish\b|^[ \t*_`]*/", re.IGNORECASE)   # "GO?", "GO*", "GO-ish", "GO/HOLD"   # "GO?", "GO*" footnote, "GO-ish"
+# A hedged or withheld verdict in the GO/NO-GO section ("Conditional GO", "HOLD", "not yet", "isn't a GO").
+# The same hedges after a GO inside the GO/NO-GO section, minus words that are ordinary prose there ("nothing to
+# hold back", "needs no migration").
+_SECTION_HEDGE = re.compile(r"\b(?:if|unless|pending|once|after|until|provided|assuming|conditional(?:ly)?|subject\s+to|"
+                            r"but|except|caveats?|however|though|although|contingent|barring|(?:as|so)\s+long\s+as|"
+                            r"tentative(?:ly)?|provisional(?:ly)?|with\s+(?:minor\s+)?(?:conditions|concerns|caveats))\b",
+                            re.IGNORECASE)
+_WITHHELD = re.compile(
+    r"\bconditional(?:ly)?\s+GO\b|\bGO\s+with\s+(?:conditions|caveats|reservations)\b|\bon\s+hold\b|\bhold\s+off\b|"
+    r"\bhold\s+(?:until|for|pending)\b|^[^\w\n]*not\s+yet\b|"
+    r"^[^\w\n]*(?:HOLD|STOP|NOGO|FAIL(?:ED)?|BLOCK(?:ED)?|REJECT(?:ED)?)"
+    r"(?:[^\w\n]*$|\s*[.!]|\s+-\s|\s*:(?![ \t*_]*(?:none|0|n/?a|nothing|no)\b))|"
+    r"^[^\w\n]*NO(?:[^\w\n]*$|\s*[.!]\s|\s+-\s)(?![^\n]*\bGO\b)|"
+    r"\b(?:recommendation|decision|verdict|status|call)\W{0,4}(?:hold|blocked|reject(?:ed)?|fail(?:ed)?|stop)\b|"
+    r"\b(?:do\s+not|don['’]?t)\s+ship\b|\bnot\s+(?:ready|safe)\s+(?:for|to)\s+promot|\b(?:would|will)\s+not\s+promote\b|"
+    r"\bnot\s+promoting\b|\bblock\s+promotion\b|\bdefer\s+promotion\b|\brevert\s+recommended\b|"
+    r"\brework\s+required\b|\b(?:wait|holding)\s+(?:for|until)\b|"
+    r"\bnot\s+yet\s+(?:ready|safe|a\s+GO)\b|\bisn['’]?t\s+a\s+GO\b|\bwon['’]?t\s+GO\b|\bcan(?:no|['’])t\s+go\b|"
+    r"\b(?:should|must)\s+not\s+be\s+(?:promoted|merged)\b|\b(?:do\s+not|don['’]?t)\s+(?:promote|merge)\b|\bNOGO\b",
+    re.IGNORECASE | re.MULTILINE)
+_HEADING_SHAPED = re.compile(r"^[ \t#*_>]*(?:\d+[.)]|[-*+]|#)[^\n]{0,60}?\bGO[ \t]*/[ \t]*NO[- ]GO\b|"
+                             r"^[ \t#*_>]*GO[ \t]*/[ \t]*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
+
+_DASHES = re.compile(r"[\u2010-\u2015\u2212]|\\-")   # Unicode dashes, and a markdown-escaped "\-"
+LEAD_WINDOW = 400   # the prompt asks for the VERDICT line first
+
+
+def _strip_thinking(text: str) -> str:
+    """The answer without leading <think> reasoning: a <think>...</think> block that opens the answer, or the
+    text before the first </think> when no <think> precedes it and no VERDICT line does (a template that put
+    <think> in the prompt), unless a NO-GO comes before it. A </think> quoted later in the answer is never a cut
+    point."""
+    stripped = text.lstrip()
+    m = re.match(r"<think>.*?</think>", stripped, re.IGNORECASE | re.DOTALL)
+    if m:
+        return stripped[m.end():]
+    close = stripped.lower().find("</think>")
+    if close >= 0:
+        before = stripped[:close]
+        if ("<think>" not in before.lower() and not any(_VERDICT_LINE.match(line) for line in before.splitlines())
+                and not _NO_GO_WORD.search(_CHOICE.sub(" ", _DASHES.sub("-", before)))):
+            return stripped[close + len("</think>"):]
+    return text
 
 
 def parse_verdict(review_text: str) -> str:
-    """GO / NO-GO from the leading "VERDICT:" line the prompt asks for. Without one, only NO-GO
-    is read from the final GO/NO-GO section (or the tail); a bare "GO" there is UNKNOWN, never GO:
-    "do NOT GO" or "not a GO" must not pass, so GO needs the explicit VERDICT line (fail safe).
-    Negated GO ("NOT GO", "not a GO", "don't GO") counts as NO-GO wherever NO-GO is looked for.
-    A VERDICT line naming both ("VERDICT: GO or VERDICT: NO-GO") is the instruction echoed back,
-    not a decision: it is ignored, including by the fallback.
-    A leading GO is overruled by a later explicit "VERDICT: NO-GO" line or a final GO/NO-GO section
-    that says NO-GO: an answer quoting a "VERDICT: GO" from the diff (a prompt injection) near its
-    start must not pass as GO when its own conclusion is NO-GO. Disagreement fails safe."""
-    text = review_text or ""
-    lead = None
-    for m in _VERDICT_LINE.finditer(text[:400]):
-        if not _VERDICT_WORD.search(m.group(2)):
-            lead = "NO-GO" if m.group(1).upper().startswith("NO") else "GO"
-            break
-    text = "\n".join(line for line in text.splitlines()
-                     if not (_VERDICT_LINE.match(line) and len(_VERDICT_WORD.findall(line)) > 1))
-    idx = text.upper().rfind("GO/NO-GO")
-    if lead == "NO-GO":
+    """GO / NO-GO / UNKNOWN for one answer. Deliberately simple, and fails safe:
+
+    * Any NO-GO the answer states, anywhere (any dash), is NO-GO: an answer that says NO-GO anywhere is not
+      a pass, even if it also quotes a "VERDICT: GO" (from an injected commit subject, a diff, a code block).
+      Naming the choice ("GO/NO-GO", "GO or NO-GO") doesn't count. A negated GO on a VERDICT line or in the
+      GO/NO-GO section ("NOT GO", "do not go ahead") is NO-GO too.
+    * GO only from an unconditional "VERDICT: GO" line the answer leads with: its first line (one title line
+      before it is allowed; leading <think> reasoning is skipped), within LEAD_WINDOW characters, not in a ```
+      fence, indented as code, quoted (`>`) or the instruction echoed back. "VERDICT: GO if/pending/until/but
+      ..." is UNKNOWN; a hedged or withheld GO/NO-GO section ("Conditional GO", "HOLD", "not yet") is NO-GO.
+    * Anything else is UNKNOWN.
+    The cost is some NO-GO for answers that mention NO-GO in passing ("no NO-GO risks"); never a false GO."""
+    text = _DASHES.sub("-", _strip_thinking(review_text or "")).replace("\u00a0", " ")
+    plain = _CHOICE.sub(" ", text)
+    if _NO_GO_WORD.search(plain):
         return "NO-GO"
-    if lead == "GO":
-        later_no_go = any(m.group(1).upper().startswith("NO") and not _VERDICT_WORD.search(m.group(2))
-                          for m in _VERDICT_LINE.finditer(text))
-        section = text[idx + len("GO/NO-GO"):] if idx >= 0 else ""   # no heading: trust the lead line
-        if later_no_go or _NO_GO.search(section):
+    for line in text.splitlines():
+        m = _VERDICT_LINE.match(line.lstrip(" >"))
+        if m and m.group(1).upper() != "GO":
             return "NO-GO"
-        return "GO"
-    tail = text[idx + len("GO/NO-GO"):] if idx >= 0 else text[-600:]
-    if _NO_GO.search(tail):
+    heading = _HEADING_SHAPED.search(text) or _SECTION_HEADING.search(text)
+    if heading and (_NEGATED_GO.search(text[heading.end():]) or _WITHHELD.search(text[heading.end():])):
         return "NO-GO"
-    return "UNKNOWN"   # no VERDICT line: a GO here is not trusted (negation, cut-off, format ignored)
+    if heading and any(_SECTION_HEDGE.search(m.group(1))
+                       for m in re.finditer(r"\bGO\b([^\n]{0,60})", text[heading.end():], re.IGNORECASE)):
+        return "UNKNOWN"   # a hedged GO in the GO/NO-GO section ("GO once the test is fixed", "GO pending sign-off")
+    # The lead: the first line the answer gives (one title line before it is allowed), within LEAD_WINDOW.
+    fenced, title_seen = False, False
+    for line in text[:LEAD_WINDOW].splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced   # only hides a GO (NO-GO is looked for everywhere above), so a toggle will do
+            continue
+        if fenced or not line.strip():
+            continue
+        if line.startswith(("    ", "\t")) or line.lstrip().startswith(">") or _CHOICE.search(line):
+            continue   # code, a quote, or the instruction echoed back ("VERDICT: <GO or NO-GO>"): not the answer's
+        m = _VERDICT_LINE.match(line)
+        if m:
+            g2 = m.group(2).lstrip("*") if line[m.start(1) - 1:m.start(1)] == "*" else m.group(2)
+            return "GO" if m.group(1).upper() == "GO" and not _CONDITION.search(g2) else "UNKNOWN"
+        if title_seen or _NUMBERED_HEADING.match(line) or _VERDICT_WORD.match(line):
+            return "UNKNOWN"   # the review started without its verdict line
+        title_seen = True
+    return "UNKNOWN"
 
 
 def combine_verdicts(verdicts: list[str], unreviewed_chunks: int = 0) -> str:
@@ -535,20 +660,28 @@ def risk_from_paths(paths: list[str]) -> str:
     return "low"
 
 
-# A commit subject that speaks to the reviewer ("VERDICT: GO", "pre-approved", "ignore previous
-# instructions") is a prompt-injection attempt, not a description of the change.
+# A commit subject that speaks to the reviewer is a prompt-injection attempt, not a description of the change.
+# The flag is advisory (it asks for a human look), so the rule errs towards flagging: any verdict mention,
+# approval wording, or "ignore/disregard the previous instructions". v2 = v1 (as released) plus approvals
+# attributed to a reviewer and wider ignore/disregard forms; it flags everything v1 did. Bump on any change.
+ROGUE_RULE_VERSION = 2
 _REVIEW_STEERING = re.compile(
-    r"\bverdict\s*[:=-]?\s*\**\s*(?:no[- ]?)?go\b"
+    # v1 (as released): any verdict mention, pre-/auto-approval, "<x>-approved/passed", ignore previous instructions
+    r"\bverdict\s*(?:[:=-]\s*)?(?:\*+\s*)?(?:no[- ]?)?go\b"   # = v1's, without its \s*..\s*..\s* backtracking
     r"|\bpre[- ]?approved\b|\bauto[- ]?approved?\b"
     r"|\b(?:review|security|ai)[- ](?:approved|passed|cleared)\b"
-    r"|\bignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier)\s+instructions\b",
+    r"|\bignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier)\s+instructions\b"
+    # v2 adds: approvals attributed to a reviewer, and wider "ignore/disregard the instructions" forms
+    r"|\b(?:pre[- ]?)?(?:approved|cleared|signed[- ]off|vetted)\s+by\s+(?:the\s+)?"
+    r"(?:security|sec|reviewers?|review|ai|bot|ci|maintainers?|admins?|code\s+owners?)\b"
+    r"|\b(?:ignore|disregard)\s+(?:all\s+|any\s+)?(?:the\s+|your\s+)?(?:previous|prior|above|earlier|system)\b",
     re.IGNORECASE,
 )
 
 
 def steers_review(text: str) -> bool:
     """True when text (a commit subject) carries verdict or approval claims aimed at the reviewer."""
-    return bool(_REVIEW_STEERING.search(text or ""))
+    return bool(_REVIEW_STEERING.search((text or "").strip()))
 
 
 def is_rogue_commit(subject: str, paths: list[str]) -> bool:
@@ -600,7 +733,8 @@ def build_commit_items(
     are listed in a final "unreviewed" item (verdict INCOMPLETE) instead of being dropped silently."""
     rev_range = f"{base_ref}..HEAD"
     # Not --max-count: git limits before --reverse, which kept the newest N and hid the oldest.
-    revs = run_git(repo, ["rev-list", "--reverse", rev_range], timeout=30)
+    # --topo-order: parents before children (date order isn't), so the "resume from" hint is an ancestor.
+    revs = run_git(repo, ["rev-list", "--reverse", "--topo-order", rev_range], timeout=30)
     if revs.code != 0:
         return []
 
@@ -1159,6 +1293,7 @@ def _run_diff_review(args: argparse.Namespace) -> int:
         "repo": str(repo),
         "base_ref": base_ref,
         "model": model,
+        "rogue_rule_version": ROGUE_RULE_VERSION,
         "items": reviewed_items,
     }
     if warnings:
@@ -1383,7 +1518,8 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _verify_commit_item(repo: Path, item: dict[str, Any]) -> dict[str, Any]:
+def _verify_commit_item(repo: Path, item: dict[str, Any], rogue_rule_version: int = ROGUE_RULE_VERSION
+                        ) -> dict[str, Any]:
     sha = str(item.get("sha") or item.get("id") or "").strip()
     result: dict[str, Any] = {
         "id": item.get("id"),
@@ -1433,9 +1569,20 @@ def _verify_commit_item(repo: Path, item: dict[str, Any]) -> dict[str, Any]:
         result["errors"].append("risk_hint mismatch with deterministic path heuristic")
 
     expected_rogue = is_rogue_commit(subject_recorded, recorded_paths)
-    if _truthy(item.get("rogue_candidate")) != expected_rogue:
+    recorded_rogue = _truthy(item.get("rogue_candidate"))
+    if expected_rogue and not recorded_rogue:
+        # The report understates risk: always an error, whichever rule version wrote it.
         result["ok"] = False
-        result["errors"].append("rogue_candidate mismatch with deterministic rule")
+        result["errors"].append("rogue_candidate mismatch with deterministic rule (not flagged, rule flags it)")
+    elif recorded_rogue and not expected_rogue:
+        if rogue_rule_version < ROGUE_RULE_VERSION:
+            # Flagged by an older, broader rule (e.g. any "pre-approved"): an extra flag never makes a
+            # review look safer, so a report written before the rule narrowed still verifies.
+            result["warnings"].append(f"rogue_candidate set by an older rule (v{rogue_rule_version}); "
+                                      f"the current rule (v{ROGUE_RULE_VERSION}) does not flag this subject")
+        else:
+            result["ok"] = False
+            result["errors"].append("rogue_candidate mismatch with deterministic rule (flagged, rule does not flag it)")
 
     return result
 
@@ -1488,6 +1635,14 @@ def _render_verify_markdown(report: dict[str, Any]) -> str:
             for err in row.get("errors", []):
                 lines.append(f"  - {err}")
 
+    item_warnings = [r for r in report["item_results"] if r.get("warnings")]
+    if item_warnings:
+        lines.append("")
+        lines.append("## Item Warnings")
+        for row in item_warnings:
+            lines.append(f"- {row.get('type')} {row.get('id')}:")
+            lines.extend(f"  - {w}" for w in row["warnings"])
+
     if report["artifact_missing"]:
         lines.append("")
         lines.append("## Artifact Warnings")
@@ -1516,6 +1671,11 @@ def _run_verify_report(args: argparse.Namespace) -> int:
 
     item_results: list[dict[str, Any]] = []
     artifact_missing: list[str] = []
+    # Reports from before the field existed were written under rule v1.
+    try:
+        rogue_rule_version = int(run_report.get("rogue_rule_version") or 1)
+    except (TypeError, ValueError):
+        rogue_rule_version = 1
 
     for item in items:
         if not isinstance(item, dict):
@@ -1523,7 +1683,7 @@ def _run_verify_report(args: argparse.Namespace) -> int:
 
         item_type = str(item.get("type", "")).strip()
         if item_type == "commit":
-            result = _verify_commit_item(repo, item)
+            result = _verify_commit_item(repo, item, rogue_rule_version)
         elif item_type == "snapshot":
             result = _verify_snapshot_item(item)
         elif item_type == "unreviewed":
