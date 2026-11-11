@@ -394,10 +394,43 @@ class TestRefreshSession(unittest.TestCase):
         self.assertFalse(t.is_alive(), "slot_lock spun past its deadline")
         return outcome[0]
 
-    def test_lock_waits_and_times_out_when_the_lock_file_cant_be_opened(self):
-        """Regression: an OSError on a lock used to retry at once, forever (no sleep, no deadline)."""
-        with patch.object(idp.os, "open", side_effect=PermissionError("denied")):
-            self.assertIn("Timed out", self._try())
+    def test_lock_file_that_cant_be_opened_is_reported_at_once(self):
+        """An open error (permissions, a full disk) is not "another process is refreshing": it is reported at once
+        with its reason, instead of being waited out for 30 s (or, before that, retried at once forever)."""
+        import errno
+        for exc in (PermissionError(errno.EACCES, "Permission denied"), OSError(errno.ENOSPC, "No space left")):
+            with patch.object(idp.os, "open", side_effect=exc):
+                start = time.time()
+                outcome = self._try(wait=5)
+            self.assertIn("Couldn't open the IdP refresh lock file", outcome)
+            self.assertIn(exc.strerror, outcome)
+            self.assertLess(time.time() - start, 2)
+
+    def test_lock_error_other_than_held_is_reported(self):
+        import errno
+        with patch("fcntl.flock" if os.name != "nt" else "msvcrt.locking", side_effect=OSError(errno.EBADF, "Bad fd")):
+            self.assertIn("Couldn't lock", self._try(wait=5))
+
+    def test_lock_on_a_replaced_or_deleted_lock_file_is_taken_again(self):
+        """Locked a file that another process meanwhile removed or replaced: let go and lock the one at the path."""
+        other = tempfile.NamedTemporaryFile(delete=False)
+        other.close()
+        real_stat = os.stat
+        calls = []
+
+        def stat_once(path, *a, **kw):
+            calls.append(path)
+            if len(calls) == 1:
+                return real_stat(other.name)          # replaced: the path is another file now
+            if len(calls) == 2:
+                raise FileNotFoundError(path)         # deleted
+            return real_stat(path, *a, **kw)
+        try:
+            with patch.object(idp.os, "stat", side_effect=stat_once):
+                self.assertEqual(self._try(), "locked")
+            self.assertEqual(len(calls), 3)
+        finally:
+            os.remove(other.name)
 
     def test_slow_holder_is_never_taken_over(self):
         """Review finding #10: a holder older than the stale limit was taken over, and its clean-up then deleted

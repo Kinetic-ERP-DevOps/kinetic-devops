@@ -167,7 +167,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   traceback; it now takes the "sign in again" path.
 - IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
   the new holder's lock, so two processes could use the same rotating refresh token. The lock is now an OS file
-  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale.
+  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale. Only a lock held by
+  another process is waited for: a lock file that can't be opened or locked (permissions, a full disk) is reported
+  at once with the reason, and a lock taken on a file that was meanwhile removed or replaced is taken again.
 - `auth` session resolution raised `IndexError` when no company was given and the environment had none
   configured; it now raises `SessionResolutionError` saying to pass `--co`.
 - `analysis diff`: the review prompt now fences the commit metadata and diff as untrusted data and tells the

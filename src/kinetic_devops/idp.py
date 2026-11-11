@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import hashlib
 import http.server
 import json
@@ -454,8 +455,16 @@ def lock_dir() -> str:
     return path
 
 
+# errno values meaning "another open of the file holds the lock": flock gives EWOULDBLOCK/EAGAIN,
+# msvcrt.locking(LK_NBLCK) gives EACCES (or EDEADLOCK).
+_LOCK_HELD = {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK}
+
+
 def _try_lock(fd: int) -> bool:
-    """Take an exclusive OS lock on the open file without waiting; False if another holder has it."""
+    """Take an exclusive OS lock on the open file without waiting; False if another holder has it.
+
+    Any other failure (the lock can't be taken at all) raises IdPError instead of being waited out.
+    """
     try:
         if os.name == "nt":
             import msvcrt
@@ -464,8 +473,10 @@ def _try_lock(fd: int) -> bool:
             import fcntl
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    except OSError:   # BlockingIOError / PermissionError: held by another open of the file
-        return False
+    except OSError as exc:
+        if exc.errno in _LOCK_HELD:
+            return False
+        raise IdPError(f"Couldn't lock the IdP refresh lock file: {exc.strerror or exc}.") from exc
 
 
 def _unlock(fd: int) -> None:
@@ -489,17 +500,37 @@ def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
     takes (a takeover after a timeout would let two processes use the same refresh token, and the old holder's
     clean-up would delete the new holder's lock). Each acquisition opens the file anew, so threads exclude each
     other too.
+
+    Only a lock held by someone else is waited for (up to wait seconds). A lock file that can't be opened or locked
+    at all (permissions, a full disk) is an IdPError at once, saying why. A lock taken on a file that was meanwhile
+    removed or replaced (its file is no longer the one at the path) is let go and taken again.
     """
     name = "kinetic-idp-" + hashlib.sha256(slot.encode()).hexdigest()[:16] + ".lock"
     path = os.path.join(lock_dir(), name)
     deadline = time.time() + wait
     while True:
-        fd = None
-        with contextlib.suppress(OSError):   # can't open it now: wait like for a held lock; never retry at once
+        try:
             fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-            if _try_lock(fd):
-                break
+        except OSError as exc:
+            raise IdPError(f"Couldn't open the IdP refresh lock file {path}: {exc.strerror or exc}.") from exc
+        try:
+            locked = _try_lock(fd)
+        except BaseException:
             os.close(fd)
+            raise
+        if locked:
+            try:
+                same = os.path.samestat(os.fstat(fd), os.stat(path))
+            except OSError:   # removed since it was opened
+                same = False
+            if same:
+                break
+            _unlock(fd)
+            os.close(fd)
+            if time.time() > deadline:
+                raise IdPError("Timed out taking the IdP refresh lock: its lock file keeps being replaced.")
+            continue   # the file at the path is another one now: lock that one
+        os.close(fd)
         if time.time() > deadline:
             raise IdPError("Timed out waiting for another process to finish refreshing the IdP session.")
         time.sleep(0.2)
