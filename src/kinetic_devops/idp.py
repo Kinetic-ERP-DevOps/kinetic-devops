@@ -29,7 +29,7 @@ import urllib.parse
 import webbrowser
 from typing import Callable, Dict, Iterator, Optional
 
-from kinetic_devops import _lazy_import
+from kinetic_devops import _lazy_import, crypto
 
 keyring = _lazy_import("keyring")
 requests = _lazy_import("requests")
@@ -38,7 +38,6 @@ SERVICE_IDP = "kinetic-idp"
 DEFAULT_PORT = 8765
 BASE_SCOPES = "openid profile offline_access"
 LOGIN_TIMEOUT_SEC = 300
-LOCK_STALE_SEC = 60
 CLOCK_SKEW_SEC = 120
 
 
@@ -153,6 +152,7 @@ def login_browser(
     port: int = DEFAULT_PORT,
     timeout: int = LOGIN_TIMEOUT_SEC,
     open_url: Callable[[str], bool] = webbrowser.open,
+    force_login: bool = False,
 ) -> Dict:
     """Authorization code + PKCE with a loopback redirect. Returns the token response (not stored here).
 
@@ -160,6 +160,8 @@ def login_browser(
     else gets 400 and is ignored, so another local program or a web page can't end or hijack the sign-in: a wrong or
     missing state, a second callback, or a Host header other than 127.0.0.1:<port> (DNS rebinding: a page on another
     name that resolves to 127.0.0.1). An iss parameter (RFC 9207), if the IdP sends one, must be the issuer.
+    force_login sends prompt=login (OIDC Core 3.1.2.1): the IdP asks for the sign-in again instead of reusing the
+    browser's existing IdP session.
     """
     redirect_uri = f"http://127.0.0.1:{port}/callback"
     expected_host = f"127.0.0.1:{port}"
@@ -202,10 +204,13 @@ def login_browser(
         raise IdPError(f"Port {port} is busy; pass --port with one of the client's registered redirect ports.") from exc
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        url = settings["authorize"] + "?" + urllib.parse.urlencode({
+        params = {
             "client_id": client_id, "response_type": "code", "redirect_uri": redirect_uri,
             "scope": f"{BASE_SCOPES} {settings['api_scope']}", "state": state, "nonce": nonce,
-            "code_challenge": challenge, "code_challenge_method": "S256"})
+            "code_challenge": challenge, "code_challenge_method": "S256"}
+        if force_login:
+            params["prompt"] = "login"
+        url = settings["authorize"] + "?" + urllib.parse.urlencode(params)
         print(f"Opening the browser for Epicor sign-in (waiting up to {timeout // 60} min)...", flush=True)
         if not open_url(url):
             print("Couldn't open a browser; open this address yourself:\n" + url, flush=True)
@@ -294,9 +299,19 @@ def refresh(token_endpoint: str, client_id: str, refresh_token: str) -> Dict:
 
 
 def _token_request(token_endpoint: str, data: Dict[str, str]) -> Dict:
+    """POST to the token endpoint. Every failure is an IdPError (callers then ask for a new sign-in), not a traceback."""
     _https(token_endpoint, "The IdP token endpoint")   # also guards a stored endpoint used for refreshes
-    resp = requests.post(token_endpoint, data=data, timeout=30, verify=True, allow_redirects=False)
-    body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        resp = requests.post(token_endpoint, data=data, timeout=30, verify=True, allow_redirects=False)
+    except requests.RequestException as exc:
+        raise IdPError(f"Couldn't reach the IdP token endpoint ({type(exc).__name__}); check the network, "
+                       "then sign in again.") from exc
+    try:
+        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    except ValueError as exc:
+        raise IdPError(f"The IdP token endpoint answered HTTP {resp.status_code} with malformed JSON.") from exc
+    if not isinstance(body, dict):
+        body = {}
     if not resp.ok or "access_token" not in body:
         raise IdPError(f"IdP token request failed: {resp.status_code} {body.get('error', '')} "
                        f"{body.get('error_description', '')}".strip(), error=str(body.get("error") or ""))
@@ -368,22 +383,37 @@ def _delete_chunked(service: str, name: str) -> None:
         keyring.delete_password(service, name)
 
 
-def pack(slot: str, meta: Dict) -> Dict:
-    """Store an IdP session's tokens in side entries; return the small metadata to keep in "current_token"."""
+def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
+    """Store an IdP session's tokens in side entries; return the small metadata to keep in "current_token".
+
+    passphrase: the vault's, when the vault is encrypted. Each token is then encrypted (crypto.encrypt_json) before
+    it is chunked, so no side entry holds a token in clear. The caller encrypts the returned metadata the same way.
+    """
     if meta.get("auth_method") != "idp":
         return meta
     for field in SECRET_FIELDS:
-        _put_chunked(slot, _side(field), str(meta.get(field) or ""))
+        value = str(meta.get(field) or "")
+        _put_chunked(slot, _side(field), crypto.encrypt_json(value, passphrase) if passphrase else value)
     stub = {k: v for k, v in meta.items() if k not in SECRET_FIELDS and k not in ("_is_valid", "_remaining")}
     stub["_idp_split"] = True
     return stub
 
 
-def unpack(slot: str, data: Dict) -> Dict:
-    """Inverse of pack (no-op for other sessions)."""
+def unpack(slot: str, data: Dict, passphrase: Optional[str] = None) -> Dict:
+    """Inverse of pack (no-op for other sessions). Reads clear and encrypted side entries alike.
+
+    An encrypted token that can't be decrypted (no passphrase, or a wrong one) reads as missing, like an encrypted
+    "current_token" does: the session then needs a new sign-in.
+    """
     if data.get("_idp_split"):
         for field in SECRET_FIELDS:
-            data[field] = _get_chunked(slot, _side(field))
+            value = _get_chunked(slot, _side(field))
+            if crypto.is_encrypted_blob(value):
+                try:
+                    value = str(crypto.decrypt_json(value, passphrase)) if passphrase else ""
+                except Exception:
+                    value = ""
+            data[field] = value
     return data
 
 
@@ -424,32 +454,60 @@ def lock_dir() -> str:
     return path
 
 
+def _try_lock(fd: int) -> bool:
+    """Take an exclusive OS lock on the open file without waiting; False if another holder has it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # byte 0 (the file is empty: locking past EOF is allowed)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:   # BlockingIOError / PermissionError: held by another open of the file
+        return False
+
+
+def _unlock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
-    """Cross-process lock around a refresh, so a rotated refresh token is used exactly once."""
+    """Cross-process lock around a refresh, so a rotated refresh token is used exactly once.
+
+    An OS file lock (flock on POSIX, msvcrt.locking on Windows) on a per-slot file that is never deleted. The OS
+    drops the lock when its holder closes the file or dies, so a crashed process can't leave a stale lock and no
+    one ever has to guess that a lock is stale and take it over: a slow holder keeps its lock however long it
+    takes (a takeover after a timeout would let two processes use the same refresh token, and the old holder's
+    clean-up would delete the new holder's lock). Each acquisition opens the file anew, so threads exclude each
+    other too.
+    """
     name = "kinetic-idp-" + hashlib.sha256(slot.encode()).hexdigest()[:16] + ".lock"
     path = os.path.join(lock_dir(), name)
     deadline = time.time() + wait
     while True:
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            # A lock older than LOCK_STALE_SEC is left over from a crashed process: take it over. If it can't be
-            # checked or removed (just released, or not ours), wait like for any held lock; never retry at once.
-            with contextlib.suppress(OSError):
-                if time.time() - os.path.getmtime(path) > LOCK_STALE_SEC:
-                    os.remove(path)
-                    continue
+        fd = None
+        with contextlib.suppress(OSError):   # can't open it now: wait like for a held lock; never retry at once
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            if _try_lock(fd):
+                break
+            os.close(fd)
         if time.time() > deadline:
             raise IdPError("Timed out waiting for another process to finish refreshing the IdP session.")
         time.sleep(0.2)
     try:
-        os.close(fd)
         yield
     finally:
-        with contextlib.suppress(OSError):
-            os.remove(path)
+        _unlock(fd)
+        os.close(fd)
 
 
 def refresh_session(meta: Dict, reread: Callable[[], Optional[Dict]], store: Callable[[Dict], None],

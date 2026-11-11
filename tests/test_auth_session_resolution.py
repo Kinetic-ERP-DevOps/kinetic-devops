@@ -57,6 +57,28 @@ class TestGetActiveConfigScoping(unittest.TestCase):
         self.assertEqual(result[3], "ACME")
         self.assertEqual(result[4], "pilot")
 
+    def test_empty_company_list_is_a_session_resolution_error(self):
+        """Review finding #13: no company given and none configured raised IndexError."""
+        mgr = _bare_manager()
+        for companies in ("", " , ", None):
+            servers = {"pilot": {"url": "https://pilot.example", "api_key": "key", "companies": companies,
+                                 "sessions": ["alice"]}}
+            with patch.object(mgr, "_get_server_dict", return_value=servers), \
+                 patch.object(mgr, "_get_token_key", return_value="slot"), \
+                 patch.object(mgr, "_get_token_meta", return_value={"_is_valid": True, "AccessToken": "tok"}):
+                with self.assertRaises(SessionResolutionError) as ctx:
+                    mgr.get_active_config("pilot", fields=("company",))
+            self.assertIn("no companies configured", str(ctx.exception))
+
+    def test_legacy_company_field_still_resolves(self):
+        mgr = _bare_manager()
+        servers = {"pilot": {"url": "https://pilot.example", "api_key": "key", "company": "ACME", "sessions": ["alice"]}}
+        with patch.object(mgr, "_get_server_dict", return_value=servers), \
+             patch.object(mgr, "_get_token_key", return_value="slot"), \
+             patch.object(mgr, "_get_token_meta", return_value={"_is_valid": True, "AccessToken": "tok"}):
+            (company,) = mgr.get_active_config("pilot", fields=("company",))
+        self.assertEqual(company, "ACME")
+
     def test_explicit_env_zero_sessions_fails_closed_without_drifting(self):
         mgr = _bare_manager()
         servers = {"pilot": {"url": "https://pilot.example", "api_key": "key", "companies": "ACME", "sessions": []}}
