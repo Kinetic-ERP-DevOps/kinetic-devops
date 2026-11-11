@@ -69,6 +69,54 @@ class TestSyncTestEnvironment(unittest.TestCase):
         self.assertIn("env=test_env(E)", runs[0])
 
 
+VERSIONS = ["0.9", "1.0.dev1", "1.0a1.dev1", "1.0a1", "1.0a2", "1.0b1", "1.0rc1", "1.0rc2.post1", "1.0", "1.0.0",
+            "1.0+local.a", "1.0+local.1", "1.0.post1.dev1", "1.0.post1", "1.0-2", "1.0.1", "1.1", "2.0.0rc1",
+            "2.0.0", "2.0.0.post0", "10.0", "1!0.1"]
+
+
+class TestSyncVersionCompare(unittest.TestCase):
+    """Finding 11: pre-release versions crashed the Dependabot check (int compared with str)."""
+
+    def setUp(self):
+        ns = sync_defs("vkey", "at_least")
+        self.vkey, self.at_least = ns["vkey"], ns["at_least"]
+
+    def test_prerelease_compares(self):
+        self.assertTrue(self.vkey("2.0.0") >= self.vkey("2.0.0rc1"))
+        self.assertFalse(self.vkey("2.0.0rc1") >= self.vkey("2.0.0"))
+        self.assertTrue(self.at_least("2.0.0", "2.0.0rc1"))
+        self.assertFalse(self.at_least("1.9.9", "2.0.0rc1"))
+        self.assertTrue(self.at_least("1.0", "1.0.0"))
+
+    def test_ordering_matches_pep_440(self):
+        for a in VERSIONS:
+            for b in VERSIONS:
+                with self.subTest(a=a, b=b):
+                    ia, ib = VERSIONS.index(a), VERSIONS.index(b)
+                    same = {a, b} <= {"1.0", "1.0.0"}
+                    self.assertEqual(self.vkey(a) == self.vkey(b), ia == ib or same)
+                    if not same and ia != ib:
+                        self.assertEqual(self.vkey(a) < self.vkey(b), ia < ib)
+
+    def test_matches_packaging_where_available(self):
+        try:
+            from packaging.version import Version
+        except ImportError:
+            self.skipTest("packaging not installed")
+        extra = ["1.0alpha1", "1.0-beta.2", "1.0c1", "1.0pre3", "1.0.rev4", "1.0r", "v1.2", "1.0_post2", "1.2.3.dev"]
+        vs = VERSIONS + extra
+        for a in vs:
+            for b in vs:
+                with self.subTest(a=a, b=b):
+                    self.assertEqual(self.vkey(a) < self.vkey(b), Version(a) < Version(b))
+                    self.assertEqual(self.vkey(a) == self.vkey(b), Version(a) == Version(b))
+
+    def test_not_pep_440_is_not_resolved(self):
+        with self.assertRaises(ValueError):
+            self.vkey("not a version")
+        self.assertFalse(self.at_least("2024-01-01-weird", "1.0"))
+
+
 class FakeResponse:
     def __init__(self, data, link=None):
         self._data, self.headers = json.dumps(data).encode(), {"Link": link} if link else {}

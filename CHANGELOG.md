@@ -108,6 +108,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- Forgejo sync's Dependabot check crashed on a pre-release version (`2.0.0` vs `2.0.0rc1` compared an int
+  with a string), refusing promotion with a traceback. Versions now compare by PEP 440; one that isn't PEP 440
+  is not counted as resolving an alert.
 - Forgejo sync gave a PR the title of a commit already on main when the branch had a merge commit (#68 and #69
   went up titled as #66): the title came from `HEAD~N` with N counted before the rebase. The title is now the
   branch's own first commit, and the commit count is taken after any rebase.

@@ -128,8 +128,38 @@ def locked_versions(lock_text):
         return {}
 
 
-def vkey(v):  # good enough for "is version >= patched" on PyPI versions
-    return [int(x) if x.isdigit() else x for x in re.split(r"[.+-]", v)]
+def vkey(v):
+    """PEP 440 sort key (epoch, release, pre, post, dev, local), like packaging.version.Version, which this
+    script can't import (uv run --no-project: no dependencies). Raises ValueError on a non-PEP 440 version."""
+    m = re.fullmatch(r"v?(?:(\d+)!)?(\d+(?:\.\d+)*)"
+                     r"(?:[._-]?(a|alpha|b|beta|c|rc|pre|preview)[._-]?(\d*))?"
+                     r"(?:-(\d+)|[._-]?(post|rev|r)[._-]?(\d*))?"
+                     r"(?:[._-]?(dev)[._-]?(\d*))?"
+                     r"(?:\+([a-z0-9]+(?:[._-][a-z0-9]+)*))?", v.strip().lower())
+    if not m:
+        raise ValueError(f"not a PEP 440 version: {v!r}")
+    epoch, rel, pre_l, pre_n, post_implicit, post_l, post_n, dev_l, dev_n, local = m.groups()
+    release = [int(x) for x in rel.split(".")]
+    while len(release) > 1 and release[-1] == 0:   # 1.0 == 1.0.0
+        release.pop()
+    if pre_l:
+        pre = (0, {"a": 0, "alpha": 0, "b": 1, "beta": 1}.get(pre_l, 2), int(pre_n or 0))
+    elif dev_l and not (post_l or post_implicit):
+        pre = (-1, 0, 0)   # 1.0.dev1 < 1.0a1
+    else:
+        pre = (1, 0, 0)    # a final release sorts after its pre-releases
+    post = (0, int(post_implicit or post_n or 0)) if (post_l or post_implicit) else (-1, 0)
+    dev = (0, int(dev_n or 0)) if dev_l else (1, 0)
+    local_key = tuple((1, int(p), "") if p.isdigit() else (0, 0, p) for p in re.split(r"[._-]", local)) if local else ()
+    return (int(epoch or 0), tuple(release), pre, post, dev, local_key)
+
+
+def at_least(have, patched):
+    """have >= patched; False when either isn't a PEP 440 version (then the alert isn't claimed as resolved)."""
+    try:
+        return vkey(have) >= vkey(patched)
+    except ValueError:
+        return False
 
 
 def audit(lock_text):
@@ -312,10 +342,10 @@ if lock_branch:
     for a in dependabot or []:
         pkg = a["dependency"]["package"]["name"].lower(); patched = (a.get("security_vulnerability") or {}).get("first_patched_version") or {}
         have = vers.get(pkg)
-        if have and patched.get("identifier") and vkey(have) >= vkey(patched["identifier"]):
+        if have and patched.get("identifier") and at_least(have, patched["identifier"]):
             vuln_lines.append(f"Resolves Dependabot alert #{a['number']} ({pkg} {have} >= {patched['identifier']})")
         local = {v.split()[0].lower() for v in after.values()}
-        if pkg not in local and not (have and patched.get("identifier") and vkey(have) >= vkey(patched["identifier"])):
+        if pkg not in local and not (have and patched.get("identifier") and at_least(have, patched["identifier"])):
             notes.append(f"Dependabot alert #{a['number']} ({pkg}) not seen by pip-audit")
 
 # 3. tests
