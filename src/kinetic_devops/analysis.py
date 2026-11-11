@@ -309,7 +309,7 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
         # Over TLS the watchdog's shutdown surfaces as "Broken pipe" (or a closed-file error) in the blocked
         # read; past the deadline that is the deadline, so say so.
         if not isinstance(exc, TimeoutError) and time.monotonic() >= deadline:
-            raise TimeoutError("AI response exceeded the request deadline") from None
+            raise TimeoutError("AI response exceeded the request deadline") from exc
         raise
 
 
@@ -522,22 +522,30 @@ _VERDICT_LINE = re.compile(
     re.IGNORECASE)
 # The choice itself, as the prompt and its headings name it ("GO/NO-GO", "GO or NO-GO", "GO|NO-GO"): naming the
 # choice is not a NO-GO, so it is blanked out before NO-GO is looked for.
-_CHOICE = re.compile(r"\b(?:NO[- ]GO|GO)\s*(?:/|\||\bor\b)\s*(?:VERDICT\W{0,4}:\W{0,4})?(?:NO[- ]GO|GO)\b",
-                     re.IGNORECASE)
+_CHOICE = re.compile(r"\bGO[ \t]*(?:/|\||(?i:\bor\b))[ \t]*(?:VERDICT\W{0,4}:\W{0,4})?NO[- ]GO\b")
 _NO_GO_WORD = re.compile(r"\bNO[- ]GO\b", re.IGNORECASE)
 # Negated GO in any case ("NOT GO", "do not go ahead", "don’t GO"): looked for only in the GO/NO-GO section, where
 # it is the verdict, and on VERDICT lines.
 _NEGATED_GO = re.compile(r"\b(?:NOT|DON['’]?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
-_SECTION_HEADING = re.compile(r"^[\s#*_\d.)]*GO\s*/\s*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
-_ANY_HEADING = re.compile(r"^\s{0,3}(?:#{1,6}\s|\d+[.)]\s|\*\*\d)", re.MULTILINE)
-_DASHES = re.compile("[\u2010-\u2015\u2212]")
+_SECTION_HEADING = re.compile(r"^[ \t#*_\d.)]*GO\s*/\s*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
+# A numbered section heading ("1) Change Classification", "## 2. Risk", "**3)"): the lead must come before one.
+_NUMBERED_HEADING = re.compile(r"^[ \t#*_]*\d+[.)]\s")
+# A GO with a condition is not a pass: "VERDICT: GO if/unless/pending/once/after/until/but ...".
+_CONDITION = re.compile(r"\b(?:if|unless|pending|once|after|until|provided|assuming|conditional(?:ly)?|subject\s+to|"
+                        r"but|except|caveats?)\b", re.IGNORECASE)
+# A hedged or withheld verdict in the GO/NO-GO section ("Conditional GO", "HOLD", "not yet", "isn't a GO").
+_WITHHELD = re.compile(r"\bconditional(?:ly)?\s+GO\b|\bGO\s+with\s+(?:conditions|caveats)\b|\bHOLD\b|\bnot\s+yet\b|"
+                       r"\bisn['’]?t\s+a\s+GO\b|\bwon['’]?t\s+GO\b|\bcan(?:no|['’])t\s+go\b|\bshould\s+not\s+be\s+promoted\b",
+                       re.IGNORECASE)
+_DASHES = re.compile(r"[\u2010-\u2015\u2212]|\\-")   # Unicode dashes, and a markdown-escaped "\-"
 LEAD_WINDOW = 400   # the prompt asks for the VERDICT line first
 
 
 def _strip_thinking(text: str) -> str:
     """The answer without leading <think> reasoning: a <think>...</think> block that opens the answer, or the
     text before the first </think> when no <think> precedes it and no VERDICT line does (a template that put
-    <think> in the prompt). A </think> quoted later in the answer is never a cut point."""
+    <think> in the prompt), unless a NO-GO comes before it. A </think> quoted later in the answer is never a cut
+    point."""
     stripped = text.lstrip()
     m = re.match(r"<think>.*?</think>", stripped, re.IGNORECASE | re.DOTALL)
     if m:
@@ -545,7 +553,8 @@ def _strip_thinking(text: str) -> str:
     close = stripped.lower().find("</think>")
     if close >= 0:
         before = stripped[:close]
-        if "<think>" not in before.lower() and not any(_VERDICT_LINE.match(line) for line in before.splitlines()):
+        if ("<think>" not in before.lower() and not any(_VERDICT_LINE.match(line) for line in before.splitlines())
+                and not _NO_GO_WORD.search(_CHOICE.sub(" ", _DASHES.sub("-", before)))):
             return stripped[close + len("</think>"):]
     return text
 
@@ -557,12 +566,13 @@ def parse_verdict(review_text: str) -> str:
       a pass, even if it also quotes a "VERDICT: GO" (from an injected commit subject, a diff, a code block).
       Naming the choice ("GO/NO-GO", "GO or NO-GO") doesn't count. A negated GO on a VERDICT line or in the
       GO/NO-GO section ("NOT GO", "do not go ahead") is NO-GO too.
-    * GO only from a "VERDICT: GO" line the answer leads with: in its first LEAD_WINDOW characters (after
-      leading <think> reasoning), before the first section heading, not in a ``` fence, not indented as code,
-      not quoted (`>`), and not the instruction echoed back ("VERDICT: GO or VERDICT: NO-GO").
+    * GO only from an unconditional "VERDICT: GO" line the answer leads with: its first line (one title line
+      before it is allowed; leading <think> reasoning is skipped), within LEAD_WINDOW characters, not in a ```
+      fence, indented as code, quoted (`>`) or the instruction echoed back. "VERDICT: GO if/pending/until/but
+      ..." is UNKNOWN; a hedged or withheld GO/NO-GO section ("Conditional GO", "HOLD", "not yet") is NO-GO.
     * Anything else is UNKNOWN.
     The cost is some NO-GO for answers that mention NO-GO in passing ("no NO-GO risks"); never a false GO."""
-    text = _DASHES.sub("-", _strip_thinking(review_text or ""))
+    text = _DASHES.sub("-", _strip_thinking(review_text or "")).replace("\u00a0", " ")
     plain = _CHOICE.sub(" ", text)
     if _NO_GO_WORD.search(plain):
         return "NO-GO"
@@ -571,22 +581,24 @@ def parse_verdict(review_text: str) -> str:
         if m and m.group(1).upper() != "GO":
             return "NO-GO"
     heading = _SECTION_HEADING.search(text)
-    if heading and _NEGATED_GO.search(text[heading.end():]):
+    if heading and (_NEGATED_GO.search(text[heading.end():]) or _WITHHELD.search(text[heading.end():])):
         return "NO-GO"
-    lead_end = LEAD_WINDOW
-    first_heading = _ANY_HEADING.search(text)
-    if first_heading:
-        lead_end = min(lead_end, first_heading.start())
-    fenced = False
-    for line in text[:lead_end].splitlines():
+    # The lead: the first line the answer gives (one title line before it is allowed), within LEAD_WINDOW.
+    fenced, title_seen = False, False
+    for line in text[:LEAD_WINDOW].splitlines():
         if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced   # only hides a GO (NO-GO is looked for everywhere above), so a toggle will do
             continue
-        if fenced or line.startswith(("    ", "\t")) or line.lstrip().startswith(">") or _CHOICE.search(line):
-            continue   # code, a quote, or the instruction echoed back ("VERDICT: <GO or NO-GO>")
+        if fenced or not line.strip():
+            continue
+        if line.startswith(("    ", "\t")) or line.lstrip().startswith(">") or _CHOICE.search(line):
+            continue   # code, a quote, or the instruction echoed back ("VERDICT: <GO or NO-GO>"): not the answer's
         m = _VERDICT_LINE.match(line)
-        if m and m.group(1).upper() == "GO":
-            return "GO"
+        if m:
+            return "GO" if m.group(1).upper() == "GO" and not _CONDITION.search(m.group(2)) else "UNKNOWN"
+        if title_seen or _NUMBERED_HEADING.match(line):
+            return "UNKNOWN"   # the review started without its verdict line
+        title_seen = True
     return "UNKNOWN"
 
 
@@ -628,7 +640,7 @@ def risk_from_paths(paths: list[str]) -> str:
 ROGUE_RULE_VERSION = 2
 _REVIEW_STEERING = re.compile(
     # v1 (as released): any verdict mention, pre-/auto-approval, "<x>-approved/passed", ignore previous instructions
-    r"\bverdict\s*[:=-]?\s*\**\s*(?:no[- ]?)?go\b"
+    r"\bverdict\s*(?:[:=-]\s*)?(?:\*+\s*)?(?:no[- ]?)?go\b"   # = v1's, without its \s*..\s*..\s* backtracking
     r"|\bpre[- ]?approved\b|\bauto[- ]?approved?\b"
     r"|\b(?:review|security|ai)[- ](?:approved|passed|cleared)\b"
     r"|\bignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier)\s+instructions\b"
@@ -642,7 +654,7 @@ _REVIEW_STEERING = re.compile(
 
 def steers_review(text: str) -> bool:
     """True when text (a commit subject) carries verdict or approval claims aimed at the reviewer."""
-    return bool(_REVIEW_STEERING.search((text or "").strip()))
+    return bool(_REVIEW_STEERING.search((text or "").strip()[:2000]))
 
 
 def is_rogue_commit(subject: str, paths: list[str]) -> bool:

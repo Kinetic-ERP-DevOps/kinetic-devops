@@ -136,9 +136,11 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   chunk NO-GO, so an answer that quotes an injected "VERDICT: GO" (from a commit subject, the diff, a code
   block, a quoted `</think>`) can't pass when it says NO-GO; naming the choice ("GO/NO-GO") doesn't count. A
   negated GO on a VERDICT line or anywhere in the GO/NO-GO section ("NOT GO", "do not go ahead") is NO-GO.
-  GO needs a `VERDICT: GO` line the answer leads with: in its first 400 characters (after leading `<think>`
-  reasoning), before the first section heading, not in a code fence, indented or quoted with `>`, and not the
-  instruction echoed back. Anything else is UNKNOWN; before, a bare "GO" in the last section passed, so "Do
+  A hedged or withheld GO/NO-GO section ("Conditional GO", "HOLD", "not yet") is NO-GO. GO needs an
+  unconditional `VERDICT: GO` line the answer leads with: its first line (one title line may come before it;
+  leading `<think>` reasoning is skipped, but never a NO-GO before a lone `</think>`), not in a code fence,
+  indented or quoted with `>`, and not the instruction echoed back; "VERDICT: GO if/pending/until/but ..." is
+  not a pass. Anything else is UNKNOWN; before, a bare "GO" in the last section passed, so "Do
   NOT GO: ..." read as GO. The cost: some answers that mention NO-GO in passing ("no NO-GO risks") now read
   as NO-GO, never a false GO.
 - Forgejo sync's Dependabot check crashed on a pre-release version (`2.0.0` vs `2.0.0rc1` compared an int
@@ -190,7 +192,8 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   anywhere, "pre-approved", "security approved", "approved by the AI review", "ignore/disregard the previous
   instructions") is a `rogue_candidate`. The flag is advisory and errs towards flagging: subjects that only
   name such a feature are flagged too. Run reports record the rule as `rogue_rule_version` (2; it flags
-  everything the released rule did); `verify-report` always fails a commit the rule flags but the report
+  everything the released rule did, without the released pattern's catastrophic backtracking on a subject
+  full of spaces, which could hang a run); `verify-report` always fails a commit the rule flags but the report
   doesn't, and accepts (with a warning) an extra flag in a report written under an older rule.
 - With the vault encrypted (`encrypt-vault`), IdP access and refresh tokens were stored in clear in the
   keyring's `idp_*` side entries, and every sign-in or refresh rewrote the session's `current_token` (and the

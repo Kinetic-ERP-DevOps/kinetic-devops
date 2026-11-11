@@ -86,7 +86,7 @@ def chat(url, payload, headers, deadline_s=900, idle_s=READ_TIMEOUT):
         # Over TLS the watchdog's shutdown surfaces as "Broken pipe" (or a closed-file error) in the
         # blocked read; past the deadline that is the deadline, so say so.
         if not isinstance(exc, TimeoutError) and time.monotonic() >= deadline:
-            raise TimeoutError("review exceeded its deadline") from None
+            raise TimeoutError("review exceeded its deadline") from exc
         raise
 
 
