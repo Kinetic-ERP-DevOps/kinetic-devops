@@ -130,6 +130,21 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
+- IdP: a network error or malformed JSON during a token request (e.g. a refresh with the network down) was a
+  traceback; it now takes the "sign in again" path.
+- IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
+  the new holder's lock, so two processes could use the same rotating refresh token. The lock is now an OS file
+  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale.
+- `auth` session resolution raised `IndexError` when no company was given and the environment had none
+  configured; it now raises `SessionResolutionError` saying to pass `--co`.
+
+### Security
+- With the vault encrypted (`encrypt-vault`), IdP access and refresh tokens were stored in clear in the
+  keyring's `idp_*` side entries, and every sign-in or refresh rewrote the session's `current_token` (and the
+  servers map, when it registered a user) as plain JSON, undoing the encryption. All writes of token material
+  and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
+  without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
+  now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
 
 
 ## [0.2.0.0a8] - 2026-11-01
