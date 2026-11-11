@@ -348,8 +348,13 @@ def session_meta(tok: Dict, settings: Dict[str, str], user_id: str, nickname: st
 # Windows Credential Manager caps a secret at 2560 bytes, and keyring stores UTF-16, so about 1280 characters.
 # An IdP session (JWT access token + refresh token + metadata) is larger. So the slot's "current_token" entry
 # keeps the metadata only, marked "_idp_split", and the two tokens go to chunked side entries in the same slot.
+# Any session's "current_token" (a password session's whole token response, encrypted or not; encryption makes it
+# about 1.4x longer) that is still over the limit is chunked too: "current_token" then holds the chunk count and
+# the value is in "current_token#0", "current_token#1", ... (write_token_entry / read_token_entry).
 SECRET_FIELDS = ("AccessToken", "refresh_token")
 CHUNK_CHARS = 1000
+MAX_ENTRY_CHARS = 1280
+TOKEN_ENTRY = "current_token"
 
 
 def _side(field: str) -> str:
@@ -382,6 +387,39 @@ def _delete_chunked(service: str, name: str) -> None:
             keyring.delete_password(service, f"{name}#{i}")
     with contextlib.suppress(Exception):
         keyring.delete_password(service, name)
+
+
+def _delete_chunks_from(service: str, name: str, start: int = 0) -> None:
+    """Delete name#start, name#start+1, ... up to the first one that isn't there (chunks are contiguous)."""
+    i = start
+    while keyring.get_password(service, f"{name}#{i}") is not None:
+        with contextlib.suppress(Exception):
+            keyring.delete_password(service, f"{name}#{i}")
+        i += 1
+
+
+def write_token_entry(slot: str, value: str) -> None:
+    """Store a slot's "current_token" value (already sealed): as is when it fits the keyring limit, else chunked.
+
+    Going from chunked to single, the single value is written first and the old chunks are removed after, so a
+    reader never finds a chunk count without its chunks.
+    """
+    if len(value) > MAX_ENTRY_CHARS:
+        _put_chunked(slot, TOKEN_ENTRY, value)
+        return
+    keyring.set_password(slot, TOKEN_ENTRY, value)
+    _delete_chunks_from(slot, TOKEN_ENTRY)
+
+
+def read_token_entry(slot: str) -> Optional[str]:
+    """A slot's "current_token" value in either form (single entry, or a chunk count plus chunks); None if absent.
+
+    A stored value is JSON (an object, or an encrypted blob), never just digits, so digits mean a chunk count.
+    """
+    raw = keyring.get_password(slot, TOKEN_ENTRY)
+    if raw and raw.isdigit():
+        return _get_chunked(slot, TOKEN_ENTRY) or None
+    return raw
 
 
 def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
@@ -419,16 +457,27 @@ def unpack(slot: str, data: Dict, passphrase: Optional[str] = None) -> Dict:
 
 
 def delete_secrets(slot: str) -> None:
-    """Remove an IdP session's token side entries (call wherever a slot's "current_token" is deleted)."""
+    """Remove a slot's side entries: an IdP session's tokens, and the chunks of a chunked "current_token".
+
+    Call wherever a slot's "current_token" is deleted, before or after it (the chunks are found without the count).
+    """
     for field in SECRET_FIELDS:
         _delete_chunked(slot, _side(field))
+    _delete_chunks_from(slot, TOKEN_ENTRY)
 
 
 def move_secrets(old_slot: str, new_slot: str) -> None:
+    """Copy a slot's side entries (IdP tokens, "current_token" chunks) to new_slot. The caller copies
+    "current_token" itself after this, so new_slot never has a chunk count without its chunks."""
     for field in SECRET_FIELDS:
         value = _get_chunked(old_slot, _side(field))
         if value:
             _put_chunked(new_slot, _side(field), value)
+    count = keyring.get_password(old_slot, TOKEN_ENTRY) or ""
+    for i in range(int(count) if count.isdigit() else 0):
+        part = keyring.get_password(old_slot, f"{TOKEN_ENTRY}#{i}")
+        if part is not None:
+            keyring.set_password(new_slot, f"{TOKEN_ENTRY}#{i}", part)
 
 
 def lock_dir() -> str:

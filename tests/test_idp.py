@@ -1008,6 +1008,114 @@ class TestIdpRefreshAsksForThePassphraseFirst(VaultFixture):
         self.assertIn("KINETIC_VAULT_PASSPHRASE", err)
 
 
+def _jwt(length):
+    """A JWT-shaped token of about this many characters (Kinetic's access tokens are 600-1100)."""
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+    head, sig = enc({"alg": "RS256", "typ": "JWT"}), "S" * 342
+    claims = {"iss": "https://kinetic.example/Env", "sub": "alice", "aud": "epicor_erp", "exp": 1, "pad": ""}
+    while len(f"{head}.{enc(claims)}.{sig}") < length:
+        claims["pad"] += "p"
+    return f"{head}.{enc(claims)}.{sig}"
+
+
+class TestPasswordSessionChunking(VaultFixture):
+    """Review finding: only IdP sessions were split; a password session's whole token response went into one
+    "current_token" entry, which encryption makes ~1.4x longer, over Windows Credential Manager's ~1280 characters
+    for Kinetic tokens of about 660-1050 characters. FakeKeyring enforces the limit."""
+
+    SECRETS = ("API-KEY-SECRET",)
+
+    def setUp(self):
+        super().setUp()
+        self.jwt = _jwt(1000)
+        self.SECRETS = ("API-KEY-SECRET", self.jwt[200:260])   # any piece of the token in clear is a leak
+        self.pw = {"AccessToken": self.jwt, "ExpiresIn": 1200, "TokenType": "Bearer", "_local_timestamp": time.time(),
+                   "user_id": "alice", "env_name": "pilot", "current_company": "ACME"}
+
+    def entries(self, slot=None):
+        return {n: v for (s, n), v in self.kr.store.items() if s == (slot or self.slot)}
+
+    def check_round_trip(self, slot=None):
+        self.assertTrue(all(len(v) <= 1280 for v in self.kr.store.values()))
+        back = self.mgr._get_token_meta(slot or self.slot)
+        self.assertEqual(back["AccessToken"], self.jwt)
+        self.assertTrue(back["_is_valid"])
+
+    def test_encrypted_password_session_is_chunked_and_reads_back(self):
+        self.assertGreater(len(_fake_encrypt(self.pw, "pass-1")), 1280)   # would not fit in one entry
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        self.assertTrue(self.kr.get_password(self.slot, "current_token").isdigit())
+        self.assertEqual(self.leaked(), [])
+        self.check_round_trip()
+
+    def test_clear_password_session_that_fits_stays_one_entry(self):
+        self.assertLess(len(json.dumps(self.pw)), 1280)
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        self.assertEqual(list(self.entries()), ["current_token"])
+        self.assertEqual(json.loads(self.kr.get_password(self.slot, "current_token"))["AccessToken"], self.jwt)
+        self.check_round_trip()
+
+    def test_clear_password_session_over_the_limit_is_chunked(self):
+        self.jwt = self.pw["AccessToken"] = _jwt(1500)
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        self.assertTrue(self.kr.get_password(self.slot, "current_token").isdigit())
+        self.check_round_trip()
+
+    def test_old_single_entry_form_still_reads(self):
+        self.encrypted_vault()
+        small = dict(self.pw, AccessToken="jwt")
+        self.kr.set_password(self.slot, "current_token", _fake_encrypt(small, "pass-1"))
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["AccessToken"], "jwt")
+
+    def test_going_back_to_one_entry_removes_the_chunks(self):
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        self.mgr.touch_session(self.slot, dict(self.pw, AccessToken="short"), "pilot")
+        self.assertEqual(list(self.entries()), ["current_token"])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["AccessToken"], "short")
+
+    def test_encrypt_and_decrypt_vault_handle_chunked_password_sessions(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")   # clear: one entry
+        with patch("builtins.print"):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertTrue(self.kr.get_password(self.slot, "current_token").isdigit())
+        self.assertEqual(self.leaked(), [])
+        self.check_round_trip()
+        with patch("builtins.print"):
+            self.mgr.decrypt_vault("pass-1")
+        self.assertEqual(list(self.entries()), ["current_token"])
+        self.check_round_trip()
+
+    def test_rename_moves_the_chunks_and_removes_the_old_ones(self):
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        self.mgr.rename("pilot", "pilot2")
+        new_slot = self.mgr._get_token_key("pilot2", "alice", "API-KEY-SECRET")
+        self.assertEqual(self.entries(), {})
+        self.assertTrue(self.kr.get_password(new_slot, "current_token").isdigit())
+        self.check_round_trip(new_slot)
+
+    def test_logout_removes_the_chunks(self):
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        with patch("builtins.print"):
+            self.mgr.logout("pilot")
+        self.assertEqual(self.entries(), {})
+
+    def test_validate_reads_chunked_and_idp_sessions_and_keeps_them(self):
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
+        with patch("builtins.print") as printed:
+            self.mgr.validate()
+        report = " ".join(str(a) for c in printed.call_args_list for a in c.args)
+        self.assertNotIn("removed", report)
+        self.assertNotIn("missing AccessToken", report)
+
+
 class TestVaultPromptMode(unittest.TestCase):
     """A typed vault passphrase is kept until the command ends (--vault-prompt once, the default, said once on stderr)
     or asked for each time (--vault-prompt every / KINETIC_VAULT_PROMPT=every)."""
@@ -1092,6 +1200,27 @@ class TestEncryptedVaultIdpTokensNative(unittest.TestCase):
             self.skipTest(f"vault encryption unavailable: {exc}")
         self.assertEqual((back["AccessToken"], back["refresh_token"]), (meta["AccessToken"], "RT-SECRET"))
         self.assertFalse([k for k, v in kr.store.items() if "RT-SECRET" in v or "AT-SECRET" in v])
+
+    def test_encrypted_password_session_with_a_kinetic_sized_token_fits(self):
+        """Real encryption: a 1000-character access token encrypts to ~1700 characters, over the limit: chunked."""
+        kr = FakeKeyring()
+        servers = {"pilot": {"url": "https://pilot.example", "api_key": "K", "companies": "ACME", "sessions": []}}
+        mgr = KineticConfigManager.__new__(KineticConfigManager)
+        meta = {"AccessToken": _jwt(1000), "ExpiresIn": 1200, "TokenType": "Bearer", "_local_timestamp": time.time(),
+                "user_id": "alice", "env_name": "pilot", "current_company": "ACME"}
+        try:
+            with patch.object(idp, "keyring", kr), patch.object(auth, "keyring", kr), \
+                 patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+                kr.set_password(auth.SERVICE_SERVERS, "config", crypto.encrypt_json(servers, "pass-1"))
+                mgr.touch_session("slot", dict(meta), "pilot")
+                back = mgr._get_token_meta("slot")
+        except auth.VaultError:
+            raise
+        except RuntimeError as exc:   # cryptography not installed, or not loadable
+            self.skipTest(f"vault encryption unavailable: {exc}")
+        self.assertTrue(kr.get_password("slot", "current_token").isdigit())
+        self.assertEqual(back["AccessToken"], meta["AccessToken"])
+        self.assertFalse([k for k, v in kr.store.items() if meta["AccessToken"][100:160] in v])
 
 
 class TestScannerLearnsIdpIdentifiers(unittest.TestCase):

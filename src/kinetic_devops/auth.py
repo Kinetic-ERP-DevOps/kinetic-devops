@@ -545,9 +545,9 @@ class KineticConfigManager(KineticCore):
 
     def _save_token_meta(self, slot: str, meta: Dict) -> None:
         """The one write path for a session's token material ("current_token" plus an IdP session's token side
-        entries), encrypted when the vault is."""
+        entries), encrypted when the vault is. "current_token" is chunked when it is over the keyring's limit."""
         passphrase = self._write_passphrase()
-        keyring.set_password(slot, "current_token", self._seal(idp.pack(slot, meta, passphrase), passphrase))
+        idp.write_token_entry(slot, self._seal(idp.pack(slot, meta, passphrase), passphrase))
 
     def _reseal_token_slots(self, servers: Dict, read_pass: Optional[str], write_pass: Optional[str]) -> int:
         """Rewrite every recorded session's token material with write_pass (None: plain JSON). For encrypt-vault and
@@ -557,13 +557,15 @@ class KineticConfigManager(KineticCore):
             api_key = cfg.get("api_key", "")
             for user in cfg.get("sessions", []) or []:
                 slot = self._get_token_key(name, user, api_key)
-                raw = keyring.get_password(slot, "current_token")
+                raw = idp.read_token_entry(slot)
                 if not raw:
+                    if keyring.get_password(slot, idp.TOKEN_ENTRY):   # a chunk count whose chunks aren't all there
+                        failed += 1
                     continue
                 try:
                     data = crypto.decrypt_json(raw, read_pass) if crypto.is_encrypted_blob(raw) else json.loads(raw)
                     data = idp.unpack(slot, data, read_pass)
-                    keyring.set_password(slot, "current_token", self._seal(idp.pack(slot, data, write_pass), write_pass))
+                    idp.write_token_entry(slot, self._seal(idp.pack(slot, data, write_pass), write_pass))
                 except Exception:
                     failed += 1
         return failed
@@ -666,7 +668,7 @@ class KineticConfigManager(KineticCore):
 
     def _get_token_meta(self, token_slot: str) -> Optional[Dict]:
         """Retrieves metadata using the unique token_slot identifier."""
-        raw_data = keyring.get_password(token_slot, "current_token")
+        raw_data = idp.read_token_entry(token_slot)
         if not raw_data: return None
 
         # If token slot is encrypted, decrypt it with same passphrase logic
@@ -686,6 +688,8 @@ class KineticConfigManager(KineticCore):
                 data = json.loads(raw_data)
             except Exception:
                 return None
+        if not isinstance(data, dict):
+            return None
 
         # The token side entries of an IdP session are encrypted with the vault too (when it is).
         data = idp.unpack(token_slot, data, passphrase or self._vault_pass_if_known())
@@ -1983,11 +1987,12 @@ class KineticConfigManager(KineticCore):
         if dry_run:
             return summary
 
-        # 1. New slots first (old ones still exist if anything below fails).
+        # 1. New slots first (old ones still exist if anything below fails). Side entries (IdP tokens, the chunks
+        # of a chunked "current_token") before "current_token" itself, which may be their chunk count.
         for move in moves:
             if move["raw"]:
-                keyring.set_password(move["new_slot"], "current_token", move["raw"])
                 idp.move_secrets(move["old_slot"], move["new_slot"])
+                keyring.set_password(move["new_slot"], "current_token", move["raw"])
 
         # 2. Config entry, keeping its position and the vault's encryption.
         renamed = {(new_name if key == old_key else key): value for key, value in servers.items()}
@@ -2573,13 +2578,24 @@ class KineticConfigManager(KineticCore):
                 key_hash = hashlib.sha256(secret.encode()).hexdigest()[:12]
                 slot = f"{env_name}-{user.lower()}-{key_hash}"
                 
-                token_raw = keyring.get_password(slot, "current_token")
+                token_raw = idp.read_token_entry(slot)   # single or chunked "current_token"
                 if not token_raw:
                     issues_found.append(f"⚠️ {env_name}: session '{user}' has no token at slot {slot}")
                     continue
                 
                 try:
-                    token_data = json.loads(token_raw)
+                    if crypto.is_encrypted_blob(token_raw) or '"_idp_split"' in token_raw:
+                        # Encrypted, or an IdP session with its tokens in side entries: read it the usual way.
+                        token_data = self._get_token_meta(slot)
+                        if token_data is None:
+                            issues_found.append(f"⚠️ {env_name}/{user}: token can't be read with this passphrase "
+                                                "(left as it is)")
+                            valid_sessions.append(user)
+                            continue
+                    else:
+                        token_data = json.loads(token_raw)
+                    if not isinstance(token_data, dict):
+                        raise json.JSONDecodeError("not a JSON object", token_raw, 0)
                     
                     # Check for required token fields
                     if not token_data.get("AccessToken") and not token_data.get("access_token"):
@@ -2620,7 +2636,9 @@ class KineticConfigManager(KineticCore):
         # Validate LAST_GLOBAL_SESSION pointer
         last_ptr = keyring.get_password("KineticSDK", "LAST_GLOBAL_SESSION")
         if last_ptr:
-            token_raw = keyring.get_password(last_ptr, "current_token")
+            token_raw = idp.read_token_entry(last_ptr)
+            if token_raw and (crypto.is_encrypted_blob(token_raw) or '"_idp_split"' in token_raw):
+                token_raw = json.dumps(self._get_token_meta(last_ptr) or {"_local_timestamp": time.time()})
             if not token_raw:
                 issues_found.append(f"⚠️ LAST_GLOBAL_SESSION points to slot with no token")
                 try:

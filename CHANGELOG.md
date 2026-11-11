@@ -182,6 +182,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
   without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
+  Encryption makes a token entry ~1.4x longer, so any session's `current_token` over the keyring's ~1280-character
+  limit (Windows Credential Manager), such as a password session with a typical Kinetic token in an encrypted
+  vault, is split over `current_token#N` entries; both forms are read, and `rename`, `logout` and the clean-up
+  commands handle the chunks.
   A typed vault passphrase is kept in memory until the command ends (said once; never stored);
   `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead. An IdP refresh asks for
   (and checks) the passphrase before it spends the refresh token, and not again during that refresh, so a

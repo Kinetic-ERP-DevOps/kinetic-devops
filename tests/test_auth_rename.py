@@ -8,7 +8,7 @@ import os
 import unittest
 from unittest import mock
 
-from kinetic_devops import auth, crypto
+from kinetic_devops import auth, crypto, idp
 from kinetic_devops.auth import SERVICE_SERVERS, KineticConfigManager
 from tests.cli_matrix import native_checks_enabled
 
@@ -39,9 +39,10 @@ class RenameTestBase(unittest.TestCase):
 
     def setUp(self):
         self.kr = FakeKeyring(case_insensitive=self.case_insensitive)
-        patcher = mock.patch.object(auth, "keyring", self.kr)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for module in (auth, idp):   # idp moves and deletes a slot's side entries
+            patcher = mock.patch.object(module, "keyring", self.kr)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.mgr = KineticConfigManager.__new__(KineticConfigManager)
         self.servers = {
             "OldEnv": {"url": "https://example.invalid/a", "companies": "CO1", "api_key": "key-1",
