@@ -108,6 +108,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- Forgejo sync gave a PR the title of a commit already on main when the branch had a merge commit (#68 and #69
+  went up titled as #66): the title came from `HEAD~N` with N counted before the rebase. The title is now the
+  branch's own first commit, and the commit count is taken after any rebase.
 - Forgejo sync failed on its first line since #66 (`mktemp: unrecognized option: suffix=.py`): the runner
   image's BusyBox `mktemp` has no long options. It now uses `mktemp -d`; a test keeps GNU-only `mktemp`
   options out of `.forgejo/workflows`.
