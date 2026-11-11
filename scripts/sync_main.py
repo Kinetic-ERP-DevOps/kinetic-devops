@@ -1,19 +1,25 @@
 """sync_main.py -- bring main up to the upstream after a PR merges, and tag what was synced.
 
 Run through scripts/sync-main.sh (any POSIX shell, Git Bash on Windows). Remotes: `public` = the GitHub
-upstream (source of truth), `origin` = the maintainer's fork (e.g. a Forgejo mirror). Steps:
+upstream (source of truth), the fork = the maintainer's fork (e.g. a Forgejo mirror; `origin` unless set).
+The branch is `main` unless set. Steps:
 
-  1. fetch public/main and origin/main
-  2. stop if origin's main or the local main has a commit that isn't on public/main: main only ever
-     fast-forwards to public/main (see CONTRIBUTING.md, "Local branch guard")
-  3. fast-forward the local main, then push it to origin (the pre-push guard allows exactly public/main)
-  4. for every merged PR from a `sync/<name>` branch without a `synced/<name>` tag on origin: an annotated
-     `synced/<name>` tag at the PR head that was merged (fetched as refs/pull/N/head), whose message names the
-     PR, the commit it became on main and, if one exists, the `sync/<name>` tag it was promoted from
+  1. fetch public/<branch> and <fork>/<branch>
+  2. stop if the fork's branch or the local branch has a commit that isn't on public/<branch>: it only ever
+     fast-forwards to public/<branch> (see CONTRIBUTING.md, "Local branch guard")
+  3. fast-forward the local branch, then push it to the fork (the pre-push guard allows main only as exactly
+     public/main)
+  4. for every PR merged into the branch from a `sync/<name>` branch without a `synced/<name>` tag on the fork:
+     an annotated `synced/<name>` tag at the PR head that was merged (fetched as refs/pull/N/head), whose
+     message names the PR, the commit it became on the branch and, if one exists, the `sync/<name>` tag it was
+     promoted from
 
-Options: --dry-run (fetch and report, change nothing), --no-tags (skip step 4), --prs-json FILE (read the
-closed PRs from a file instead of the GitHub API, for tests). GITHUB_TOKEN, if set, is sent to the API
-(only needed for private repos or the rate limit). Exit 1 = stopped; the reason is printed.
+Options: --fork REMOTE (the fork's remote name), --branch NAME (the branch to bring up), --save (store the
+given --fork/--branch in this clone's git config as sync-main.fork / sync-main.branch, the defaults from then
+on), --dry-run (fetch and report, change nothing), --no-tags (skip step 4), --prs-json FILE (read the closed
+PRs from a file instead of the GitHub API, for tests). Defaults: the option, else the git config, else
+origin / main. GITHUB_TOKEN, if set, is sent to the API (only needed for private repos or the rate limit).
+Exit 1 = stopped; the reason is printed.
 """
 import argparse
 import json
@@ -23,7 +29,8 @@ import subprocess
 import sys
 import urllib.request
 
-UP, FORK = "public", "origin"
+UP = "public"
+FORK, BRANCH = "origin", "main"   # set from the options / git config in main()
 
 
 class Stop(Exception):
@@ -50,7 +57,7 @@ def ahead(base, ref):
 
 
 def remote_tags(prefix):
-    """{tag name: commit sha} of the tags on origin under prefix (annotated tags resolved to their commit)."""
+    """{tag name: commit sha} of the tags on the fork under prefix (annotated tags resolved to their commit)."""
     tags = {}
     for line in git("ls-remote", "--tags", FORK, f"refs/tags/{prefix}*").splitlines():
         obj, ref = line.split("\t")
@@ -83,37 +90,40 @@ def closed_prs(prs_json):
 
 
 def sync_main(dry):
-    git("fetch", "-q", UP, f"+refs/heads/main:refs/remotes/{UP}/main")
-    git("fetch", "-q", FORK, f"+refs/heads/main:refs/remotes/{FORK}/main")
-    new = sha(f"refs/remotes/{UP}/main")
-    fork = sha(f"refs/remotes/{FORK}/main")
-    local = sha("refs/heads/main")
-    for who, ref in ((f"{FORK}/main", fork), ("local main", local)):
+    B = BRANCH
+    git("fetch", "-q", UP, f"+refs/heads/{B}:refs/remotes/{UP}/{B}")
+    git("fetch", "-q", FORK, f"+refs/heads/{B}:refs/remotes/{FORK}/{B}")
+    new = sha(f"refs/remotes/{UP}/{B}")
+    if not new:
+        raise Stop(f"{UP} has no branch {B}")
+    fork = sha(f"refs/remotes/{FORK}/{B}")
+    local = sha(f"refs/heads/{B}")
+    for who, ref in ((f"{FORK}/{B}", fork), (f"local {B}", local)):
         if ref and not is_ancestor(ref, new):
-            raise Stop(f"{who} has commits that aren't on {UP}/main; main only fast-forwards to {UP}/main. "
-                       "Move them to a branch, then reset main to " + f"{UP}/main:\n  " + "\n  ".join(ahead(new, ref)))
-    print(f"{UP}/main is at {new[:12]}")
+            raise Stop(f"{who} has commits that aren't on {UP}/{B}; {B} only fast-forwards to {UP}/{B}. "
+                       "Move them to a branch, then reset " + f"{B} to {UP}/{B}:\n  " + "\n  ".join(ahead(new, ref)))
+    print(f"{UP}/{B} is at {new[:12]}")
     current = git("symbolic-ref", "-q", "--short", "HEAD", check=False)
     if local == new:
-        print("local main: up to date")
+        print(f"local {B}: up to date")
     elif dry:
-        print(f"local main: would fast-forward {local[:12] if local else '(none)'} -> {new[:12]}")
-    elif current == "main":
+        print(f"local {B}: would fast-forward {local[:12] if local else '(none)'} -> {new[:12]}")
+    elif current == B:
         git("merge", "-q", "--ff-only", new)
-        print(f"local main: fast-forwarded to {new[:12]}")
-    else:  # refuses if main is checked out in another worktree
-        git("fetch", "-q", ".", f"{new}:refs/heads/main")
-        print(f"local main: fast-forwarded to {new[:12]}")
+        print(f"local {B}: fast-forwarded to {new[:12]}")
+    else:  # refuses if the branch is checked out in another worktree
+        git("fetch", "-q", ".", f"{new}:refs/heads/{B}")
+        print(f"local {B}: fast-forwarded to {new[:12]}")
     if fork == new:
-        print(f"{FORK}/main: up to date")
+        print(f"{FORK}/{B}: up to date")
     elif dry:
-        print(f"{FORK}/main: would push {fork[:12] if fork else '(none)'} -> {new[:12]}")
+        print(f"{FORK}/{B}: would push {fork[:12] if fork else '(none)'} -> {new[:12]}")
     else:
-        git("push", "-q", FORK, "refs/heads/main:refs/heads/main")
-        git("fetch", "-q", FORK, f"+refs/heads/main:refs/remotes/{FORK}/main")
-        if sha(f"refs/remotes/{FORK}/main") != new:
-            raise Stop(f"{FORK}/main isn't {new[:12]} after the push")
-        print(f"{FORK}/main: pushed {new[:12]}")
+        git("push", "-q", FORK, f"refs/heads/{B}:refs/heads/{B}")
+        git("fetch", "-q", FORK, f"+refs/heads/{B}:refs/remotes/{FORK}/{B}")
+        if sha(f"refs/remotes/{FORK}/{B}") != new:
+            raise Stop(f"{FORK}/{B} isn't {new[:12]} after the push")
+        print(f"{FORK}/{B}: pushed {new[:12]}")
 
 
 def tag_synced(dry, prs_json):
@@ -122,6 +132,8 @@ def tag_synced(dry, prs_json):
     for p in sorted(closed_prs(prs_json), key=lambda p: p["number"]):
         ref = p["head"]["ref"]
         if not p.get("merged_at") or not ref.startswith("sync/"):
+            continue
+        if (p.get("base") or {}).get("ref", BRANCH) != BRANCH:   # merged into another branch
             continue
         name, head, n = ref[len("sync/"):], p["head"]["sha"], p["number"]
         tag = f"synced/{name}"
@@ -133,7 +145,7 @@ def tag_synced(dry, prs_json):
         if sha("FETCH_HEAD") != head:
             raise Stop(f"PR #{n}: {UP} refs/pull/{n}/head isn't {head[:12]}")
         src = sync_tags.get(f"sync/{name}")
-        msg = (f"{ref} -> PR #{n} \"{p['title']}\", merged {p['merged_at'][:10]} as {p['merge_commit_sha'][:12]} on main.\n"
+        msg = (f"{ref} -> PR #{n} \"{p['title']}\", merged {p['merged_at'][:10]} as {p['merge_commit_sha'][:12]} on {BRANCH}.\n"
                f"This tag = the PR head that was merged ({head[:12]}).\n"
                + (f"Promoted from {FORK} commit {src[:12]} (tag sync/{name})." if src
                   else "Started from the Run workflow dialog (no sync/ tag)."))
@@ -156,16 +168,40 @@ def tag_synced(dry, prs_json):
     print(f"synced/ tags: pushed {len(todo)} to {FORK}")
 
 
+def config(key):
+    return git("config", "--get", f"sync-main.{key}", check=False) or None
+
+
 def main(argv=None):
+    global FORK, BRANCH
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--fork", help="the fork's remote name (default: git config sync-main.fork, else origin)")
+    ap.add_argument("--branch", help="the branch to bring up (default: git config sync-main.branch, else main)")
+    ap.add_argument("--save", action="store_true",
+                    help="store the given --fork/--branch in this clone's git config as the defaults")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-tags", action="store_true")
     ap.add_argument("--prs-json")
     a = ap.parse_args(argv)
     try:
+        if a.save and not (a.fork or a.branch):
+            raise Stop("--save stores --fork and/or --branch; give at least one")
+        FORK = a.fork or config("fork") or "origin"
+        BRANCH = a.branch or config("branch") or "main"
+        if git("check-ref-format", "--branch", BRANCH, check=False) != BRANCH:
+            raise Stop(f"not a valid branch name: {BRANCH!r}")
         for r in (UP, FORK):
             if not git("remote", "get-url", r, check=False):
-                raise Stop(f"no remote '{r}' ({UP} = the GitHub upstream, {FORK} = your fork)")
+                raise Stop(f"no remote '{r}' ({UP} = the GitHub upstream, {FORK} = your fork; "
+                           "set the fork with --fork REMOTE, add --save to keep it)")
+        if FORK == UP:
+            raise Stop(f"the fork can't be {UP}, the upstream")
+        if a.save:
+            for key, val in (("fork", a.fork), ("branch", a.branch)):
+                if val:
+                    git("config", f"sync-main.{key}", val)
+                    print(f"saved: git config sync-main.{key} {val}")
+        print(f"sync-main: {UP}/{BRANCH} -> local {BRANCH} and {FORK}/{BRANCH}")
         sync_main(a.dry_run)
         if not a.no_tags:
             tag_synced(a.dry_run, a.prs_json)
