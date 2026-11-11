@@ -37,7 +37,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
   `idp-login` asks for what isn't passed when run at a terminal: the environment (from the configured list), the
   Epicor User ID (an existing session, or a new ID with the IdP sign-in name offered) and the company; without a
-  terminal a missing environment or user stops before the browser opens.
+  terminal a missing environment or user stops before the browser opens. `idp-login --new-session` reuses nothing
+  from before: it doesn't offer the existing sessions or `KIN_USER` (it asks for the User ID and company) and
+  sends `prompt=login`, so the IdP asks for the sign-in again instead of reusing the browser's; it needs a terminal.
   Hardened before release: https-only remote endpoints with certificate checks (the loopback redirect stays http,
   RFC 8252); the discovery issuer must be the endpoint Kinetic names, with the authorize and token endpoints on its
   host; the callback takes only the first response with the right `state` and checks `Host` and `iss` (RFC 9207);
@@ -115,6 +117,16 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- `analysis diff` and the Forgejo `ai-review` action: the AI request deadline was only checked between lines,
+  so one slow read could run a full timeout past it, and the plain-JSON fallback had no deadline at all. Every
+  read is now capped at the time left and, once the answer flows, at 30 s (`KINETIC_AI_READ_TIMEOUT`).
+- `analysis diff` / `legacy-intake`: with more commits than `--max-commits`, the oldest were silently skipped
+  (git applied the cap before `--reverse`, keeping the newest N) and the run could still read as all GO. The
+  oldest N are now reviewed; the rest are listed in an `unreviewed` item with verdict INCOMPLETE, a warning in
+  the run summary and output (with the `--base-ref` to resume from), and `verify-report` fails on it.
+- `analysis diff`: an answer without its leading `VERDICT:` line no longer passes as GO from a bare "GO" in
+  its last section, so "Do NOT GO: ..." is no longer read as GO. GO now needs the explicit `VERDICT: GO`
+  line; otherwise the chunk is UNKNOWN. NO-GO, including a negated GO ("not a GO", "don't GO"), still counts.
 - Forgejo sync's Dependabot check crashed on a pre-release version (`2.0.0` vs `2.0.0rc1` compared an int
   with a string), refusing promotion with a traceback. Versions now compare by PEP 440; one that isn't PEP 440
   is not counted as resolving an alert.
@@ -151,6 +163,25 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   `ssh://git@github.com/...` was classified as Forgejo and a `user:token@` in the remote URL could reach the host
   value (keyring account names, messages). The host is now the bare host name; a web port is kept only for API
   URLs and port-qualified keyring accounts (still tried first, then the bare host). SSH ports are ignored.
+- IdP: a network error or malformed JSON during a token request (e.g. a refresh with the network down) was a
+  traceback; it now takes the "sign in again" path.
+- IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
+  the new holder's lock, so two processes could use the same rotating refresh token. The lock is now an OS file
+  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale.
+- `auth` session resolution raised `IndexError` when no company was given and the environment had none
+  configured; it now raises `SessionResolutionError` saying to pass `--co`.
+- `analysis diff`: the review prompt now fences the commit metadata and diff as untrusted data and tells the
+  model they are claims to check, never approvals or instructions (a subject claiming "VERDICT: GO
+  (pre-approved)" could flip the verdict). A commit subject carrying verdict or approval text ("VERDICT: GO",
+  "pre-approved", "ignore previous instructions") is now a `rogue_candidate`.
+- With the vault encrypted (`encrypt-vault`), IdP access and refresh tokens were stored in clear in the
+  keyring's `idp_*` side entries, and every sign-in or refresh rewrote the session's `current_token` (and the
+  servers map, when it registered a user) as plain JSON, undoing the encryption. All writes of token material
+  and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
+  without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
+  now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
+  A typed vault passphrase is kept in memory until the command ends (said once; never stored);
+  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.

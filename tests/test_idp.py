@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import json
 import os
 import socket
@@ -16,8 +17,9 @@ import urllib.parse
 import urllib.request
 from unittest.mock import MagicMock, patch
 
-from kinetic_devops import idp
+from kinetic_devops import auth, crypto, idp
 from kinetic_devops.auth import KineticConfigManager, SessionResolutionError
+from tests.cli_matrix import native_checks_enabled
 
 CONFIG = {"IdentityProvider": {"Enabled": True, "Endpoint": "https://idp.example/tid/42/",
                                "ApiScope": "epicor_erp idp_access"}}
@@ -154,7 +156,7 @@ def _get(url, headers=None):
 
 
 class TestLoginBrowser(unittest.TestCase):
-    def _run(self, reply, timeout=10, claims=None):
+    def _run(self, reply, timeout=10, claims=None, **kw):
         """reply(params) -> list of (query dict, extra headers) the 'browser' sends to the loopback redirect, in order."""
         port = _free_port()
         self.statuses = []
@@ -175,7 +177,7 @@ class TestLoginBrowser(unittest.TestCase):
             "access_token": "AT", "refresh_token": "RT", "expires_in": 3600,
             "id_token": _id_token(**(claims(self.seen["nonce"]) if claims else _claims(self.seen["nonce"])))})
         with patch.object(idp, "requests", req):
-            tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=timeout, open_url=browser)
+            tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=timeout, open_url=browser, **kw)
         return tok, req, port
 
     def test_pkce_code_exchange(self):
@@ -191,6 +193,14 @@ class TestLoginBrowser(unittest.TestCase):
         status, headers = self.statuses[0]
         self.assertEqual(status, 200)
         self.assertEqual((headers.get("Cache-Control"), headers.get("Referrer-Policy")), ("no-store", "no-referrer"))
+
+    def test_force_login_asks_the_idp_for_a_new_sign_in(self):
+        self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})], force_login=True)
+        self.assertEqual(self.seen["prompt"], "login")
+
+    def test_default_reuses_the_browsers_idp_session(self):
+        self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})])
+        self.assertNotIn("prompt", self.seen)
 
     def test_wrong_state_is_ignored_and_the_real_callback_still_wins(self):
         tok, req, _ = self._run(lambda p: [({"code": "EVIL", "state": "forged"}, {}),
@@ -346,27 +356,77 @@ class TestRefreshSession(unittest.TestCase):
         self.assertIsNone(tok)
         self.assertEqual(self.stored, [])
 
-    def test_lock_waits_and_times_out_when_the_lock_cant_be_checked(self):
-        """Regression: an OSError while checking a held lock used to retry at once, forever (no sleep, no deadline)."""
-        path = os.path.join(idp.lock_dir(), "kinetic-idp-" + hashlib.sha256(self.slot.encode()).hexdigest()[:16] + ".lock")
-        open(path, "w").close()
+    def test_network_error_takes_the_sign_in_again_path(self):
+        """Review finding #9: a ConnectionError/Timeout during a refresh was a traceback, not "sign in again"."""
+        import requests
+        for exc in (requests.ConnectionError("network down"), requests.Timeout("slow")):
+            with patch("requests.post", side_effect=exc), patch.object(idp, "get_client_id", return_value="cid"):
+                tok = idp.refresh_session(self.meta, reread=lambda: dict(self.meta), store=self.stored.append,
+                                          slot=self.slot)
+            self.assertIsNone(tok)
+        self.assertEqual(self.stored, [])   # the refresh token is kept: the failure may be temporary
+
+    def test_malformed_json_is_an_idp_error(self):
+        bad = _resp({}, 200)
+        bad.json.side_effect = ValueError("Expecting value")
+        req = MagicMock()
+        req.post.return_value = bad
+        with patch.object(idp, "requests", req), self.assertRaises(idp.IdPError) as ctx:
+            idp.refresh(SETTINGS["token"], "cid", "RT")
+        self.assertIn("malformed JSON", str(ctx.exception))
+
+    def _lock_path(self):
+        return os.path.join(idp.lock_dir(), "kinetic-idp-" + hashlib.sha256(self.slot.encode()).hexdigest()[:16] + ".lock")
+
+    def _try(self, wait=0.5):
+        """Try the slot lock in a thread: 'locked' or the IdPError text; fails if it spins past its deadline."""
         outcome = []
 
         def worker():
             try:
-                with patch.object(idp.os.path, "getmtime", side_effect=OSError("gone")):
-                    with idp.slot_lock(self.slot, wait=0.5):
-                        outcome.append("locked")
+                with idp.slot_lock(self.slot, wait=wait):
+                    outcome.append("locked")
             except idp.IdPError as exc:
                 outcome.append(str(exc))
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(wait + 5)
+        self.assertFalse(t.is_alive(), "slot_lock spun past its deadline")
+        return outcome[0]
+
+    def test_lock_waits_and_times_out_when_the_lock_file_cant_be_opened(self):
+        """Regression: an OSError on a lock used to retry at once, forever (no sleep, no deadline)."""
+        with patch.object(idp.os, "open", side_effect=PermissionError("denied")):
+            self.assertIn("Timed out", self._try())
+
+    def test_slow_holder_is_never_taken_over(self):
+        """Review finding #10: a holder older than the stale limit was taken over, and its clean-up then deleted
+        the new holder's lock. An OS lock has no stale limit: an old lock file that is held stays held."""
+        with idp.slot_lock(self.slot):
+            os.utime(self._lock_path(), (0, 0))   # looks hours old
+            self.assertIn("Timed out", self._try())
+        self.assertEqual(self._try(), "locked")   # released when the holder is done
+
+    def test_leftover_lock_file_is_not_a_held_lock(self):
+        """A lock file left by a crashed process (or an older version) is taken at once: nothing holds it."""
+        open(self._lock_path(), "w").close()
+        self.assertEqual(self._try(wait=0), "locked")
+
+    def test_lock_of_a_process_that_died_is_released(self):
+        import subprocess
+        code = ("import sys, time; from kinetic_devops import idp\n"
+                "with idp.slot_lock(sys.argv[1]):\n"
+                "    print('held', flush=True); time.sleep(60)\n")
+        child = subprocess.Popen([sys.executable, "-c", code, self.slot], stdout=subprocess.PIPE, text=True)
         try:
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            t.join(5)
-            self.assertFalse(t.is_alive(), "slot_lock spun past its deadline")
-            self.assertIn("Timed out", outcome[0])
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            self.assertIn("Timed out", self._try())
+            child.kill()
+            child.wait(10)
+            self.assertEqual(self._try(wait=5), "locked")
         finally:
-            os.remove(path)
+            child.kill()
+            child.stdout.close()
 
     def test_lock_serialises_refreshes(self):
         inside, overlap = [], []
@@ -583,6 +643,60 @@ class TestIdpLoginPrompts(unittest.TestCase):
         self.assertEqual(self.stored["current_company"], "ACME")
         ask.assert_not_called()
 
+    # --- without --new-session nothing changes ---
+
+    def test_without_new_session_existing_sessions_and_kin_user_are_reused(self):
+        self.cfg["sessions"] = ["alice", "bob"]
+        with patch.dict(os.environ, {"KIN_USER": ""}):
+            token, ask, _ = self.run_login("pilot", answers=["2", "1"])   # session list: bob; company ACME
+        self.assertEqual((self.stored["user_id"], self.stored["current_company"]), ("bob", "ACME"))
+        self.assertIn("Select Session", ask.call_args_list[0].args[0])
+        self.assertIs(self.login.call_args.kwargs.get("force_login"), False)
+        with patch.dict(os.environ, {"KIN_USER": "Carol"}):
+            _, ask, _ = self.run_login("pilot", company_id="ACME")
+        self.assertEqual(self.stored["user_id"], "carol")
+        ask.assert_not_called()
+
+    # --- --new-session ---
+
+    def test_new_session_offers_no_sessions_ignores_kin_user_and_forces_the_idp_sign_in(self):
+        self.cfg["sessions"] = ["alice", "bob"]
+        with patch.dict(os.environ, {"KIN_USER": "Carol"}):
+            token, ask, _ = self.run_login("pilot", answers=["", "2"], new_session=True)
+        prompts = [c.args[0] for c in ask.call_args_list]
+        self.assertTrue(prompts[0].startswith("Enter Epicor User ID [jdoe]"), prompts)   # no session list first
+        self.assertFalse([p for p in prompts if "Session" in p])
+        self.assertEqual((token, self.stored["user_id"], self.stored["current_company"]), ("AT", "jdoe", "BETA"))
+        self.assertIs(self.login.call_args.kwargs["force_login"], True)
+
+    def test_new_session_still_uses_values_passed(self):
+        with patch.dict(os.environ, {"KIN_USER": "Carol"}):
+            token, ask, pick = self.run_login("pilot", "BSmith", "BETA", new_session=True)
+        self.assertEqual((self.stored["user_id"], self.stored["current_company"]), ("bsmith", "BETA"))
+        ask.assert_not_called()
+        pick.assert_not_called()
+
+    def test_new_session_asks_for_the_environment_when_not_given(self):
+        token, _, pick = self.run_login(user_id="jdoe", company_id="ACME", new_session=True)
+        pick.assert_called_once_with(passive=True)
+        self.assertEqual(token, "AT")
+
+    def test_new_session_without_terminal_stops_before_the_browser(self):
+        with self.assertRaises(SessionResolutionError) as ctx:
+            self.run_login("pilot", "jdoe", "ACME", tty=False, new_session=True)
+        self.assertIn("--new-session", str(ctx.exception))
+        self.assertIn("pass ENV, --user and --co", str(ctx.exception))
+        self.login.assert_not_called()
+
+    def test_cli_flag_reaches_idp_login(self):
+        from kinetic_devops import auth as auth_mod
+        for argv, expected in ((["idp-login", "pilot", "--new-session"], True), (["idp-login", "pilot"], False)):
+            with patch.object(sys, "argv", ["auth"] + argv), \
+                 patch.object(auth_mod.KineticConfigManager, "__init__", return_value=None), \
+                 patch.object(auth_mod.KineticConfigManager, "idp_login") as login:
+                auth_mod.main()
+            self.assertIs(login.call_args.kwargs["new_session"], expected)
+
 
 class TestSelectSessionForEnv(unittest.TestCase):
     """The shared session/company picker (password sign-in uses it too) after splitting out the company choice."""
@@ -607,6 +721,10 @@ class TestSelectSessionForEnv(unittest.TestCase):
     def test_existing_session_and_single_company_unchanged(self):
         got, _ = self.pick(["2"], cfg={"sessions": ["alice", "bob"], "companies": "ACME"})
         self.assertEqual(got, ("bob", "ACME"))
+
+    def test_offer_sessions_false_always_asks_for_a_user_id(self):
+        got, _ = self.pick(["carol"], cfg={"sessions": ["alice", "bob"], "companies": "ACME"}, offer_sessions=False)
+        self.assertEqual(got, ("carol", "ACME"))
 
     def test_preferred_company_skips_the_company_prompt(self):
         got, _ = self.pick(["1"], cfg={"sessions": ["alice"], "companies": "ACME,BETA"}, preferred_company="BETA")
@@ -668,6 +786,214 @@ class TestSlotStorage(unittest.TestCase):
         meta = {"AccessToken": "jwt", "user_id": "alice"}
         self.assertIs(idp.pack("slot", meta), meta)
         self.assertEqual(self.kr.store, {})
+
+
+def _fake_encrypt(obj, passphrase):
+    """Stand-in for crypto.encrypt_json (no native library): an {"_enc": true} blob that hides the plaintext."""
+    ct = base64.b64encode(json.dumps(obj).encode()).decode()[::-1]
+    return json.dumps({"_enc": True, "ver": 1, "salt": "", "iv": hashlib.sha256(passphrase.encode()).hexdigest(),
+                       "ct": ct})
+
+
+def _fake_decrypt(blob, passphrase):
+    wrapper = json.loads(blob)
+    if wrapper.get("iv") != hashlib.sha256(passphrase.encode()).hexdigest():
+        raise ValueError("InvalidTag")
+    return json.loads(base64.b64decode(wrapper["ct"][::-1]))
+
+
+class TestEncryptedVaultIdpTokens(unittest.TestCase):
+    """Review finding #8: with the vault encrypted, IdP tokens were written in clear (the idp_*#N side entries), and
+    touch_session rewrote "current_token" (and the servers map) as plain JSON, undoing encrypt-vault."""
+
+    SECRETS = ("AT-SECRET", "RT-SECRET", "API-KEY-SECRET")
+
+    def setUp(self):
+        self.kr = FakeKeyring()
+        self.servers = {"pilot": {"url": "https://pilot.example", "api_key": "API-KEY-SECRET", "companies": "ACME",
+                                  "sessions": ["alice"]}}
+        self.mgr = KineticConfigManager.__new__(KineticConfigManager)
+        self.slot = self.mgr._get_token_key("pilot", "alice", "API-KEY-SECRET")
+        self.meta = {"auth_method": "idp", "AccessToken": "AT-SECRET" + "a" * 2000, "refresh_token": "RT-SECRET",
+                     "expires_in": 3600, "_local_timestamp": time.time(), "user_id": "alice", "env_name": "pilot",
+                     "idp_tenant": "42", "idp_token_endpoint": SETTINGS["token"], "current_company": "ACME"}
+        self.patches = [patch.object(idp, "keyring", self.kr), patch.object(auth, "keyring", self.kr),
+                        patch.object(crypto, "encrypt_json", _fake_encrypt),
+                        patch.object(crypto, "decrypt_json", _fake_decrypt),
+                        patch.object(sys.stdout, "isatty", return_value=False),
+                        patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"})]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def leaked(self):
+        return sorted(n for (_, n), v in self.kr.store.items() if any(x in v for x in self.SECRETS))
+
+    def encrypted_vault(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+
+    def test_pack_with_the_vault_passphrase_stores_no_token_in_clear(self):
+        stub = idp.pack("slot", {"auth_method": "idp", "AccessToken": "AT-SECRET", "refresh_token": "RT-SECRET"},
+                        "pass-1")
+        self.assertEqual(self.leaked(), [])
+        back = idp.unpack("slot", dict(stub), "pass-1")
+        self.assertEqual((back["AccessToken"], back["refresh_token"]), ("AT-SECRET", "RT-SECRET"))
+        # without (or with a wrong) passphrase the tokens read as missing: sign in again, no traceback
+        self.assertEqual(idp.unpack("slot", dict(stub))["refresh_token"], "")
+        self.assertEqual(idp.unpack("slot", dict(stub), "wrong")["refresh_token"], "")
+
+    def test_sign_in_and_refresh_keep_an_encrypted_vault_encrypted(self):
+        self.encrypted_vault()
+        self.servers["pilot"]["sessions"] = []   # touch_session registers the user: the servers map is rewritten
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.assertEqual(self.leaked(), [])
+        self.assertTrue(crypto.is_encrypted_blob(self.kr.get_password(self.slot, "current_token")))
+        servers = _fake_decrypt(self.kr.get_password(auth.SERVICE_SERVERS, "config"), "pass-1")
+        self.assertEqual(servers["pilot"]["sessions"], ["alice"])
+        back = self.mgr._get_token_meta(self.slot)
+        self.assertEqual((back["AccessToken"], back["refresh_token"]), (self.meta["AccessToken"], "RT-SECRET"))
+        self.assertTrue(back["_is_valid"])
+        self.mgr.set_current_company("pilot", "alice", "BETA")   # the other write path
+        self.assertEqual(self.leaked(), [])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["current_company"], "BETA")
+
+    def test_unencrypted_vault_is_unchanged(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        stub = json.loads(self.kr.get_password(self.slot, "current_token"))
+        self.assertTrue(stub["_idp_split"])
+        self.assertEqual(idp._get_chunked(self.slot, "idp_refresh_token"), "RT-SECRET")
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+
+    def test_no_passphrase_refuses_to_write_in_clear(self):
+        self.encrypted_vault()
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.assertIn("KINETIC_VAULT_PASSPHRASE", str(ctx.exception))
+        self.assertEqual(self.leaked(), [])
+
+    def test_wrong_passphrase_refuses_to_write(self):
+        self.encrypted_vault()
+        os.environ["KINETIC_VAULT_PASSPHRASE"] = "typo"
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.assertIn("doesn't open the vault", str(ctx.exception))
+        self.assertIsNone(self.kr.get_password(self.slot, "current_token"))
+
+    def test_encrypt_vault_encrypts_idp_side_entries_and_decrypt_vault_restores_them(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")   # plain vault: tokens in clear
+        self.assertTrue(self.leaked())
+        with patch("builtins.print"):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertEqual(self.leaked(), [])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+        with patch("builtins.print"):
+            self.mgr.decrypt_vault("pass-1")
+        self.assertFalse(crypto.is_encrypted_blob(self.kr.get_password(self.slot, "current_token")))
+        self.assertEqual(idp._get_chunked(self.slot, "idp_refresh_token"), "RT-SECRET")
+
+    def test_encrypt_vault_repairs_a_slot_left_half_clear_by_older_versions(self):
+        """Older encrypt-vault encrypted the stub but left the side entries in clear; running it again fixes that."""
+        self.encrypted_vault()
+        stub = idp.pack(self.slot, dict(self.meta))   # side entries in clear
+        self.kr.set_password(self.slot, "current_token", _fake_encrypt(stub, "pass-1"))
+        self.assertIn("idp_refresh_token#0", self.leaked())
+        with patch("builtins.print"):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertEqual(self.leaked(), [])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+
+
+class TestVaultPromptMode(unittest.TestCase):
+    """A typed vault passphrase is kept until the command ends (--vault-prompt once, the default, said once on stderr)
+    or asked for each time (--vault-prompt every / KINETIC_VAULT_PROMPT=every)."""
+
+    def setUp(self):
+        self.kr = FakeKeyring()
+        servers = {"pilot": {"url": "https://pilot.example", "api_key": "K", "companies": "ACME", "sessions": []}}
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(servers, "pass-1"))
+        self.mgr = KineticConfigManager.__new__(KineticConfigManager)
+        env = {k: v for k, v in os.environ.items() if k not in ("KINETIC_VAULT_PASSPHRASE", "KINETIC_VAULT_PROMPT")}
+        self.patches = [patch.object(idp, "keyring", self.kr), patch.object(auth, "keyring", self.kr),
+                        patch.object(crypto, "encrypt_json", _fake_encrypt),
+                        patch.object(crypto, "decrypt_json", _fake_decrypt),
+                        patch.object(sys.stdout, "isatty", return_value=True),
+                        patch.dict(os.environ, env, clear=True)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def read_twice(self):
+        err = io.StringIO()
+        with patch("kinetic_devops.auth.getpass.getpass", return_value="pass-1") as ask, \
+             patch.object(sys, "stderr", err):
+            self.mgr._get_server_dict()
+            self.mgr._save_server_dict(self.mgr._get_server_dict())
+        return ask.call_count, err.getvalue()
+
+    def test_once_is_the_default_asks_once_and_says_so(self):
+        asked, err = self.read_twice()
+        self.assertEqual(asked, 1)
+        self.assertEqual(err.count("kept in memory until this command ends"), 1)
+        self.assertIn("--vault-prompt every", err)
+
+    def test_every_asks_each_time_and_keeps_nothing(self):
+        self.mgr.vault_prompt = "every"
+        asked, err = self.read_twice()
+        self.assertEqual(asked, 3)                      # two reads and the write's check
+        self.assertIsNone(getattr(self.mgr, "_vault_pass", None))
+        self.assertNotIn("kept in memory", err)
+
+    def test_every_from_the_environment(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PROMPT": "EVERY"}):
+            asked, _ = self.read_twice()
+        self.assertEqual(asked, 3)
+
+    def test_option_beats_the_environment(self):
+        self.mgr.vault_prompt = "once"
+        with patch.dict(os.environ, {"KINETIC_VAULT_PROMPT": "every"}):
+            asked, _ = self.read_twice()
+        self.assertEqual(asked, 1)
+
+    def test_passphrase_from_the_environment_is_not_announced(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            asked, err = self.read_twice()
+        self.assertEqual((asked, err), (0, ""))
+
+    def test_bad_mode_is_an_error(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PROMPT": "sometimes"}), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="pass-1"), \
+             self.assertRaisesRegex(RuntimeError, "once or every"):
+            self.mgr._get_server_dict()
+
+
+@unittest.skipUnless(native_checks_enabled(), "native check deferred (loads cryptography's native library)")
+class TestEncryptedVaultIdpTokensNative(unittest.TestCase):
+    def test_real_encryption_round_trip_fits_the_keyring_limit(self):
+        kr = FakeKeyring()
+        meta = {"auth_method": "idp", "AccessToken": "AT-SECRET" + "a" * 3000, "refresh_token": "RT-SECRET",
+                "idp_token_endpoint": SETTINGS["token"], "idp_tenant": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "user_id": "firstname.lastname", "env_name": "MyProductionEnvironment",
+                "idp_username": "firstname.lastname@corp.example", "idp_subject": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+        try:
+            with patch.object(idp, "keyring", kr):
+                stub = idp.pack("slot", meta, "pass-1")
+                kr.set_password("slot", "current_token", crypto.encrypt_json(stub, "pass-1"))  # FakeKeyring: <= 1280
+                back = idp.unpack("slot", crypto.decrypt_json(kr.get_password("slot", "current_token"), "pass-1"),
+                                  "pass-1")
+        except RuntimeError as exc:   # cryptography not installed, or not loadable
+            self.skipTest(f"vault encryption unavailable: {exc}")
+        self.assertEqual((back["AccessToken"], back["refresh_token"]), (meta["AccessToken"], "RT-SECRET"))
+        self.assertFalse([k for k, v in kr.store.items() if "RT-SECRET" in v or "AT-SECRET" in v])
 
 
 class TestScannerLearnsIdpIdentifiers(unittest.TestCase):
