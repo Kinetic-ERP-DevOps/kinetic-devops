@@ -263,7 +263,8 @@ def resolve_token(
         for account in accounts:
             candidate = str(keyring.get_password(service, account) or "").strip()
             if candidate:
-                if account == legacy and host_value and account != explicit_account:
+                if account == legacy and host_value and account != explicit_account and not (
+                        legacy == "github" and host_value == "github.com"):   # github.com: the account's own host
                     # The provider-wide legacy account isn't tied to a server: say which token is used for this
                     # host, so a token meant for another server doesn't go there unnoticed.
                     print(f"WARNING: no token stored for {scoped_account(host_value, owner_value) or host_value}; "

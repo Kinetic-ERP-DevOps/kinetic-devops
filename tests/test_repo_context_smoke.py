@@ -230,6 +230,12 @@ class TestRemoteHostIdentity(unittest.TestCase):
         with patch("sys.stderr", err):
             self._resolve("forgejo.example.com:3000", {"forgejo.example.com:3000": "own-token"})
         self.assertEqual(err.getvalue(), "")                      # a server's own token: nothing to say
+        err = io.StringIO()
+        with patch("keyring.get_password", side_effect=lambda svc, acct: {"github": "gh"}.get(acct)), \
+             patch("sys.stderr", err):
+            repo_context.resolve_token(env_name="KINETIC_TEST_UNSET_TOKEN_ENV", token_service="svc",
+                                       token_account="", host="github.com", owner="acme", legacy_account="github")
+        self.assertEqual(err.getvalue(), "")                      # github.com is the github account's own host
 
     def test_parse_errors_carry_no_chained_password_fragment(self):
         # urlparse's own message quotes the bad "port", i.e. part of a password containing "/".
