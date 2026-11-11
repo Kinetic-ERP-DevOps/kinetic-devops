@@ -542,15 +542,32 @@ def build_snapshot_item(repo: Path, max_chars: int = DEFAULT_MAX_DIFF_CHARS) -> 
     }
 
 
+def unreviewed_commits_item(rev_range: str, total: int, reviewed: list[str], skipped: list[str],
+                            max_commits: int) -> dict[str, Any]:
+    """Run-report item for commits past --max-commits: never sent to the model, verdict INCOMPLETE,
+    so a capped run can never read as all-GO."""
+    resume = f" or rerun with --base-ref {reviewed[-1]}" if reviewed else ""
+    warning = (f"{len(skipped)} of {total} commits in {rev_range} were NOT reviewed (--max-commits {max_commits}); "
+               f"the oldest {len(reviewed)} were. Raise --max-commits{resume} to review the rest.")
+    return {"id": "unreviewed-commits", "type": "unreviewed", "truncated": True, "verdict": "INCOMPLETE",
+            "commit_count": total, "reviewed_count": len(reviewed), "skipped_commits": skipped,
+            "warning": warning}
+
+
 def build_commit_items(
     repo: Path, base_ref: str, max_commits: int, max_chars: int = DEFAULT_MAX_DIFF_CHARS
 ) -> list[dict[str, Any]]:
+    """One item per commit in base_ref..HEAD, oldest first, up to max_commits. Commits past the cap
+    are listed in a final "unreviewed" item (verdict INCOMPLETE) instead of being dropped silently."""
     rev_range = f"{base_ref}..HEAD"
-    revs = run_git(repo, ["rev-list", "--reverse", f"--max-count={max_commits}", rev_range], timeout=30)
+    # Not --max-count: git limits before --reverse, which kept the newest N and hid the oldest.
+    revs = run_git(repo, ["rev-list", "--reverse", rev_range], timeout=30)
     if revs.code != 0:
         return []
 
-    commits = [line.strip() for line in revs.out.splitlines() if line.strip()]
+    all_commits = [line.strip() for line in revs.out.splitlines() if line.strip()]
+    commits = all_commits[:max(max_commits, 0)]
+    skipped = all_commits[len(commits):]
     items: list[dict[str, Any]] = []
     for sha in commits:
         meta = run_git(
@@ -586,6 +603,8 @@ def build_commit_items(
                 "chunks": chunks,
             }
         )
+    if skipped:
+        items.append(unreviewed_commits_item(rev_range, len(all_commits), commits, skipped, max_commits))
     return items
 
 
@@ -675,6 +694,10 @@ def render_master_summary(run_report: dict[str, Any]) -> str:
     lines.append(f"- Base Ref: {run_report['base_ref']}")
     lines.append(f"- Model: {run_report['model']}")
     lines.append(f"- Items Reviewed: {len(run_report['items'])}")
+    if run_report.get("warnings"):
+        lines.append("")
+        lines.append("## Warnings")
+        lines += [f"- INCOMPLETE: {w}" for w in run_report["warnings"]]
     lines.append("")
     lines.append("## Items")
     for item in run_report["items"]:
@@ -1044,7 +1067,16 @@ def _run_diff_review(args: argparse.Namespace) -> int:
                                     max_chars=budget["max_diff_chars"]))
 
     reviewed_items: list[dict[str, Any]] = []
+    warnings: list[str] = []
     for idx, item in enumerate(items, start=1):
+        if item.get("type") == "unreviewed":
+            # Commits past --max-commits: nothing to ask the model; the item itself is the INCOMPLETE mark.
+            md_path = out_dir / f"{idx:03d}_{item['type']}_{item['id']}.md"
+            md_path.write_text("# Not reviewed\n\n- Verdict: **INCOMPLETE**\n- " + item["warning"] + "\n"
+                               + "".join(f"- {sha}\n" for sha in item["skipped_commits"]), encoding="utf-8")
+            reviewed_items.append({**item, "output_md": str(md_path)})
+            warnings.append(item["warning"])
+            continue
         chunks = item.get("chunks") or [item.get("payload", "")]
         reviewed_chunks = chunks[: budget["max_chunks"]]
         unreviewed = len(chunks) - len(reviewed_chunks)
@@ -1090,6 +1122,9 @@ def _run_diff_review(args: argparse.Namespace) -> int:
         "model": model,
         "items": reviewed_items,
     }
+    if warnings:
+        run_report["incomplete"] = True
+        run_report["warnings"] = warnings
 
     master_json = out_dir / "run_report.json"
     master_md = out_dir / "run_summary.md"
@@ -1099,6 +1134,8 @@ def _run_diff_review(args: argparse.Namespace) -> int:
     print(f"BASE_REF={base_ref}")
     print(f"MODEL={model}")
     print(f"ITEM_COUNT={len(reviewed_items)}")
+    for warning in warnings:
+        print(f"WARNING={warning}")
     print(f"RUN_REPORT_JSON={master_json}")
     print(f"RUN_SUMMARY_MD={master_md}")
     return 0
@@ -1450,6 +1487,11 @@ def _run_verify_report(args: argparse.Namespace) -> int:
             result = _verify_commit_item(repo, item)
         elif item_type == "snapshot":
             result = _verify_snapshot_item(item)
+        elif item_type == "unreviewed":
+            # A capped run is honest about it, but it is not a verified review of the whole range.
+            result = {"id": item.get("id"), "type": item_type, "ok": False,
+                      "errors": [f"run is INCOMPLETE: {len(item.get('skipped_commits') or [])} commit(s) "
+                                 "were not reviewed (--max-commits cap)"], "warnings": []}
         else:
             result = {
                 "id": item.get("id"),
@@ -1541,7 +1583,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     diff.add_argument(
         "--max-commits", metavar="N", type=int, default=int(_env("KINETIC_ANALYSIS_MAX_COMMITS", "20")),
-        help="Maximum number of commits to review (default: KINETIC_ANALYSIS_MAX_COMMITS or 20)",
+        help="Maximum number of commits to review, oldest first; any beyond make the run INCOMPLETE "
+             "(default: KINETIC_ANALYSIS_MAX_COMMITS or 20)",
     )
     diff.add_argument("--ai-base-url", metavar="URL", default="", help=ai_url_help)
     diff.add_argument("--ai-profile", metavar="NAME", default="", help=ai_profile_help)
@@ -1639,7 +1682,8 @@ def _build_parser() -> argparse.ArgumentParser:
     legacy.add_argument("--base-ref", metavar="REF", default="", help="Base ref per repo (default: upstream, else HEAD~1)")
     legacy.add_argument(
         "--max-commits", metavar="N", type=int, default=int(_env("KINETIC_ANALYSIS_MAX_COMMITS", "10")),
-        help="Maximum commits per repo (default: KINETIC_ANALYSIS_MAX_COMMITS or 10)",
+        help="Maximum commits per repo, oldest first; any beyond make the run INCOMPLETE "
+             "(default: KINETIC_ANALYSIS_MAX_COMMITS or 10)",
     )
     legacy.add_argument("--ai-base-url", metavar="URL", default="", help=ai_url_help)
     legacy.add_argument("--ai-profile", metavar="NAME", default="", help=ai_profile_help)
