@@ -132,6 +132,11 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
 
+### Security
+- ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
+  into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
+  copied out of the workspace before it runs.
+
 
 ## [0.2.0.0a8] - 2026-11-01
 
