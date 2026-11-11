@@ -10,7 +10,7 @@ sync/dry-run/<name> runs every step except the push and the PR. The same runs fr
      GitHub issues; mentions of a *draft* security advisory (undisclosed fix -> use its private fork);
      open secret-scanning alerts; dependency vulnerabilities introduced (pip-audit on uv.lock, main vs
      branch); open Dependabot alerts the branch resolves
-  3. the repo's tests (SYNC_TEST_CMD)
+  3. the repo's tests (SYNC_TEST_CMD), with an allowlisted environment: no GH_TOKEN
   4. push the result to GitHub branch sync/<name> (never main) and open or update the PR to main
 Env: GH_REPO (owner/name), GH_TOKEN (fine-grained, this repo: Contents/Pull requests RW; Issues, statuses,
 checks, Dependabot alerts, secret-scanning alerts, security advisories R; no Workflows), TAG, SYNC_TEST_CMD,
@@ -42,24 +42,82 @@ def sh(*cmd, check=True, env=None, input=None):
     return r.stdout
 
 
-def gh(path, method="GET", body=None, ok404=False):
-    req = urllib.request.Request(API + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+class GitHubError(SystemExit):  # uncaught, it stops the run like any other SystemExit
+    pass
+
+
+def gh(path, method="GET", body=None, ok404=False, ok403=False, links=None):
+    """ok404/ok403: that status means "nothing there" (None). A 403 is only tolerable where the answer is
+    informational: a guard that can't see (token without the permission) must refuse, not pass (review F3).
+    links: a dict to receive the response's Link header relations (pagination)."""
+    url = path if path.startswith(API + "/") else API + path
+    where = f"GitHub {method} {url[len(API):].split('?')[0]}"
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
                                           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "forgejo-sync"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
+            if links is not None:
+                links.update({rel: u for u, rel in re.findall(r'<([^>]+)>;\s*rel="(\w+)"', r.headers.get("Link") or "")})
             data = r.read(); return json.loads(data) if data else {}
     except urllib.error.HTTPError as e:
         if ok404 and e.code == 404:
             return None
-        if e.code == 403:  # missing permission or feature disabled: say which, don't crash
-            notes.append(f"GitHub {path.split('?')[0]}: HTTP 403 (token permission or feature not enabled)"); return None
-        raise SystemExit(f"GitHub {method} {path}: HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
+        if ok403 and e.code == 403:  # missing permission or feature disabled: say which, don't crash
+            notes.append(f"{where}: HTTP 403 (token permission or feature not enabled)"); return None
+        detail = e.read().decode(errors="replace")[:300] if e.fp else e.reason
+        raise GitHubError(f"{where}: HTTP {e.code} {detail}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise GitHubError(f"{where}: {e}")
+
+
+def gh_all(path, ok404=False, ok403=False, max_pages=50):
+    """Every item of a list endpoint, 100 per page, following the Link header (page- and cursor-paginated
+    endpoints alike). None if the first page is a tolerated 404/403."""
+    items, url = [], path + ("&" if "?" in path else "?") + "per_page=100"
+    for _ in range(max_pages):
+        links = {}
+        batch = gh(url, ok404=ok404, ok403=ok403, links=links)
+        if batch is None:
+            return items or None
+        if not isinstance(batch, list):
+            raise GitHubError(f"GitHub GET {path.split('?')[0]}: expected a list, got {type(batch).__name__}")
+        items += batch
+        url = links.get("next")
+        if not url:
+            return items
+        if not url.startswith(API + "/"):   # the token goes only to the API
+            raise GitHubError(f"GitHub GET {path.split('?')[0]}: next page outside {API}: {url}")
+    raise GitHubError(f"GitHub GET {path.split('?')[0]}: more than {max_pages} pages")
+
+
+def guard_list(path, what, ok404=False):
+    """A list a guard depends on. Any failure to read it (403, network, too many pages) refuses promotion."""
+    try:
+        return gh_all(path, ok404=ok404)
+    except GitHubError as e:
+        problems.append(f"can't check {what}, so promotion is refused: {e} "
+                        "(check GH_PUSH_TOKEN's permissions, see sync.yml)")
+        return []
 
 
 def git_auth():  # token only in a per-command header, never in a URL or the config file
     return ["-c", "http.https://github.com/.extraheader=AUTHORIZATION: basic " +
             __import__("base64").b64encode(f"x-access-token:{TOKEN}".encode()).decode()]
+
+
+# What the branch's tests may see. They run the promoted branch's code, conftest and dependencies, so they get an
+# allowlist: never GH_TOKEN or the runner's tokens. Names that look secret are dropped even if listed.
+TEST_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR", "CI",
+            "PYTHONUNBUFFERED", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+            "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+TEST_ENV_PREFIXES = ("LC_", "UV_", "XDG_")
+
+
+def test_env(environ):
+    secret = re.compile(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|AUTH", re.I)
+    return {k: v for k, v in environ.items()
+            if (k in TEST_ENV or k.startswith(TEST_ENV_PREFIXES)) and not secret.search(k)}
 
 
 def locked_versions(lock_text):
@@ -70,8 +128,48 @@ def locked_versions(lock_text):
         return {}
 
 
-def vkey(v):  # good enough for "is version >= patched" on PyPI versions
-    return [int(x) if x.isdigit() else x for x in re.split(r"[.+-]", v)]
+def vkey(v):
+    """PEP 440 sort key (epoch, release, pre, post, dev, local), like packaging.version.Version, which this
+    script can't import (uv run --no-project: no dependencies). Raises ValueError on a non-PEP 440 version."""
+    m = re.fullmatch(r"v?(?:(\d+)!)?(\d+(?:\.\d+)*)"
+                     r"(?:[._-]?(a|alpha|b|beta|c|rc|pre|preview)[._-]?(\d*))?"
+                     r"(?:-(\d+)|[._-]?(post|rev|r)[._-]?(\d*))?"
+                     r"(?:[._-]?(dev)[._-]?(\d*))?"
+                     r"(?:\+([a-z0-9]+(?:[._-][a-z0-9]+)*))?", v.strip().lower())
+    if not m:
+        raise ValueError(f"not a PEP 440 version: {v!r}")
+    epoch, rel, pre_l, pre_n, post_implicit, post_l, post_n, dev_l, dev_n, local = m.groups()
+    release = [int(x) for x in rel.split(".")]
+    while len(release) > 1 and release[-1] == 0:   # 1.0 == 1.0.0
+        release.pop()
+    if pre_l:
+        pre = (0, {"a": 0, "alpha": 0, "b": 1, "beta": 1}.get(pre_l, 2), int(pre_n or 0))
+    elif dev_l and not (post_l or post_implicit):
+        pre = (-1, 0, 0)   # 1.0.dev1 < 1.0a1
+    else:
+        pre = (1, 0, 0)    # a final release sorts after its pre-releases
+    post = (0, int(post_implicit or post_n or 0)) if (post_l or post_implicit) else (-1, 0)
+    dev = (0, int(dev_n or 0)) if dev_l else (1, 0)
+    local_key = tuple((1, int(p), "") if p.isdigit() else (0, 0, p) for p in re.split(r"[._-]", local)) if local else ()
+    return (int(epoch or 0), tuple(release), pre, post, dev, local_key)
+
+
+def at_least(have, patched):
+    """have >= patched; False when either isn't a PEP 440 version (then the alert isn't claimed as resolved)."""
+    try:
+        return vkey(have) >= vkey(patched)
+    except ValueError:
+        return False
+
+
+def outgoing(upstream="github/main"):
+    """(commits, PR title) for what goes up: HEAD's commits not on upstream, taken after any rebase.
+
+    No merge commits (a rebase drops them). The title is the branch's own first commit: follow first parents so a
+    merged-in branch's commits don't supply it."""
+    commits = sh("git", "rev-list", "--reverse", "--no-merges", f"{upstream}..HEAD").split()
+    own = sh("git", "rev-list", "--reverse", "--first-parent", "--no-merges", f"{upstream}..HEAD").split() or commits
+    return commits, (sh("git", "log", "-1", "--format=%s", own[0]).strip() if own else "")
 
 
 def audit(lock_text):
@@ -163,6 +261,11 @@ if rebased:
                          (", ".join(conflicts) if conflicts else r.stderr.strip()[-400:]))
 else:
     print(f"no rebase needed: branch is already on GitHub main {main_sha[:7]}")
+# Count and name what actually goes up, after any rebase: a rebase drops merge commits and commits already on
+# main, so the count from before it can be too high (2026-11-11: #68 and #69 got #66's title from HEAD~N).
+commits, title = outgoing()
+if not commits:
+    raise SystemExit("nothing to sync: every commit on the branch is already on GitHub main")
 changed = sh("git", "diff", "--name-only", "github/main..HEAD").split()
 log = sh("git", "log", "--format=%H%n%B%n---", "github/main..HEAD")
 print(f"{len(commits)} commit(s), {len(changed)} file(s) changed{' after rebase' if rebased else ''}")
@@ -202,7 +305,10 @@ if wf:
 refs = sorted({int(n) for n in re.findall(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", log)})
 closes = []
 for n in refs:
-    i = gh(f"/repos/{REPO}/issues/{n}", ok404=True)
+    try:
+        i = gh(f"/repos/{REPO}/issues/{n}", ok404=True)
+    except GitHubError as e:
+        problems.append(f"can't check #{n}, so promotion is refused: {e}"); continue
     if not i or "pull_request" in i:
         problems.append(f"#{n} is referenced as closed but isn't a GitHub issue")
     elif i.get("state") != "open":
@@ -211,13 +317,17 @@ for n in refs:
         closes.append(f"Closes #{n} ({i['title']})")
 
 text = (log + "\n" + sh("git", "diff", "github/main..HEAD")).lower()
-for adv in gh(f"/repos/{REPO}/security-advisories?state=draft&per_page=100") or []:
+# Guards: a list that can't be read (403: token without the permission) refuses promotion; it never passes as
+# empty (review 2026-11-09 F3). Published advisories and Dependabot alerts only add lines to the PR body.
+for adv in guard_list(f"/repos/{REPO}/security-advisories?state=draft", "draft security advisories"):
     if adv["ghsa_id"].lower() in text or (adv.get("summary") and adv["summary"].lower() in text):
         problems.append(f"mentions draft advisory {adv['ghsa_id']}: undisclosed fixes go through its private fork, not a public PR")
-fixes_ghsa = [f"Fixes {a['ghsa_id']} ({a.get('summary','')})" for a in gh(f"/repos/{REPO}/security-advisories?state=published&per_page=100") or []
+fixes_ghsa = [f"Fixes {a['ghsa_id']} ({a.get('summary','')})"
+              for a in gh_all(f"/repos/{REPO}/security-advisories?state=published", ok403=True) or []
               if a["ghsa_id"].lower() in text]
 
-secrets = gh(f"/repos/{REPO}/secret-scanning/alerts?state=open&per_page=100", ok404=True)
+# 404 = secret scanning not enabled (nothing to check); 403 = can't see the alerts (refused)
+secrets = guard_list(f"/repos/{REPO}/secret-scanning/alerts?state=open", "secret-scanning alerts", ok404=True)
 if secrets is None:
     notes.append("secret scanning isn't enabled on the GitHub repo (no alerts to check)")
 elif secrets:
@@ -234,22 +344,22 @@ if lock_branch:
         problems.append("introduces vulnerable dependencies: " + ", ".join(f"{k} ({v})" for k, v in introduced.items()))
     vuln_lines += [f"Fixes {k} ({v})" for k, v in fixed.items()]
     vers = locked_versions(lock_branch)
-    dependabot = gh(f"/repos/{REPO}/dependabot/alerts?state=open&per_page=100", ok404=True)
+    dependabot = gh_all(f"/repos/{REPO}/dependabot/alerts?state=open", ok404=True, ok403=True)
     if dependabot is None:
         notes.append("Dependabot alerts aren't enabled on the GitHub repo (none to match)")
     for a in dependabot or []:
         pkg = a["dependency"]["package"]["name"].lower(); patched = (a.get("security_vulnerability") or {}).get("first_patched_version") or {}
         have = vers.get(pkg)
-        if have and patched.get("identifier") and vkey(have) >= vkey(patched["identifier"]):
+        if have and patched.get("identifier") and at_least(have, patched["identifier"]):
             vuln_lines.append(f"Resolves Dependabot alert #{a['number']} ({pkg} {have} >= {patched['identifier']})")
         local = {v.split()[0].lower() for v in after.values()}
-        if pkg not in local and not (have and patched.get("identifier") and vkey(have) >= vkey(patched["identifier"])):
+        if pkg not in local and not (have and patched.get("identifier") and at_least(have, patched["identifier"])):
             notes.append(f"Dependabot alert #{a['number']} ({pkg}) not seen by pip-audit")
 
 # 3. tests
 cmd = E.get("SYNC_TEST_CMD") or "uv sync --locked && uv run python -m pytest -q -p no:cacheprovider"
 print(f"tests: {cmd}")
-t = subprocess.run(["bash", "-c", cmd])
+t = subprocess.run(["bash", "-c", cmd], env=test_env(E))   # without GH_TOKEN or other secrets: see test_env
 if t.returncode:
     problems.append(f"tests failed ({cmd})")
 
@@ -261,7 +371,6 @@ summary = [f"Promoted from the maintainer's fork by `{TAG}` ({len(commits)} comm
            ""] + closes + fixes_ghsa + vuln_lines
 if notes:
     summary += ["", "Notes:"] + [f"- {n}" for n in notes]
-title = sh("git", "log", "-1", "--format=%s", "HEAD~%d" % (len(commits) - 1)).strip()   # first commit's subject
 body = "\n".join(summary) + "\n"
 for where, text in (("PR title", title), ("PR body", body)):
     if leaks(text):
