@@ -139,6 +139,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   value (keyring account names, messages). The host is now the bare host name; a web port is kept only for API
   URLs and port-qualified keyring accounts (still tried first, then the bare host). SSH ports are ignored.
 
+### Security
+- GitHub workflows pin every action to a full commit SHA (the version in a comment) instead of a movable tag
+  or branch: the PyPI publish job holds `id-token: write`, so a moved or compromised upstream ref could have
+  published as kinetic-devops. Dependabot now updates the pins (`github-actions` ecosystem).
 
 ## [0.2.0.0a8] - 2026-11-01
 
