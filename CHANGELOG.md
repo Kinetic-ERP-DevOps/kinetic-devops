@@ -183,7 +183,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
   A typed vault passphrase is kept in memory until the command ends (said once; never stored);
-  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
+  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead. An IdP refresh asks for
+  (and checks) the passphrase before it spends the refresh token, and not again during that refresh, so a
+  mistyped passphrase can't lose a rotated refresh token; it takes the sign-in-again path.
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.

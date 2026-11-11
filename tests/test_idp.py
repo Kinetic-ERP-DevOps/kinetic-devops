@@ -835,9 +835,8 @@ def _fake_decrypt(blob, passphrase):
     return json.loads(base64.b64decode(wrapper["ct"][::-1]))
 
 
-class TestEncryptedVaultIdpTokens(unittest.TestCase):
-    """Review finding #8: with the vault encrypted, IdP tokens were written in clear (the idp_*#N side entries), and
-    touch_session rewrote "current_token" (and the servers map) as plain JSON, undoing encrypt-vault."""
+class VaultFixture(unittest.TestCase):
+    """FakeKeyring, stand-in encryption, KINETIC_VAULT_PASSPHRASE=pass-1, and one IdP session (self.meta)."""
 
     SECRETS = ("AT-SECRET", "RT-SECRET", "API-KEY-SECRET")
 
@@ -867,6 +866,11 @@ class TestEncryptedVaultIdpTokens(unittest.TestCase):
 
     def encrypted_vault(self):
         self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+
+
+class TestEncryptedVaultIdpTokens(VaultFixture):
+    """Review finding #8: with the vault encrypted, IdP tokens were written in clear (the idp_*#N side entries), and
+    touch_session rewrote "current_token" (and the servers map) as plain JSON, undoing encrypt-vault."""
 
     def test_pack_with_the_vault_passphrase_stores_no_token_in_clear(self):
         stub = idp.pack("slot", {"auth_method": "idp", "AccessToken": "AT-SECRET", "refresh_token": "RT-SECRET"},
@@ -941,6 +945,67 @@ class TestEncryptedVaultIdpTokens(unittest.TestCase):
             self.mgr.encrypt_vault("pass-1")
         self.assertEqual(self.leaked(), [])
         self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+
+
+class TestIdpRefreshAsksForThePassphraseFirst(VaultFixture):
+    """Review finding: with --vault-prompt every, a refresh asked for the passphrase only to store the new tokens,
+    after the refresh token was spent and while the lock was held; a typo lost the rotated refresh token and was a
+    traceback instead of the sign-in-again path."""
+
+    def setUp(self):
+        super().setUp()
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta, _local_timestamp=time.time() - 7200), "pilot")
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        self.mgr._vault_pass = None   # a new run
+        self.mgr.vault_prompt = "every"
+        self.req = MagicMock()
+        self.req.post.return_value = _resp({"access_token": "AT-NEW", "refresh_token": "RT-NEW", "expires_in": 3600})
+        for p in (patch.object(sys.stdout, "isatty", return_value=True), patch.object(idp, "requests", self.req),
+                  patch.object(idp, "get_client_id", return_value="cid")):
+            p.start()
+            self.patches.append(p)
+
+    def stored(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            return self.mgr._get_token_meta(self.slot)
+
+    def refresh(self, *typed):
+        err = io.StringIO()
+        with patch("kinetic_devops.auth.getpass.getpass", side_effect=list(typed)) as ask, \
+             patch.object(sys, "stderr", err):
+            token = self.mgr._refresh_idp(self.slot, dict(self.meta, _is_valid=False), "pilot")
+        return token, ask.call_count, err.getvalue()
+
+    def test_right_passphrase_is_asked_once_before_the_refresh(self):
+        token, asked, _ = self.refresh("pass-1")
+        self.assertEqual(token, "AT-NEW")
+        self.assertEqual(asked, 1)   # not again to re-read, to store the tokens or to register the session
+        self.req.post.assert_called_once()
+        self.assertEqual((self.stored()["AccessToken"], self.stored()["refresh_token"]), ("AT-NEW", "RT-NEW"))
+        self.assertEqual(self.leaked(), [])
+        self.assertIsNone(getattr(self.mgr, "_pinned_vault_pass", None))   # nothing kept after the refresh
+
+    def test_typo_spends_nothing_and_takes_the_sign_in_again_path(self):
+        token, asked, err = self.refresh("typo")
+        self.assertIsNone(token)
+        self.assertEqual(asked, 1)
+        self.req.post.assert_not_called()   # the refresh token was not spent
+        self.assertIn("doesn't open the vault", err)
+        self.assertEqual(self.stored()["refresh_token"], "RT-SECRET")
+        # without a terminal on stdin: the friendly "run idp-login" error, not the vault error's traceback
+        with patch("kinetic_devops.auth.getpass.getpass", return_value="typo"), patch.object(sys, "stderr", io.StringIO()), \
+             patch.object(sys.stdin, "isatty", return_value=False), self.assertRaises(RuntimeError) as ctx:
+            self.mgr._renew_idp_or_raise(self.slot, dict(self.meta, _is_valid=False), "pilot", "alice", "ACME")
+        self.assertNotIsInstance(ctx.exception, auth.VaultError)
+        self.assertIn("idp-login pilot", str(ctx.exception))
+        self.req.post.assert_not_called()
+
+    def test_no_passphrase_at_all_spends_nothing(self):
+        token, _, err = self.refresh(EOFError())
+        self.assertIsNone(token)
+        self.req.post.assert_not_called()
+        self.assertIn("KINETIC_VAULT_PASSPHRASE", err)
 
 
 class TestVaultPromptMode(unittest.TestCase):

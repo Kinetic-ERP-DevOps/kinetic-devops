@@ -136,4 +136,7 @@ terminal: without one it stops before the browser opens; pass ENV, `--user` and 
 - With the vault encrypted, a typed vault passphrase is kept in memory until the command ends (never stored), and
   the tool says so once. To be asked every time it is needed instead: `auth --vault-prompt every <command>` or
   `KINETIC_VAULT_PROMPT=every`. `KINETIC_VAULT_PASSPHRASE`, when set, is used either way.
+- A refresh asks for the vault passphrase (when it isn't at hand) and checks it before it sends the refresh token,
+  and uses it for the whole refresh. A mistyped passphrase spends nothing: the tool says so and takes the
+  sign-in-again path (a browser sign-in at a terminal, otherwise a message saying to run `idp-login`).
 - The tool never prints tokens. Revoke a session from the IdP side (or let it expire) if a machine is lost.

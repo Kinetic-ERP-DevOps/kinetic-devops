@@ -27,6 +27,7 @@ This file is intentionally lightweight and designed for both interactive develop
 """
 
 import sys
+import contextlib
 import json
 import base64
 import getpass
@@ -47,7 +48,7 @@ from datetime import timedelta
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from typing import Any, Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Iterator, Tuple
 
 # Ensure UTF-8 encoding for Windows terminals to support emojis
 if sys.platform == "win32":
@@ -398,6 +399,10 @@ class SessionResolutionError(RuntimeError):
     """
 
 
+class VaultError(RuntimeError):
+    """The encrypted vault can't be read or written: no passphrase at hand, or one that doesn't open it."""
+
+
 class KineticConfigManager(KineticCore):
     """Manager for Kinetic server configs and token lifecycle stored in keyring.
 
@@ -433,12 +438,12 @@ class KineticConfigManager(KineticCore):
             passphrase = self._vault_passphrase()
 
             if not passphrase:
-                raise RuntimeError("Vault is encrypted. Set KINETIC_VAULT_PASSPHRASE or run in interactive terminal to provide passphrase.")
+                raise VaultError("Vault is encrypted. Set KINETIC_VAULT_PASSPHRASE or run in interactive terminal to provide passphrase.")
 
             try:
                 servers = crypto.decrypt_json(raw, passphrase)
             except Exception as e:
-                raise RuntimeError(f"Failed to decrypt vault: {e}")
+                raise VaultError(f"Failed to decrypt vault: {e}")
             self._remember_vault_pass(passphrase)   # it opened the vault
             return servers
 
@@ -478,13 +483,27 @@ class KineticConfigManager(KineticCore):
         self._vault_pass = passphrase
 
     def _vault_pass_if_known(self) -> Optional[str]:
-        """The vault passphrase if it's at hand without asking (kept from earlier, or KINETIC_VAULT_PASSPHRASE)."""
-        return getattr(self, "_vault_pass", None) or os.environ.get("KINETIC_VAULT_PASSPHRASE") or None
+        """The vault passphrase if it's at hand without asking (pinned for a refresh, kept from earlier, or
+        KINETIC_VAULT_PASSPHRASE)."""
+        return (getattr(self, "_pinned_vault_pass", None) or getattr(self, "_vault_pass", None)
+                or os.environ.get("KINETIC_VAULT_PASSPHRASE") or None)
+
+    @contextlib.contextmanager
+    def _vault_pass_pinned(self, passphrase: Optional[str]) -> Iterator[None]:
+        """Use this (checked) passphrase for every vault read and write inside the block, whatever --vault-prompt
+        says: an IdP refresh asks once, before it spends the refresh token, and never again while it holds the
+        session's lock or after the token is spent."""
+        previous = getattr(self, "_pinned_vault_pass", None)
+        self._pinned_vault_pass = passphrase or previous
+        try:
+            yield
+        finally:
+            self._pinned_vault_pass = previous
 
     def _vault_passphrase(self) -> Optional[str]:
-        """The vault passphrase: one kept from earlier in this process (--vault-prompt once), else
-        KINETIC_VAULT_PASSPHRASE, else asked at a terminal. None if there is none of these."""
-        passphrase = getattr(self, "_vault_pass", None) or os.environ.get("KINETIC_VAULT_PASSPHRASE")
+        """The vault passphrase: one pinned for a refresh, else one kept from earlier in this run (--vault-prompt
+        once), else KINETIC_VAULT_PASSPHRASE, else asked at a terminal. None if there is none of these."""
+        passphrase = self._vault_pass_if_known()
         if not passphrase and sys.stdout.isatty():
             try:
                 passphrase = getpass.getpass("Vault passphrase: ")
@@ -502,15 +521,18 @@ class KineticConfigManager(KineticCore):
         raw = keyring.get_password(SERVICE_SERVERS, "config")
         if not raw or not crypto.is_encrypted_blob(raw):
             return None
+        pinned = getattr(self, "_pinned_vault_pass", None)
+        if pinned:
+            return pinned   # checked against the servers map when it was pinned
         passphrase = self._vault_passphrase()
         if not passphrase:
-            raise RuntimeError("Vault is encrypted. Set KINETIC_VAULT_PASSPHRASE or run in an interactive terminal; "
-                               "refusing to store anything in clear.")
+            raise VaultError("Vault is encrypted. Set KINETIC_VAULT_PASSPHRASE or run in an interactive terminal; "
+                             "refusing to store anything in clear.")
         if passphrase != getattr(self, "_vault_pass", None):
             try:
                 crypto.decrypt_json(raw, passphrase)
             except Exception:
-                raise RuntimeError("That passphrase doesn't open the vault; nothing was stored.") from None
+                raise VaultError("That passphrase doesn't open the vault; nothing was stored.") from None
             self._remember_vault_pass(passphrase)
         return passphrase
 
@@ -1769,9 +1791,23 @@ class KineticConfigManager(KineticCore):
         return meta["AccessToken"]
 
     def _refresh_idp(self, slot: str, meta: Dict, nickname: str, force: bool = False) -> Optional[str]:
-        """Refresh an IdP session without prompting; None when the refresh token is gone or expired."""
-        return idp.refresh_session(meta, reread=lambda: self._get_token_meta(slot),
-                                   store=lambda m: self.touch_session(slot, m, nickname), slot=slot, force=force)
+        """Refresh an IdP session without a password prompt; None when it can't be refreshed (sign in again).
+
+        With the vault encrypted, the passphrase is asked for (if it isn't at hand) and checked against the servers
+        map here, before the refresh token is spent, and then used for every vault read and write of this refresh:
+        with --vault-prompt every, nothing is asked while the session's lock is held or after the IdP has rotated the
+        refresh token, so a mistyped passphrase can't lose the new one. A vault error is reported on stderr and
+        takes the sign-in-again path (None), not a traceback.
+        """
+        try:
+            write_pass = self._write_passphrase()
+            with self._vault_pass_pinned(write_pass):
+                return idp.refresh_session(meta, reread=lambda: self._get_token_meta(slot),
+                                           store=lambda m: self.touch_session(slot, m, nickname), slot=slot,
+                                           force=force)
+        except VaultError as exc:
+            print(f"⚠️ {exc} The IdP session for {nickname} wasn't refreshed.", file=sys.stderr)
+            return None
 
     def _renew_idp_or_raise(self, slot: str, meta: Dict, name: str, user_id: str, company: str,
                             force: bool = False) -> Optional[str]:
