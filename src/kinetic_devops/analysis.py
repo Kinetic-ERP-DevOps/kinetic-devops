@@ -464,42 +464,96 @@ def split_diff_chunks(patch_text: str, max_chars: int = DEFAULT_MAX_DIFF_CHARS) 
 VERDICTS = ("GO", "NO-GO", "UNKNOWN", "INCOMPLETE")
 
 
-_VERDICT_LINE = re.compile(r"^[\s*#>_`]*VERDICT[\s*_`]*:[\s*_`]*(NO[- ]GO|GO)\b(.*)$", re.IGNORECASE | re.MULTILINE)
-_VERDICT_WORD = re.compile(r"\bNO[- ]GO\b|\bGO\b", re.IGNORECASE)
-# NO-GO in words: "NO-GO", "no go", and negated GO ("NOT GO", "not a GO", "don't GO", "do not go").
-_NO_GO = re.compile(r"\bNO[- ]GO\b|\b(?:NOT|DON'?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
+# A VERDICT line as the prompt asks for it: at the line start, after optional markdown (`**`, `#`, `_`, a
+# backtick); a `>` quote is not a line start (see _lead_verdict). The value is GO, NO-GO or a negated GO.
+_VERDICT_LINE = re.compile(
+    r"^[\s*#_`]*VERDICT[\s*_`]*:[\s*_`<\[]*"
+    r"(NO[- ]GO|(?:NOT|DON['’]?T|DO\s+NOT)\s+(?:A\s+)?GO|GO)\b(.*)$",
+    re.IGNORECASE)
+# The instruction echoed back: a VERDICT line whose whole value is the choice ("GO or VERDICT: NO-GO",
+# "GO|NO-GO", "NO-GO / GO"). It is not a decision; "VERDICT: NO-GO / GO once fixed" is (NO-GO).
+_VERDICT_ECHO = re.compile(r"\W*(?:NO[- ])?GO\W{0,4}(?:OR|/|\|)\W{0,4}(?:VERDICT\W{0,4}:\W{0,4})?(?:NO[- ])?GO\W*",
+                           re.IGNORECASE)
+_NO_GO_WORD = re.compile(r"\bNO[- ]GO\b", re.IGNORECASE)
+# Negated GO ("NOT GO", "not a GO", "don't GO", "don’t GO"). GO must be upper case: "does not go beyond"
+# and "do not go to production" are prose, not a verdict. Only looked for in a verdict statement.
+_NEGATED_GO = re.compile(r"(?i:\b(?:NOT|DON['’]?T)\s+(?:A\s+)?)GO\b")
+_GO_NO_GO_HEADING = re.compile(r"\bGO\s*/\s*NO[- ]GO\b", re.IGNORECASE)
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_FENCE = re.compile(r"^\s*(```|~~~)")
+
+
+def _strip_thinking(text: str) -> str:
+    """The answer without <think>...</think> reasoning (and anything before a lone closing tag)."""
+    text = _THINK_BLOCK.sub("", text)
+    close = text.lower().rfind("</think>")
+    return text[close + len("</think>"):] if close >= 0 else text
+
+
+def _verdict_statement(section: str) -> str:
+    """The first sentence of a GO/NO-GO section: the rest of the heading line plus its first non-blank
+    line, up to the first sentence end."""
+    lines = section.splitlines()
+    head = lines[0] if lines else ""
+    body = next((line for line in lines[1:] if line.strip()), "")
+    return re.split(r"(?<=[.!?])\s", f"{head} {body}".strip(), maxsplit=1)[0]
+
+
+def _is_echo(line: str) -> bool:
+    m = _VERDICT_LINE.match(line.lstrip(" >"))
+    return bool(m and _VERDICT_ECHO.fullmatch(m.group(1) + m.group(2)))
+
+
+def _lead_verdict(lines: list[str]) -> tuple[str | None, int]:
+    """(verdict, line index) of the first VERDICT line the answer itself gives: not inside a ``` fence,
+    not quoted with `>` (echoes are already dropped). (None, -1) if there is none."""
+    fenced = False
+    for i, line in enumerate(lines):
+        if _FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced or line.lstrip().startswith(">"):
+            continue
+        m = _VERDICT_LINE.match(line)
+        if not m:
+            continue
+        return ("GO" if m.group(1).upper() == "GO" else "NO-GO"), i
+    return None, -1
 
 
 def parse_verdict(review_text: str) -> str:
-    """GO / NO-GO from the leading "VERDICT:" line the prompt asks for. Without one, only NO-GO
-    is read from the final GO/NO-GO section (or the tail); a bare "GO" there is UNKNOWN, never GO:
-    "do NOT GO" or "not a GO" must not pass, so GO needs the explicit VERDICT line (fail safe).
-    Negated GO ("NOT GO", "not a GO", "don't GO") counts as NO-GO wherever NO-GO is looked for.
-    A VERDICT line naming both ("VERDICT: GO or VERDICT: NO-GO") is the instruction echoed back,
-    not a decision: it is ignored, including by the fallback.
-    A leading GO is overruled by a later explicit "VERDICT: NO-GO" line or a final GO/NO-GO section
-    that says NO-GO: an answer quoting a "VERDICT: GO" from the diff (a prompt injection) near its
-    start must not pass as GO when its own conclusion is NO-GO. Disagreement fails safe."""
-    text = review_text or ""
-    lead = None
-    for m in _VERDICT_LINE.finditer(text[:400]):
-        if not _VERDICT_WORD.search(m.group(2)):
-            lead = "NO-GO" if m.group(1).upper().startswith("NO") else "GO"
-            break
-    text = "\n".join(line for line in text.splitlines()
-                     if not (_VERDICT_LINE.match(line) and len(_VERDICT_WORD.findall(line)) > 1))
-    idx = text.upper().rfind("GO/NO-GO")
+    """GO / NO-GO from the answer's own "VERDICT:" line (the prompt asks for it first). Fails safe:
+
+    * The lead verdict is the first VERDICT line that isn't quoted (`>`), inside a ``` fence or the
+      instruction echoed back ("VERDICT: GO or VERDICT: NO-GO"); <think> reasoning is ignored. A lead
+      "VERDICT: NO-GO" (or "NOT GO") is NO-GO whatever follows it.
+    * A lead GO stands only if the answer doesn't conclude NO-GO elsewhere: a later VERDICT line or a
+      final GO/NO-GO section saying NO-GO (or, in its first sentence, a negated upper-case GO such as
+      "Do NOT GO") overrules it, and without such a section any NO-GO after the lead line does. An
+      answer quoting an injected "VERDICT: GO" from the diff must not pass when it concludes NO-GO.
+    * Without a lead line GO is never inferred (a bare "GO" may be "do NOT GO", cut off, or the
+      format ignored): NO-GO is read from the final GO/NO-GO section (or the last 600 characters),
+      otherwise the answer is UNKNOWN."""
+    lines = [line for line in _strip_thinking(review_text or "").splitlines() if not _is_echo(line)]
+    lead, at = _lead_verdict(lines)
     if lead == "NO-GO":
         return "NO-GO"
+    text = "\n".join(lines)
+    headings = list(_GO_NO_GO_HEADING.finditer(text))
+    section = text[headings[-1].end():] if headings else None
     if lead == "GO":
-        later_no_go = any(m.group(1).upper().startswith("NO") and not _VERDICT_WORD.search(m.group(2))
-                          for m in _VERDICT_LINE.finditer(text))
-        section = text[idx + len("GO/NO-GO"):] if idx >= 0 else ""   # no heading: trust the lead line
-        if later_no_go or _NO_GO.search(section):
+        own = _VERDICT_LINE.match(lines[at]).group(2)
+        after = lines[at + 1:]
+        if _NO_GO_WORD.search(own) or _NEGATED_GO.search(own) or any(
+                (m := _VERDICT_LINE.match(line.lstrip(" >"))) and m.group(1).upper() != "GO" for line in after):
+            return "NO-GO"
+        if section is None:   # no final section: any NO-GO after the lead line wins
+            return "NO-GO" if _NO_GO_WORD.search("\n".join(after)) else "GO"
+        if _NO_GO_WORD.search(section) or _NEGATED_GO.search(_verdict_statement(section)):
             return "NO-GO"
         return "GO"
-    tail = text[idx + len("GO/NO-GO"):] if idx >= 0 else text[-600:]
-    if _NO_GO.search(tail):
+    tail = section if section is not None else text[-600:]
+    if _NO_GO_WORD.search(tail) or _NEGATED_GO.search(tail):
         return "NO-GO"
     return "UNKNOWN"   # no VERDICT line: a GO here is not trusted (negation, cut-off, format ignored)
 

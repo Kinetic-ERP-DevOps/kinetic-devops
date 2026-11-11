@@ -126,7 +126,14 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   the run summary and output (with the `--base-ref` to resume from), and `verify-report` fails on it.
 - `analysis diff`: an answer without its leading `VERDICT:` line no longer passes as GO from a bare "GO" in
   its last section, so "Do NOT GO: ..." is no longer read as GO. GO now needs the explicit `VERDICT: GO`
-  line; otherwise the chunk is UNKNOWN. NO-GO, including a negated GO ("not a GO", "don't GO"), still counts.
+  line; otherwise the chunk is UNKNOWN. NO-GO, including a negated GO ("not a GO", "don't GO", "don’t GO"),
+  still counts. The verdict line is the first one the answer gives itself, anywhere after `<think>` reasoning
+  or a preamble, but not one quoted with `>` or inside a code fence; a `VERDICT: NO-GO` line is NO-GO whatever
+  follows it, and only a line shaped like the instruction ("VERDICT: GO or VERDICT: NO-GO") is ignored as an
+  echo. A leading GO is overruled by the answer's own NO-GO: a later NO-GO verdict line, a NO-GO in its final
+  GO/NO-GO section or, without that section, any NO-GO after the verdict line. A negated GO counts only in the
+  verdict statement (the VERDICT line, the section's first sentence) and only with an upper-case GO, so prose
+  like "does not go beyond renaming" or "do not go to production yet" doesn't turn a GO into NO-GO.
 - Forgejo sync's Dependabot check crashed on a pre-release version (`2.0.0` vs `2.0.0rc1` compared an int
   with a string), refusing promotion with a traceback. Versions now compare by PEP 440; one that isn't PEP 440
   is not counted as resolving an alert.
