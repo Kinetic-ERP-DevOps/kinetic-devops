@@ -565,8 +565,12 @@ class KineticConfigManager(KineticCore):
         if meta.get("_tokens_unreadable"):
             raise VaultError("This session's tokens couldn't be decrypted, so it wasn't saved (that would store empty "
                              "tokens over them). Run with the vault passphrase, or sign in again.")
-        passphrase = self._write_passphrase()
-        idp.write_token_entry(slot, self._seal(idp.pack(slot, meta, passphrase), passphrase))
+        self._write_token_material(slot, meta, self._write_passphrase())
+
+    def _write_token_material(self, slot: str, meta: Dict, passphrase: Optional[str]) -> None:
+        """Store a session sealed with passphrase (None: plain JSON), with one commit point (idp.store_session)."""
+        idp.store_session(slot, meta, passphrase,
+                          lambda stored: idp.write_token_entry(slot, self._seal(stored, passphrase)))
 
     def _reseal_token_slots(self, servers: Dict, read_pass: Optional[str], write_pass: Optional[str]) -> int:
         """Rewrite every recorded session's token material with write_pass (None: plain JSON). For encrypt-vault and
@@ -579,13 +583,13 @@ class KineticConfigManager(KineticCore):
                 slot = self._get_token_key(name, user, api_key)
                 raw = idp.read_token_entry(slot)
                 if not raw:
-                    if keyring.get_password(slot, idp.TOKEN_ENTRY):   # a chunk count whose chunks aren't all there
+                    if keyring.get_password(slot, idp.TOKEN_ENTRY):   # a chunk marker whose chunks aren't all there
                         failed += 1
                     continue
                 try:
                     data = crypto.decrypt_json(raw, read_pass) if crypto.is_encrypted_blob(raw) else json.loads(raw)
                     data = idp.unpack(slot, data, read_pass, strict=True)   # unreadable token: raises, slot kept
-                    idp.write_token_entry(slot, self._seal(idp.pack(slot, data, write_pass), write_pass))
+                    self._write_token_material(slot, data, write_pass)
                 except Exception:
                     failed += 1
         return failed
@@ -692,34 +696,42 @@ class KineticConfigManager(KineticCore):
         A session whose access token can't be read (encrypted with a passphrase that isn't at hand) is returned
         with _is_valid False, so it is renewed or signed in again, never used with an empty token.
         """
-        raw_data = idp.read_token_entry(token_slot)
-        if not raw_data: return None
-
-        # If token slot is encrypted, decrypt it with same passphrase logic
         passphrase = None
-        if crypto.is_encrypted_blob(raw_data):
-            passphrase = self._vault_passphrase()
-            if not passphrase:
-                # Can't decrypt non-interactively; treat as missing
-                return None
-            try:
-                data = crypto.decrypt_json(raw_data, passphrase)
-            except Exception:
-                return None
-            # Opening a token slot doesn't prove it's the vault's passphrase: keep it only if it opens the servers map.
-            self._remember_if_it_opens_the_vault(passphrase)
-        else:
-            try:
-                data = json.loads(raw_data)
-            except Exception:
-                return None
-        if not isinstance(data, dict):
-            return None
+        # An IdP session whose token chunks are gone was most likely just replaced by another process (the new
+        # stub names new chunks, and the old ones are deleted after it is written): read it again.
+        for _ in range(idp.READ_ATTEMPTS):
+            raw_data = idp.read_token_entry(token_slot)
+            if not raw_data: return None
 
-        # The token side entries of an IdP session are encrypted with the vault too (when it is). A clear stub with
-        # encrypted side entries (e.g. left by an interrupted encrypt-vault) needs the passphrase too: ask for it.
-        data = idp.unpack(token_slot, data, passphrase or self._vault_pass_if_known())
-        if data.get("_tokens_unreadable") and not passphrase and not self._vault_pass_if_known():
+            # If token slot is encrypted, decrypt it with same passphrase logic
+            if crypto.is_encrypted_blob(raw_data):
+                passphrase = passphrase or self._vault_passphrase()
+                if not passphrase:
+                    # Can't decrypt non-interactively; treat as missing
+                    return None
+                try:
+                    data = crypto.decrypt_json(raw_data, passphrase)
+                except Exception:
+                    return None
+                # Opening a token slot doesn't prove it's the vault's passphrase: keep it only if it opens the
+                # servers map.
+                self._remember_if_it_opens_the_vault(passphrase)
+            else:
+                try:
+                    data = json.loads(raw_data)
+                except Exception:
+                    return None
+            if not isinstance(data, dict):
+                return None
+
+            # The token side entries of an IdP session are encrypted with the vault too (when it is).
+            data = idp.unpack(token_slot, data, passphrase or self._vault_pass_if_known())
+            if not data.get("_chunks_missing"):
+                break
+
+        # A clear stub with encrypted side entries (e.g. left by an interrupted encrypt-vault) needs the passphrase
+        # too: ask for it (only then: a missing chunk is no reason to ask for a passphrase).
+        if data.get("_tokens_locked") and not passphrase and not self._vault_pass_if_known():
             asked = self._vault_passphrase()
             if asked:
                 data = idp.unpack(token_slot, data, asked)
@@ -1251,8 +1263,8 @@ class KineticConfigManager(KineticCore):
         for user in sessions:
             slot = self._get_token_key(name, user, cfg['api_key'])
             try:
-                idp.delete_secrets(slot)   # first: it finds the chunks through "current_token"
-                keyring.delete_password(slot, "current_token")
+                if not idp.delete_session(slot):   # "current_token" first, then its chunks and side entries
+                    raise LookupError("no session stored")
                 print(f"🗑️ Cleared session for {user}")
             except: pass
         
@@ -1592,8 +1604,8 @@ class KineticConfigManager(KineticCore):
                 continue
             try:
                 old_slot = self._get_token_key(name, user_id, old_key)
-                idp.delete_secrets(old_slot)   # first: it finds the chunks through "current_token"
-                keyring.delete_password(old_slot, "current_token")
+                if not idp.delete_session(old_slot):   # "current_token" first, then its chunks and side entries
+                    raise LookupError("no session stored")
                 deleted_slots += 1
             except Exception:
                 pass
@@ -2025,11 +2037,13 @@ class KineticConfigManager(KineticCore):
             return summary
 
         # 1. New slots first (old ones still exist if anything below fails). Side entries (IdP tokens, the chunks
-        # of a chunked "current_token") before "current_token" itself, which may be their chunk count.
+        # of a chunked "current_token") before "current_token" itself, which may point to them: move_secrets
+        # returns the "current_token" value it copied the side entries for, and that is what is written.
         for move in moves:
             if move["raw"]:
-                idp.move_secrets(move["old_slot"], move["new_slot"])
-                keyring.set_password(move["new_slot"], "current_token", move["raw"])
+                current = idp.move_secrets(move["old_slot"], move["new_slot"])
+                if current is not None:
+                    keyring.set_password(move["new_slot"], "current_token", current)
 
         # 2. Config entry, keeping its position and the vault's encryption.
         renamed = {(new_name if key == old_key else key): value for key, value in servers.items()}
@@ -2046,8 +2060,8 @@ class KineticConfigManager(KineticCore):
         for move in moves:
             if move["raw"] and move["old_slot"].lower() != move["new_slot"].lower():
                 try:
-                    idp.delete_secrets(move["old_slot"])   # first: it finds the chunks through "current_token"
-                    keyring.delete_password(move["old_slot"], "current_token")
+                    if not idp.delete_session(move["old_slot"]):   # "current_token" first, then its chunks and side entries
+                        raise LookupError("no session stored")
                 except Exception:
                     pass
         return summary
@@ -2393,8 +2407,8 @@ class KineticConfigManager(KineticCore):
                 key_hash = hashlib.sha256(secret.encode()).hexdigest()[:12]
                 slot = f"{env_name}-{user.lower()}-{key_hash}"
                 try:
-                    idp.delete_secrets(slot)   # first: it finds the chunks through "current_token"
-                    keyring.delete_password(slot, "current_token")
+                    if not idp.delete_session(slot):   # "current_token" first, then its chunks and side entries
+                        raise LookupError("no session stored")
                     deleted_count += 1
                 except:
                     pass
@@ -2567,8 +2581,8 @@ class KineticConfigManager(KineticCore):
             print(f"\n🧹 Purging {len(orphans_found)} orphaned tokens...")
             for _, _, slot in orphans_found:
                 try:
-                    idp.delete_secrets(slot)   # first: it finds the chunks through "current_token"
-                    keyring.delete_password(slot, "current_token")
+                    if not idp.delete_session(slot):   # "current_token" first, then its chunks and side entries
+                        raise LookupError("no session stored")
                     print(f"   ✅ Deleted {slot}")
                 except: pass
             print("✨ Cleanup complete.")

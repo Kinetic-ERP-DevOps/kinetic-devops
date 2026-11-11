@@ -185,13 +185,17 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
   A session they can't read (a token encrypted with another passphrase, a missing entry) is left as it was and
   counted, never rewritten as an empty token; a session whose token can't be decrypted reads as expired and is
-  never saved back (the vault passphrase is asked for when an IdP session's token entries are encrypted).
+  never saved back (the vault passphrase is asked for when an IdP session's token entries are encrypted and none
+  is at hand).
   Encryption makes a token entry ~1.4x longer, so any session's `current_token` over the keyring's ~1280-character
   limit (Windows Credential Manager), such as a password session with a typical Kinetic token in an encrypted
-  vault, is split over several entries. Each such write stores its chunks under new names and then switches
-  `current_token` to them with one write (IdP token entries the same way), so a reader never sees a half-written
-  value and an interrupted write leaves the previous one; versions without this read such an entry as missing
-  (sign in again). Both forms are read, and `rename`, `logout` and the clean-up commands handle the chunks.
+  vault, is split over several entries. Every write of a session has one commit point: the chunks (and an IdP
+  session's token entries) go under new names first, then one write of `current_token` switches to them, and only
+  then are the old ones removed. So a crash part-way leaves the previous session whole (never a new access token
+  with an already rotated-away refresh token), and a reader that races a writer reads the session again instead of
+  seeing it as gone. Logout removes `current_token` first, so an interrupted logout can't leave a usable refresh
+  token. Versions without this read a chunked entry as missing (sign in again). Sessions stored the earlier ways
+  are read, and `rename`, `logout` and the clean-up commands handle the chunks.
   A typed vault passphrase is kept in memory for the rest of the run (said once; never stored; only a passphrase
   that opens the servers map is kept); `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time
   instead. An IdP refresh asks for (and checks) the passphrase before it spends the refresh token, and not again

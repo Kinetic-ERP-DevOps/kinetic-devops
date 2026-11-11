@@ -1,10 +1,13 @@
 """Tests for kinetic_devops.idp (Epicor IdP sign-in) and its use in auth. No network: requests is mocked."""
 
 import base64
+import copy
+import contextlib
 import hashlib
 import io
 import json
 import os
+import secrets
 import socket
 import stat
 import sys
@@ -803,18 +806,22 @@ class TestSlotStorage(unittest.TestCase):
         self.assertEqual((back["AccessToken"], back["refresh_token"]), (meta["AccessToken"], meta["refresh_token"]))
 
     def test_shorter_token_drops_stale_chunks(self):
-        idp.pack("slot", {"auth_method": "idp", "AccessToken": "a" * 3000, "refresh_token": "r"})
-        idp.pack("slot", {"auth_method": "idp", "AccessToken": "b" * 10, "refresh_token": "r"})
-        self.assertEqual(idp.unpack("slot", {"_idp_split": True})["AccessToken"], "b" * 10)
-        self.assertEqual([n for (_, n) in self.kr.store if n.startswith("idp_AccessToken#")],
-                         idp._chunk_names("idp_AccessToken", self.kr.get_password("slot", "idp_AccessToken")))
+        _store("slot", {"auth_method": "idp", "AccessToken": "a" * 3000, "refresh_token": "r"})
+        _store("slot", {"auth_method": "idp", "AccessToken": "b" * 10, "refresh_token": "r"})
+        stub = _stub("slot")
+        self.assertEqual(idp.unpack("slot", dict(stub))["AccessToken"], "b" * 10)
+        self.assertEqual(sorted(n for (_, n) in self.kr.store if n.startswith("idp_AccessToken#")),
+                         idp._chunk_names("idp_AccessToken", stub["_idp_gens"]["AccessToken"]))
 
     def test_delete_and_move_secrets(self):
-        idp.pack("old", {"auth_method": "idp", "AccessToken": "a" * 1500, "refresh_token": "r"})
-        idp.move_secrets("old", "new")
-        idp.delete_secrets("old")
+        _store("old", {"auth_method": "idp", "AccessToken": "a" * 1500, "refresh_token": "r"})
+        current = idp.move_secrets("old", "new")
+        self.kr.set_password("new", "current_token", current)
+        self.assertTrue(idp.delete_session("old"))
         self.assertFalse([k for k in self.kr.store if k[0] == "old"])
-        self.assertEqual(idp.unpack("new", {"_idp_split": True})["AccessToken"], "a" * 1500)
+        self.assertEqual(idp.unpack("new", _stub("new"))["AccessToken"], "a" * 1500)
+        self.assertTrue(idp.delete_session("new"))
+        self.assertEqual(self.kr.store, {})
 
     def test_password_sessions_are_untouched(self):
         meta = {"AccessToken": "jwt", "user_id": "alice"}
@@ -834,6 +841,29 @@ def _fake_decrypt(blob, passphrase):
     if wrapper.get("iv") != hashlib.sha256(passphrase.encode()).hexdigest():
         raise ValueError("InvalidTag")
     return json.loads(base64.b64decode(wrapper["ct"][::-1]))
+
+
+def _store(slot, meta, passphrase=None):
+    """Write a session the way auth does (idp.store_session), in clear or with the stand-in encryption."""
+    idp.store_session(slot, meta, passphrase, lambda stub: idp.write_token_entry(
+        slot, _fake_encrypt(stub, passphrase) if passphrase else json.dumps(stub)))
+
+
+def _stub(slot, passphrase=None):
+    raw = idp.read_token_entry(slot)
+    return _fake_decrypt(raw, passphrase) if crypto.is_encrypted_blob(raw) else json.loads(raw)
+
+
+def _side_raw(slot, field, passphrase=None):
+    """The stored (possibly encrypted) value of an IdP session's token side entry."""
+    return idp._read_chunks(slot, idp._side(field), _stub(slot, passphrase)["_idp_gens"][field])
+
+
+def _set_side(slot, field, value, passphrase=None):
+    """Replace one side entry's stored value (e.g. with one encrypted with another passphrase)."""
+    stub = _stub(slot, passphrase)
+    stub["_idp_gens"][field] = idp._write_chunks(slot, idp._side(field), idp._split(value), secrets.token_hex(4))
+    idp.write_token_entry(slot, _fake_encrypt(stub, passphrase) if passphrase else json.dumps(stub))
 
 
 class VaultFixture(unittest.TestCase):
@@ -904,7 +934,7 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
         self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
         stub = json.loads(self.kr.get_password(self.slot, "current_token"))
         self.assertTrue(stub["_idp_split"])
-        self.assertEqual(idp._get_chunked(self.slot, "idp_refresh_token"), "RT-SECRET")
+        self.assertEqual(_side_raw(self.slot, "refresh_token"), "RT-SECRET")
         self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
 
     def test_no_passphrase_refuses_to_write_in_clear(self):
@@ -934,7 +964,7 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
         with patch("builtins.print"):
             self.mgr.decrypt_vault("pass-1")
         self.assertFalse(crypto.is_encrypted_blob(self.kr.get_password(self.slot, "current_token")))
-        self.assertEqual(idp._get_chunked(self.slot, "idp_refresh_token"), "RT-SECRET")
+        self.assertEqual(_side_raw(self.slot, "refresh_token"), "RT-SECRET")
 
     def test_encrypt_vault_repairs_a_slot_left_half_clear_by_older_versions(self):
         """Older encrypt-vault encrypted the stub but left the side entries in clear; running it again fixes that."""
@@ -952,7 +982,7 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
         not counted as a failure. Now the slot is left untouched and counted."""
         self.encrypted_vault()
         self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
-        idp._put_chunked(self.slot, "idp_refresh_token", _fake_encrypt("RT-OTHER", "other-pass"))
+        _set_side(self.slot, "refresh_token", _fake_encrypt("RT-OTHER", "other-pass"), "pass-1")
         before = dict(self.kr.store)
         out = io.StringIO()
         with patch("sys.stdout", out):
@@ -964,8 +994,8 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
     def test_encrypt_vault_counts_a_missing_chunk_and_leaves_the_slot(self):
         self.encrypted_vault()
         self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
-        self.kr.delete_password(self.slot, idp._chunk_names("idp_AccessToken",
-                                                            self.kr.get_password(self.slot, "idp_AccessToken"))[1])
+        marker = _stub(self.slot, "pass-1")["_idp_gens"]["AccessToken"]
+        self.kr.delete_password(self.slot, idp._chunk_names("idp_AccessToken", marker)[1])
         before = {k: v for k, v in self.kr.store.items() if k[0] == self.slot}
         with patch("builtins.print") as printed:
             self.mgr.encrypt_vault("pass-1")
@@ -976,7 +1006,7 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
         """_get_token_meta returned _is_valid True with an empty AccessToken when a side entry didn't decrypt."""
         self.encrypted_vault()
         self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
-        idp._put_chunked(self.slot, "idp_AccessToken", _fake_encrypt("AT-OTHER", "other-pass"))
+        _set_side(self.slot, "AccessToken", _fake_encrypt("AT-OTHER", "other-pass"), "pass-1")
         meta = self.mgr._get_token_meta(self.slot)
         self.assertEqual(meta["AccessToken"], "")
         self.assertFalse(meta["_is_valid"])
@@ -1252,12 +1282,35 @@ class TestChunkedWritesAreNeverTorn(unittest.TestCase):
         self.assertEqual(seen, ['{"AccessToken": "short"}'])
         self.assertEqual(list(self.kr.store), [("slot", "current_token")])
 
-    def test_idp_side_entries_are_written_as_generations_too(self):
-        idp.pack("slot", {"auth_method": "idp", "AccessToken": self.OLD, "refresh_token": "r"})
+    def test_a_reader_of_an_idp_session_between_any_two_writes_sees_the_old_or_the_new_one(self):
+        """Review finding: the IdP tokens and the stub were switched one after another, so a crash or a reader
+        between them got the new access token with the rotated-away refresh token. The stub is the commit point."""
+        old = {"auth_method": "idp", "AccessToken": self.OLD, "refresh_token": "RA" * 600}
+        new = {"auth_method": "idp", "AccessToken": self.NEW, "refresh_token": "RB" * 600}
+        _store("s2", old)
         seen = []
-        self.kr.hook = lambda service, user: seen.append(idp._get_chunked("slot", "idp_AccessToken"))
-        idp.pack("slot", {"auth_method": "idp", "AccessToken": self.NEW, "refresh_token": "r"})
-        self.assertEqual(set(seen) - {self.OLD, self.NEW}, set())
+
+        def read(service, user):
+            back = idp.unpack("s2", _stub("s2"))
+            seen.append((back["AccessToken"], back["refresh_token"]))
+        self.kr.hook = read
+        with patch.object(self.kr, "delete_password", side_effect=lambda s, u: (FakeKeyring.delete_password(
+                self.kr, s, u), read(s, u))):
+            _store("s2", new)
+        self.assertEqual(set(seen) - {(self.OLD, "RA" * 600), (self.NEW, "RB" * 600)}, set())
+        self.assertEqual(seen[-1], (self.NEW, "RB" * 600))
+
+    def test_a_new_generation_never_reuses_the_current_one(self):
+        with patch.object(idp.secrets, "token_hex", side_effect=["deadbeef", "deadbeef", "cafebabe"]):
+            idp.write_token_entry("s3", "A" * 1500)
+            idp.write_token_entry("s3", "B" * 1500)
+        self.assertEqual(idp.read_token_entry("s3"), "B" * 1500)
+        self.assertTrue(self.kr.get_password("s3", "current_token").startswith("chunks:cafebabe:"))
+
+    def test_marker_parsing_is_strict(self):
+        for bad in ("chunks:abc:99999", "chunks:a-b:2", "chunks:ab:", "\u00b2", "chunks::2", "65"):
+            self.assertIsNone(idp._chunk_names("current_token", bad), bad)
+        self.assertEqual(idp._chunk_names("x", "chunks:ab12:2"), ["x#ab12.0", "x#ab12.1"])
 
     def test_marker_is_neither_json_nor_digits(self):
         marker = self.kr.get_password("slot", "current_token")
@@ -1277,13 +1330,31 @@ class TestChunkedWritesAreNeverTorn(unittest.TestCase):
             self.assertEqual(idp.read_token_entry("s"), '{"AccessToken": "legacy"}')
             self.assertEqual(idp.unpack("s", {"_idp_split": True})["AccessToken"], "AT-LEGACY")
             idp.write_token_entry("s", "x" * 1500)
-            idp.pack("s", {"auth_method": "idp", "AccessToken": "AT-NEW", "refresh_token": "r"})
             self.assertNotIn(("s", "current_token#0"), kr.store)
-            self.assertNotIn(("s", "idp_AccessToken#0"), kr.store)
             self.assertEqual(idp.read_token_entry("s"), "x" * 1500)
-            idp.delete_secrets("s")
-            kr.delete_password("s", "current_token")
+            _store("s", {"auth_method": "idp", "AccessToken": "AT-NEW", "refresh_token": "r"})
+            self.assertNotIn(("s", "idp_AccessToken"), kr.store)
+            self.assertNotIn(("s", "idp_AccessToken#0"), kr.store)
+            self.assertEqual(idp.unpack("s", _stub("s"))["AccessToken"], "AT-NEW")
+            self.assertTrue(idp.delete_session("s"))
             self.assertEqual(kr.store, {})
+
+    def test_main_format_idp_session_reads_and_is_replaced(self):
+        """Stored by main before generations: a stub without "_idp_gens" and per-field count entries."""
+        kr = FakeKeyring()
+        with patch.object(idp, "keyring", kr):
+            for field, value in (("AccessToken", "A" * 1500), ("refresh_token", "R" * 900)):
+                parts = [value[i:i + 1000] for i in range(0, len(value), 1000)]
+                for i, part in enumerate(parts):
+                    kr.set_password("s", f"idp_{field}#{i}", part)
+                kr.set_password("s", f"idp_{field}", str(len(parts)))
+            kr.set_password("s", "current_token", json.dumps({"_idp_split": True, "user_id": "alice"}))
+            back = idp.unpack("s", _stub("s"))
+            self.assertEqual((back["AccessToken"], back["refresh_token"]), ("A" * 1500, "R" * 900))
+            _store("s", dict(back, auth_method="idp", AccessToken="A2"))
+            self.assertEqual(idp.unpack("s", _stub("s"))["refresh_token"], "R" * 900)
+            self.assertFalse([n for (_, n) in kr.store if n in ("idp_AccessToken", "idp_refresh_token")
+                              or n.startswith(("idp_AccessToken#", "idp_refresh_token#")) and "." not in n])
 
 
 class TestUnreadableTokensAreNeverSaved(VaultFixture):
@@ -1337,6 +1408,34 @@ class TestUnreadableTokensAreNeverSaved(VaultFixture):
             self.mgr.touch_from_headers({"Authorization": "Bearer AT", "X-Epicor-Company": "BETA"})
         touch.assert_not_called()
 
+    def test_rejected_refresh_token_is_dropped_even_when_the_access_token_didnt_read(self):
+        """Review finding: the invalid_grant branch kept "_tokens_unreadable", so storing the dropped refresh token
+        was refused with a misleading message and the dead token was sent again on every run."""
+        stored = []
+        meta = {"AccessToken": "", "refresh_token": "RT1", "idp_tenant": "42", "idp_token_endpoint": SETTINGS["token"],
+                "_is_valid": False, "_tokens_unreadable": True, "_tokens_locked": True}
+        req = MagicMock()
+        req.post.return_value = _resp({"error": "invalid_grant"}, 400)
+        with patch.object(idp, "requests", req), patch.object(idp, "get_client_id", return_value="cid"):
+            idp.refresh_session(meta, reread=lambda: dict(meta), store=stored.append, slot=f"s-{time.time()}")
+        self.assertEqual(stored[-1]["refresh_token"], "")
+        self.assertFalse(set(stored[-1]) & set(idp.UNREAD_FLAGS))
+
+    def test_a_missing_chunk_on_a_clear_vault_asks_for_no_passphrase(self):
+        """Review finding: a missing chunk set the same flag as an encrypted token, so a clear vault asked for a
+        vault passphrase."""
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        marker = _stub(self.slot)["_idp_gens"]["AccessToken"]
+        self.kr.delete_password(self.slot, idp._chunk_names("idp_AccessToken", marker)[0])
+        with patch.object(sys.stdout, "isatty", return_value=True), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="") as ask:
+            meta = self.mgr._get_token_meta(self.slot)
+        ask.assert_not_called()
+        self.assertTrue(meta["_tokens_unreadable"])
+        self.assertFalse(meta["_is_valid"])
+
     def test_refresh_saves_new_tokens_over_an_unreadable_access_token(self):
         stored = []
         meta = {"AccessToken": "", "refresh_token": "RT1", "idp_tenant": "42", "idp_token_endpoint": SETTINGS["token"],
@@ -1346,6 +1445,222 @@ class TestUnreadableTokensAreNeverSaved(VaultFixture):
         with patch.object(idp, "requests", req), patch.object(idp, "get_client_id", return_value="cid"):
             idp.refresh_session(meta, reread=lambda: dict(meta), store=stored.append, slot=f"s-{time.time()}")
         self.assertNotIn("_tokens_unreadable", stored[-1])
+
+
+class Crash(BaseException):
+    """A process killed at this point (BaseException: no except clause in the code under test catches it)."""
+
+
+class CrashingKeyring(FakeKeyring):
+    """FakeKeyring that dies after `budget` more writes or deletes."""
+
+    budget = None
+
+    def _tick(self):
+        if self.budget is not None:
+            if self.budget == 0:
+                raise Crash()
+            self.budget -= 1
+
+    def set_password(self, service, user, value):
+        if len(value) > 1280:
+            raise OSError("CredWrite: The stub received bad data")
+        self._tick()
+        self.store[(service, user)] = value
+
+    def delete_password(self, service, user):
+        self._tick()
+        self.store.pop((service, user))
+
+
+class TestCrashAtEveryWrite(unittest.TestCase):
+    """Kill the process at every keyring write or delete of an operation: what's read afterwards is the session
+    from before or the one from after, whole (never a new access token with the old, rotated-away refresh token),
+    and a logged-out session never comes back. Based on the review's crash harness."""
+
+    SERVERS = {"pilot": {"url": "https://pilot.example", "api_key": "K", "companies": "ACME", "sessions": ["alice"]}}
+
+    def setUp(self):
+        self.kr = CrashingKeyring()
+        self.patches = [patch.object(idp, "keyring", self.kr), patch.object(auth, "keyring", self.kr),
+                        patch.object(crypto, "encrypt_json", _fake_encrypt),
+                        patch.object(crypto, "decrypt_json", _fake_decrypt),
+                        patch.object(sys.stdout, "isatty", return_value=False),
+                        patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"})]
+        for p in self.patches:
+            p.start()
+        self.slot = self.mgr()._get_token_key("pilot", "alice", "K")
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    @staticmethod
+    def mgr():
+        return KineticConfigManager.__new__(KineticConfigManager)
+
+    @staticmethod
+    def idp_meta(at, rt, co="ACME"):
+        return {"auth_method": "idp", "AccessToken": at, "refresh_token": rt, "expires_in": 3600,
+                "_local_timestamp": time.time(), "user_id": "alice", "env_name": "pilot", "idp_tenant": "t",
+                "idp_token_endpoint": SETTINGS["token"], "current_company": co}
+
+    @staticmethod
+    def pw_meta(at, co="ACME"):
+        return {"AccessToken": at, "expires_in": 3600, "_local_timestamp": time.time(), "user_id": "alice",
+                "env_name": "pilot", "current_company": co}
+
+    @staticmethod
+    def sig(meta):
+        return None if meta is None else (meta.get("AccessToken"), meta.get("refresh_token"),
+                                          meta.get("current_company"))
+
+    def readback(self, slot=None):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return self.sig(self.mgr()._get_token_meta(slot or self.slot))
+
+    def prepare(self, encrypted, meta):
+        self.kr.budget = None
+        self.kr.store = {}
+        self.kr.store[(auth.SERVICE_SERVERS, "config")] = (_fake_encrypt(self.SERVERS, "pass-1") if encrypted
+                                                            else json.dumps(self.SERVERS))
+        self.mgr().touch_session(self.slot, copy.deepcopy(meta), "pilot")
+        return copy.deepcopy(self.kr.store)
+
+    def crash_everywhere(self, base, action, check):
+        """Run action from the stored state `base`, killed after 0, 1, 2, ... writes until it completes; check()
+        after each run. Returns the number of writes the action makes."""
+        k = 0
+        while True:
+            self.kr.store = copy.deepcopy(base)
+            self.kr.budget = k
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    action()
+                done = True
+            except Crash:
+                done = False
+            self.kr.budget = None
+            check(k, done)
+            if done:
+                return k
+            k += 1
+
+    def test_touch_session(self):
+        big_a, big_b = "A" * 1500, "B" * 1500
+        cases = [("pw big->big", self.pw_meta(big_a), self.pw_meta(big_b)),
+                 ("pw small->big", self.pw_meta("A" * 50), self.pw_meta(big_b)),
+                 ("pw big->small", self.pw_meta(big_a), self.pw_meta("B" * 50)),
+                 ("idp->idp", self.idp_meta("A" * 2500, "RA" * 600), self.idp_meta("B" * 2500, "RB" * 600)),
+                 ("pw->idp", self.pw_meta(big_a), self.idp_meta("B" * 2500, "RB" * 600)),
+                 ("idp->pw", self.idp_meta("A" * 2500, "RA" * 600), self.pw_meta(big_b))]
+        for encrypted in (False, True):
+            for label, old, new in cases:
+                with self.subTest(label, encrypted=encrypted):
+                    base = self.prepare(encrypted, old)
+                    allowed = {self.sig(old), self.sig(new)}
+
+                    def check(k, done):
+                        self.assertIn(self.readback(), allowed, f"killed after write {k}")
+                        if done:
+                            self.assertEqual(self.readback(), self.sig(new))
+                    self.crash_everywhere(base, lambda: self.mgr().touch_session(self.slot, copy.deepcopy(new),
+                                                                                   "pilot"), check)
+
+    def test_set_current_company(self):
+        meta = self.idp_meta("A" * 2500, "RA" * 600)
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                base = self.prepare(encrypted, meta)
+                allowed = {self.sig(meta), self.sig(dict(meta, current_company="BETA"))}
+                self.crash_everywhere(base, lambda: self.mgr().set_current_company("pilot", "alice", "BETA"),
+                                      lambda k, done: self.assertIn(self.readback(), allowed, f"write {k}"))
+
+    def test_logout(self):
+        for encrypted in (False, True):
+            for label, meta in (("pw big", self.pw_meta("A" * 1500)), ("idp", self.idp_meta("A" * 2500, "R" * 1200))):
+                with self.subTest(label, encrypted=encrypted):
+                    base = self.prepare(encrypted, meta)
+
+                    def check(k, done):
+                        got = self.readback()
+                        if k > 0 or done:   # the first write is the delete of "current_token": gone at once
+                            self.assertIsNone(got, f"session back after a crash at write {k}")
+                        else:
+                            self.assertIn(got, (self.sig(meta), None))
+                        if done:
+                            self.assertEqual([u for (s, u) in self.kr.store if s == self.slot], [])
+                    self.crash_everywhere(base, lambda: self.mgr().logout("pilot"), check)
+
+    def test_encrypt_and_decrypt_vault(self):
+        for label, meta in (("pw big", self.pw_meta("A" * 1500)), ("idp", self.idp_meta("A" * 2500, "RA" * 600)),
+                            ("pw small", self.pw_meta("A" * 30))):
+            for encrypted, action in ((False, lambda: self.mgr().encrypt_vault("pass-1")),
+                                      (True, lambda: self.mgr().decrypt_vault("pass-1"))):
+                with self.subTest(label, encrypted=encrypted):
+                    base = self.prepare(encrypted, meta)
+                    self.crash_everywhere(base, action, lambda k, done: self.assertEqual(
+                        self.readback(), self.sig(meta), f"write {k}"))
+
+    def test_rename(self):
+        new_slot = self.mgr()._get_token_key("pilot2", "alice", "K")
+        for encrypted in (False, True):
+            for label, meta in (("pw big", self.pw_meta("A" * 1500)), ("idp", self.idp_meta("A" * 2500, "R" * 1200))):
+                with self.subTest(label, encrypted=encrypted):
+                    base = self.prepare(encrypted, meta)
+
+                    def check(k, done):
+                        renamed = "pilot2" in self.mgr()._get_server_dict()
+                        self.assertEqual(self.readback(new_slot if renamed else self.slot), self.sig(meta),
+                                         f"write {k}")
+                        if done:
+                            self.assertEqual([u for (s, u) in self.kr.store if s == self.slot], [])
+                    self.crash_everywhere(base, lambda: self.mgr().rename("pilot", "pilot2"), check)
+
+
+class TestReadersRacingAWriter(VaultFixture):
+    """Review finding: a reader that read the marker (or the stub) just before another process switched to a new
+    generation and deleted the old one found a chunk missing and read the session as gone (password prompt, or a
+    headless failure). A missing chunk under a marker or stub that changed meanwhile is read again."""
+
+    def race(self, entry_prefix, write):
+        """Run write() once, just before the reader's first read of an entry starting with entry_prefix."""
+        real_get = FakeKeyring.get_password
+        fired = []
+
+        def get(service, user):
+            if service == self.slot and user.startswith(entry_prefix) and not fired:
+                fired.append(1)
+                write()
+            return real_get(self.kr, service, user)
+        return patch.object(self.kr, "get_password", side_effect=get), fired
+
+    def test_chunked_password_session(self):
+        self.encrypted_vault()
+        pw = {"AccessToken": "A" * 1500, "expires_in": 3600, "_local_timestamp": time.time(), "user_id": "alice"}
+        self.mgr.touch_session(self.slot, dict(pw), "pilot")
+        racing, fired = self.race("current_token#", lambda: KineticConfigManager.__new__(
+            KineticConfigManager).touch_session(self.slot, dict(pw, AccessToken="B" * 1500), "pilot"))
+        with racing:
+            meta = self.mgr._get_token_meta(self.slot)
+        self.assertTrue(fired)
+        self.assertEqual(meta["AccessToken"], "B" * 1500)
+        self.assertTrue(meta["_is_valid"])
+
+    def test_idp_session_on_a_clear_vault_asks_for_nothing(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        newer = dict(self.meta, AccessToken="AT-NEW" + "b" * 2000, refresh_token="RT-NEW")
+        racing, fired = self.race("idp_AccessToken#", lambda: KineticConfigManager.__new__(
+            KineticConfigManager).touch_session(self.slot, dict(newer), "pilot"))
+        with racing, patch.object(sys.stdout, "isatty", return_value=True), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="") as ask:
+            meta = self.mgr._get_token_meta(self.slot)
+        self.assertTrue(fired)
+        ask.assert_not_called()
+        self.assertEqual((meta["AccessToken"], meta["refresh_token"]), (newer["AccessToken"], "RT-NEW"))
+        self.assertNotIn("_tokens_unreadable", meta)
 
 
 class TestVaultPromptMode(unittest.TestCase):
