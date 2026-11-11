@@ -72,6 +72,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - `scripts/sync-main.sh`: after a PR merges, fast-forwards the local `main` and the fork's `main` to
   `public/main` (stops if either has a commit that isn't there) and tags each merged `sync/<name>` PR as
   `synced/<name>` on the fork, at the PR head that was merged. The branch guard already pointed to it.
+  `--fork REMOTE` names the fork's remote (default `origin`) and `--branch NAME` the branch to bring up
+  (default `main`; only PRs merged into that branch are tagged); `--save` keeps the given values in the
+  clone's git config (`sync-main.fork`, `sync-main.branch`) as the defaults from then on.
 
 ### Changed
 - `analysis diff` reviews a diff larger than the budget **in chunks** instead of truncating it (before:
