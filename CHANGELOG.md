@@ -160,8 +160,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
   A typed vault passphrase is kept in memory until the command ends (said once; never stored);
   `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
-
-### Security
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.
@@ -172,7 +170,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   token without the permission read as "nothing found"). A guard that can't read its list (403, network error)
   now refuses promotion, as does a failed issue lookup for "Closes #N". Lists follow GitHub's `Link` pagination
   past the first 100 results.
-
 - GitHub workflows pin every action to a full commit SHA (the version in a comment) instead of a movable tag
   or branch: the PyPI publish job holds `id-token: write`, so a moved or compromised upstream ref could have
   published as kinetic-devops. Dependabot now updates the pins (`github-actions` ecosystem).
