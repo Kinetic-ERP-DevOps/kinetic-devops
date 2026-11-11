@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import json
 import os
 import socket
@@ -907,6 +908,72 @@ class TestEncryptedVaultIdpTokens(unittest.TestCase):
             self.mgr.encrypt_vault("pass-1")
         self.assertEqual(self.leaked(), [])
         self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+
+
+class TestVaultPromptMode(unittest.TestCase):
+    """A typed vault passphrase is kept until the command ends (--vault-prompt once, the default, said once on stderr)
+    or asked for each time (--vault-prompt every / KINETIC_VAULT_PROMPT=every)."""
+
+    def setUp(self):
+        self.kr = FakeKeyring()
+        servers = {"pilot": {"url": "https://pilot.example", "api_key": "K", "companies": "ACME", "sessions": []}}
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(servers, "pass-1"))
+        self.mgr = KineticConfigManager.__new__(KineticConfigManager)
+        env = {k: v for k, v in os.environ.items() if k not in ("KINETIC_VAULT_PASSPHRASE", "KINETIC_VAULT_PROMPT")}
+        self.patches = [patch.object(idp, "keyring", self.kr), patch.object(auth, "keyring", self.kr),
+                        patch.object(crypto, "encrypt_json", _fake_encrypt),
+                        patch.object(crypto, "decrypt_json", _fake_decrypt),
+                        patch.object(sys.stdout, "isatty", return_value=True),
+                        patch.dict(os.environ, env, clear=True)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def read_twice(self):
+        err = io.StringIO()
+        with patch("kinetic_devops.auth.getpass.getpass", return_value="pass-1") as ask, \
+             patch.object(sys, "stderr", err):
+            self.mgr._get_server_dict()
+            self.mgr._save_server_dict(self.mgr._get_server_dict())
+        return ask.call_count, err.getvalue()
+
+    def test_once_is_the_default_asks_once_and_says_so(self):
+        asked, err = self.read_twice()
+        self.assertEqual(asked, 1)
+        self.assertEqual(err.count("kept in memory until this command ends"), 1)
+        self.assertIn("--vault-prompt every", err)
+
+    def test_every_asks_each_time_and_keeps_nothing(self):
+        self.mgr.vault_prompt = "every"
+        asked, err = self.read_twice()
+        self.assertEqual(asked, 3)                      # two reads and the write's check
+        self.assertIsNone(getattr(self.mgr, "_vault_pass", None))
+        self.assertNotIn("kept in memory", err)
+
+    def test_every_from_the_environment(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PROMPT": "EVERY"}):
+            asked, _ = self.read_twice()
+        self.assertEqual(asked, 3)
+
+    def test_option_beats_the_environment(self):
+        self.mgr.vault_prompt = "once"
+        with patch.dict(os.environ, {"KINETIC_VAULT_PROMPT": "every"}):
+            asked, _ = self.read_twice()
+        self.assertEqual(asked, 1)
+
+    def test_passphrase_from_the_environment_is_not_announced(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            asked, err = self.read_twice()
+        self.assertEqual((asked, err), (0, ""))
+
+    def test_bad_mode_is_an_error(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PROMPT": "sometimes"}), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="pass-1"), \
+             self.assertRaisesRegex(RuntimeError, "once or every"):
+            self.mgr._get_server_dict()
 
 
 @unittest.skipUnless(native_checks_enabled(), "native check deferred (loads cryptography's native library)")

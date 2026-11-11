@@ -439,7 +439,7 @@ class KineticConfigManager(KineticCore):
                 servers = crypto.decrypt_json(raw, passphrase)
             except Exception as e:
                 raise RuntimeError(f"Failed to decrypt vault: {e}")
-            self._vault_pass = passphrase   # it opened the vault: don't ask again in this process
+            self._remember_vault_pass(passphrase)   # it opened the vault
             return servers
 
         # Legacy plain JSON fallback
@@ -454,13 +454,36 @@ class KineticConfigManager(KineticCore):
     # encrypted with the vault passphrase; writes go through _save_server_dict and _save_token_meta only. Reads
     # accept clear and encrypted entries alike, so vaults that were never encrypted keep working unchanged.
 
+    # How a typed vault passphrase is reused (--vault-prompt / KINETIC_VAULT_PROMPT): "once" keeps it in memory until
+    # the command ends (never stored; said once on stderr), "every" asks again whenever the vault is read or written.
+    # KINETIC_VAULT_PASSPHRASE, when set, is used either way.
+    VAULT_PROMPT_MODES = ("once", "every")
+
+    def _vault_prompt_mode(self) -> str:
+        mode = (getattr(self, "vault_prompt", None) or os.environ.get("KINETIC_VAULT_PROMPT") or "once").strip().lower()
+        if mode not in self.VAULT_PROMPT_MODES:
+            raise RuntimeError(f"KINETIC_VAULT_PROMPT / --vault-prompt must be once or every, not {mode!r}.")
+        return mode
+
+    def _remember_vault_pass(self, passphrase: str) -> None:
+        """Keep a passphrase that opened the vault for the rest of this process, unless --vault-prompt every."""
+        if self._vault_prompt_mode() == "every":
+            self._vault_pass = None
+            return
+        typed = passphrase != os.environ.get("KINETIC_VAULT_PASSPHRASE")
+        if typed and not getattr(self, "_vault_pass_noted", False):
+            print("🔐 Vault passphrase kept in memory until this command ends (never stored). To be asked every "
+                  "time: --vault-prompt every or KINETIC_VAULT_PROMPT=every.", file=sys.stderr)
+            self._vault_pass_noted = True
+        self._vault_pass = passphrase
+
     def _vault_pass_if_known(self) -> Optional[str]:
-        """The vault passphrase if it's at hand without asking (already used, or KINETIC_VAULT_PASSPHRASE)."""
+        """The vault passphrase if it's at hand without asking (kept from earlier, or KINETIC_VAULT_PASSPHRASE)."""
         return getattr(self, "_vault_pass", None) or os.environ.get("KINETIC_VAULT_PASSPHRASE") or None
 
     def _vault_passphrase(self) -> Optional[str]:
-        """The vault passphrase: one that already opened the vault in this process, else KINETIC_VAULT_PASSPHRASE,
-        else asked at a terminal. None if there is none of these."""
+        """The vault passphrase: one kept from earlier in this process (--vault-prompt once), else
+        KINETIC_VAULT_PASSPHRASE, else asked at a terminal. None if there is none of these."""
         passphrase = getattr(self, "_vault_pass", None) or os.environ.get("KINETIC_VAULT_PASSPHRASE")
         if not passphrase and sys.stdout.isatty():
             try:
@@ -488,7 +511,7 @@ class KineticConfigManager(KineticCore):
                 crypto.decrypt_json(raw, passphrase)
             except Exception:
                 raise RuntimeError("That passphrase doesn't open the vault; nothing was stored.") from None
-            self._vault_pass = passphrase
+            self._remember_vault_pass(passphrase)
         return passphrase
 
     def _seal(self, obj: Any, passphrase: Optional[str]) -> str:
@@ -540,7 +563,7 @@ class KineticConfigManager(KineticCore):
         except Exception as e:
             print(f"Failed to encrypt servers: {str(e) or 'wrong passphrase'}")
             sys.exit(1)
-        self._vault_pass = passphrase
+        self._remember_vault_pass(passphrase)
         failed = self._reseal_token_slots(servers, passphrase, passphrase)
         if failed:
             print(f"⚠️ {failed} session(s) couldn't be read and were left as they were; sign in to them again.")
@@ -635,7 +658,7 @@ class KineticConfigManager(KineticCore):
                 data = crypto.decrypt_json(raw_data, passphrase)
             except Exception:
                 return None
-            self._vault_pass = passphrase
+            self._remember_vault_pass(passphrase)
         else:
             try:
                 data = json.loads(raw_data)
@@ -2614,7 +2637,8 @@ def main():
         description=(
             "Kinetic Config Manager: store Epicor Kinetic environments (URL, API key, companies) in the\n"
             "OS keyring, mint and cache bearer tokens per user, and manage/repair those keyring records.\n"
-            "Set KINETIC_VAULT_PASSPHRASE to unlock an encrypted vault non-interactively."
+            "Set KINETIC_VAULT_PASSPHRASE to unlock an encrypted vault non-interactively. A typed vault\n"
+            "passphrase is kept in memory until the command ends; --vault-prompt every asks each time instead."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -2625,6 +2649,10 @@ def main():
             "  python -m kinetic_devops.auth <command> -h     # details for one command"
         ),
     )
+    parser.add_argument("--vault-prompt", choices=KineticConfigManager.VAULT_PROMPT_MODES, default=None,
+                        help="Encrypted vault: 'once' (default) keeps a typed passphrase in memory until the command "
+                             "ends, never stored; 'every' asks each time the vault is read or written. "
+                             "Default: KINETIC_VAULT_PROMPT, else once.")
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
     subparsers.add_parser(
@@ -2999,6 +3027,7 @@ def main():
     args = parser.parse_args()
     try:
         mgr = KineticConfigManager(debug=True)
+        mgr.vault_prompt = args.vault_prompt
         if args.command == "store": mgr.store()
         elif args.command == "list": mgr.list()
         elif args.command == "migrate": mgr.migrate()

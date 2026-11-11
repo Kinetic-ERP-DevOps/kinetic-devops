@@ -145,6 +145,8 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
   without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
+  A typed vault passphrase is kept in memory until the command ends (said once; never stored);
+  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
 
 
 ## [0.2.0.0a8] - 2026-11-01

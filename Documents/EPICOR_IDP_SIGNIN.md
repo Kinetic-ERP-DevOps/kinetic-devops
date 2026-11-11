@@ -133,4 +133,7 @@ terminal: without one it stops before the browser opens; pass ENV, `--user` and 
   (`auth encrypt-vault`) the tokens are encrypted with it too; run `encrypt-vault` again to encrypt IdP sessions
   that earlier versions stored in clear. The client ID is stored per IdP tenant under the keyring service
   `kinetic-idp`.
+- With the vault encrypted, a typed vault passphrase is kept in memory until the command ends (never stored), and
+  the tool says so once. To be asked every time it is needed instead: `auth --vault-prompt every <command>` or
+  `KINETIC_VAULT_PROMPT=every`. `KINETIC_VAULT_PASSPHRASE`, when set, is used either way.
 - The tool never prints tokens. Revoke a session from the IdP side (or let it expire) if a machine is lost.
