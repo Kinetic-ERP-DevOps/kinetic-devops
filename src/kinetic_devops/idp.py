@@ -28,7 +28,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
-from typing import Callable, Dict, Iterator, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 from kinetic_devops import _lazy_import, crypto
 
@@ -349,12 +349,20 @@ def session_meta(tok: Dict, settings: Dict[str, str], user_id: str, nickname: st
 # An IdP session (JWT access token + refresh token + metadata) is larger. So the slot's "current_token" entry
 # keeps the metadata only, marked "_idp_split", and the two tokens go to chunked side entries in the same slot.
 # Any session's "current_token" (a password session's whole token response, encrypted or not; encryption makes it
-# about 1.4x longer) that is still over the limit is chunked too: "current_token" then holds the chunk count and
-# the value is in "current_token#0", "current_token#1", ... (write_token_entry / read_token_entry).
+# about 1.4x longer) that is still over the limit is chunked too (write_token_entry / read_token_entry).
+#
+# A chunked value is written as a new generation: its chunks go to fresh entries "<name>#<gen>.<i>", then the entry
+# <name> is switched to the marker "chunks:<gen>:<n>", then the previous generation's chunks are deleted. One
+# set_password (the switch) changes which value is read, so a reader sees the old value or the new one, never a mix,
+# and a writer stopped part-way leaves the old value readable. The marker is neither JSON nor digits, so versions
+# that don't know it read the entry as missing (sign in again) instead of failing on it.
+# Also read: a bare chunk count "<n>" with chunks "<name>#<i>" (IdP side entries written before generations, and
+# an unreleased chunked "current_token"), and a single JSON "current_token".
 SECRET_FIELDS = ("AccessToken", "refresh_token")
 CHUNK_CHARS = 1000
 MAX_ENTRY_CHARS = 1280
 TOKEN_ENTRY = "current_token"
+CHUNK_MARKER = "chunks:"
 
 
 class UnreadableTokenError(ValueError):
@@ -365,25 +373,44 @@ def _side(field: str) -> str:
     return f"idp_{field}"
 
 
+def _chunk_names(name: str, marker: Optional[str]) -> Optional[List[str]]:
+    """Entry names holding the chunks a marker points to: "chunks:<gen>:<n>", or a bare legacy count "<n>".
+    None if the value is not a chunk marker."""
+    marker = marker or ""
+    if marker.isdigit():
+        return [f"{name}#{i}" for i in range(int(marker))]
+    if marker.startswith(CHUNK_MARKER):
+        gen, _, count = marker[len(CHUNK_MARKER):].partition(":")
+        if gen.isalnum() and count.isdigit():
+            return [f"{name}#{gen}.{i}" for i in range(int(count))]
+    return None
+
+
+def _delete_names(service: str, names: Optional[List[str]]) -> None:
+    for entry in names or ():
+        with contextlib.suppress(Exception):
+            keyring.delete_password(service, entry)
+
+
 def _put_chunked(service: str, name: str, value: str) -> None:
-    old = keyring.get_password(service, name) or ""
+    """Store value in chunks as a new generation (see above): the old or the new value is readable at every step."""
+    old = keyring.get_password(service, name)
+    gen = secrets.token_hex(4)
     chunks = [value[i:i + CHUNK_CHARS] for i in range(0, len(value), CHUNK_CHARS)] or [""]
     for i, part in enumerate(chunks):
-        keyring.set_password(service, f"{name}#{i}", part)
-    keyring.set_password(service, name, str(len(chunks)))
-    for i in range(len(chunks), int(old) if old.isdigit() else 0):
-        with contextlib.suppress(Exception):
-            keyring.delete_password(service, f"{name}#{i}")
+        keyring.set_password(service, f"{name}#{gen}.{i}", part)
+    keyring.set_password(service, name, f"{CHUNK_MARKER}{gen}:{len(chunks)}")   # the switch
+    _delete_names(service, _chunk_names(name, old))
 
 
 def _get_chunked(service: str, name: str, strict: bool = False) -> str:
-    """The chunked value, or "" if there is none. strict: a count whose chunks aren't all there raises."""
-    count = keyring.get_password(service, name) or ""
-    if not count.isdigit():
+    """The chunked value, or "" if there is none. strict: no marker, or a chunk that isn't there, raises."""
+    names = _chunk_names(name, keyring.get_password(service, name))
+    if names is None:
         if strict:
             raise UnreadableTokenError(f"{name}: not there")
         return ""
-    parts = [keyring.get_password(service, f"{name}#{i}") for i in range(int(count))]
+    parts = [keyring.get_password(service, entry) for entry in names]
     if any(p is None for p in parts):
         if strict:
             raise UnreadableTokenError(f"{name}: a chunk is missing")
@@ -392,43 +419,27 @@ def _get_chunked(service: str, name: str, strict: bool = False) -> str:
 
 
 def _delete_chunked(service: str, name: str) -> None:
-    count = keyring.get_password(service, name) or ""
-    for i in range(int(count) if count.isdigit() else 0):
-        with contextlib.suppress(Exception):
-            keyring.delete_password(service, f"{name}#{i}")
+    _delete_names(service, _chunk_names(name, keyring.get_password(service, name)))
     with contextlib.suppress(Exception):
         keyring.delete_password(service, name)
 
 
-def _delete_chunks_from(service: str, name: str, start: int = 0) -> None:
-    """Delete name#start, name#start+1, ... up to the first one that isn't there (chunks are contiguous)."""
-    i = start
-    while keyring.get_password(service, f"{name}#{i}") is not None:
-        with contextlib.suppress(Exception):
-            keyring.delete_password(service, f"{name}#{i}")
-        i += 1
-
-
 def write_token_entry(slot: str, value: str) -> None:
-    """Store a slot's "current_token" value (already sealed): as is when it fits the keyring limit, else chunked.
-
-    Going from chunked to single, the single value is written first and the old chunks are removed after, so a
-    reader never finds a chunk count without its chunks.
-    """
+    """Store a slot's "current_token" value (already sealed): as one entry when it fits the keyring limit (a single,
+    atomic write), else as a new chunk generation. The chunks of the value it replaces are removed afterwards."""
     if len(value) > MAX_ENTRY_CHARS:
         _put_chunked(slot, TOKEN_ENTRY, value)
         return
+    old = keyring.get_password(slot, TOKEN_ENTRY)
     keyring.set_password(slot, TOKEN_ENTRY, value)
-    _delete_chunks_from(slot, TOKEN_ENTRY)
+    _delete_names(slot, _chunk_names(TOKEN_ENTRY, old))
 
 
 def read_token_entry(slot: str) -> Optional[str]:
-    """A slot's "current_token" value in either form (single entry, or a chunk count plus chunks); None if absent.
-
-    A stored value is JSON (an object, or an encrypted blob), never just digits, so digits mean a chunk count.
-    """
+    """A slot's "current_token" value in any form it is stored in (one JSON entry, a chunk generation, or a legacy
+    chunk count); None if it is absent or a chunk is missing."""
     raw = keyring.get_password(slot, TOKEN_ENTRY)
-    if raw and raw.isdigit():
+    if _chunk_names(TOKEN_ENTRY, raw) is not None:
         return _get_chunked(slot, TOKEN_ENTRY) or None
     return raw
 
@@ -444,7 +455,8 @@ def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
     for field in SECRET_FIELDS:
         value = str(meta.get(field) or "")
         _put_chunked(slot, _side(field), crypto.encrypt_json(value, passphrase) if passphrase else value)
-    stub = {k: v for k, v in meta.items() if k not in SECRET_FIELDS and k not in ("_is_valid", "_remaining")}
+    stub = {k: v for k, v in meta.items()
+            if k not in SECRET_FIELDS and k not in ("_is_valid", "_remaining", "_tokens_unreadable")}
     stub["_idp_split"] = True
     return stub
 
@@ -452,13 +464,18 @@ def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
 def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool = False) -> Dict:
     """Inverse of pack (no-op for other sessions). Reads clear and encrypted side entries alike.
 
-    An encrypted token that can't be decrypted (no passphrase, or a wrong one) reads as missing, like an encrypted
-    "current_token" does: the session then needs a new sign-in. strict (for re-encrypting the vault): that, or a
-    missing chunk, raises UnreadableTokenError instead, so the caller can leave the slot as it is.
+    An encrypted token that can't be decrypted (no passphrase, or a wrong one) or one with a missing chunk reads as
+    "" and sets "_tokens_unreadable": the session then needs a new sign-in, and its token material must not be saved
+    back (that would store the empty strings over the real tokens). strict (for re-encrypting the vault): raises
+    UnreadableTokenError instead, so the caller can leave the slot as it is.
     """
     if data.get("_idp_split"):
+        data.pop("_tokens_unreadable", None)
         for field in SECRET_FIELDS:
-            value = _get_chunked(slot, _side(field), strict=strict)
+            entry = _side(field)
+            value = _get_chunked(slot, entry, strict=strict)
+            if not value and _chunk_names(entry, keyring.get_password(slot, entry)):
+                data["_tokens_unreadable"] = True   # a marker whose chunks aren't all there
             if crypto.is_encrypted_blob(value):
                 try:
                     if not passphrase:
@@ -468,6 +485,7 @@ def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool
                     if strict:
                         raise UnreadableTokenError(f"{field}: can't be decrypted") from exc
                     value = ""
+                    data["_tokens_unreadable"] = True
             data[field] = value
     return data
 
@@ -475,25 +493,29 @@ def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool
 def delete_secrets(slot: str) -> None:
     """Remove a slot's side entries: an IdP session's tokens, and the chunks of a chunked "current_token".
 
-    Call wherever a slot's "current_token" is deleted, before or after it (the chunks are found without the count).
+    Call it before deleting the slot's "current_token": those chunks are found through the marker in it (legacy
+    numbered chunks are found without it too).
     """
     for field in SECRET_FIELDS:
         _delete_chunked(slot, _side(field))
-    _delete_chunks_from(slot, TOKEN_ENTRY)
+    _delete_names(slot, _chunk_names(TOKEN_ENTRY, keyring.get_password(slot, TOKEN_ENTRY)))
+    i = 0
+    while keyring.get_password(slot, f"{TOKEN_ENTRY}#{i}") is not None:   # legacy numbered chunks
+        _delete_names(slot, [f"{TOKEN_ENTRY}#{i}"])
+        i += 1
 
 
 def move_secrets(old_slot: str, new_slot: str) -> None:
     """Copy a slot's side entries (IdP tokens, "current_token" chunks) to new_slot. The caller copies
-    "current_token" itself after this, so new_slot never has a chunk count without its chunks."""
+    "current_token" itself after this, so new_slot never has a marker without its chunks."""
     for field in SECRET_FIELDS:
         value = _get_chunked(old_slot, _side(field))
         if value:
             _put_chunked(new_slot, _side(field), value)
-    count = keyring.get_password(old_slot, TOKEN_ENTRY) or ""
-    for i in range(int(count) if count.isdigit() else 0):
-        part = keyring.get_password(old_slot, f"{TOKEN_ENTRY}#{i}")
+    for entry in _chunk_names(TOKEN_ENTRY, keyring.get_password(old_slot, TOKEN_ENTRY)) or ():
+        part = keyring.get_password(old_slot, entry)
         if part is not None:
-            keyring.set_password(new_slot, f"{TOKEN_ENTRY}#{i}", part)
+            keyring.set_password(new_slot, entry, part)
 
 
 def lock_dir() -> str:
@@ -638,7 +660,7 @@ def refresh_session(meta: Dict, reread: Callable[[], Optional[Dict]], store: Cal
                 store(dropped)
             return None
         updated = dict(current)
-        for k in ("_is_valid", "_remaining"):
+        for k in ("_is_valid", "_remaining", "_tokens_unreadable"):   # both tokens are new: nothing unread is saved
             updated.pop(k, None)
         now = time.time()
         updated.update(AccessToken=tok["access_token"], expires_in=int(tok.get("expires_in") or 3600),

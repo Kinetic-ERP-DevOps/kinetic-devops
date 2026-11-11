@@ -806,7 +806,8 @@ class TestSlotStorage(unittest.TestCase):
         idp.pack("slot", {"auth_method": "idp", "AccessToken": "a" * 3000, "refresh_token": "r"})
         idp.pack("slot", {"auth_method": "idp", "AccessToken": "b" * 10, "refresh_token": "r"})
         self.assertEqual(idp.unpack("slot", {"_idp_split": True})["AccessToken"], "b" * 10)
-        self.assertNotIn(("slot", "idp_AccessToken#2"), self.kr.store)
+        self.assertEqual([n for (_, n) in self.kr.store if n.startswith("idp_AccessToken#")],
+                         idp._chunk_names("idp_AccessToken", self.kr.get_password("slot", "idp_AccessToken")))
 
     def test_delete_and_move_secrets(self):
         idp.pack("old", {"auth_method": "idp", "AccessToken": "a" * 1500, "refresh_token": "r"})
@@ -940,7 +941,7 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
         self.encrypted_vault()
         stub = idp.pack(self.slot, dict(self.meta))   # side entries in clear
         self.kr.set_password(self.slot, "current_token", _fake_encrypt(stub, "pass-1"))
-        self.assertIn("idp_refresh_token#0", self.leaked())
+        self.assertTrue([n for n in self.leaked() if n.startswith("idp_refresh_token#")])
         with patch("builtins.print"):
             self.mgr.encrypt_vault("pass-1")
         self.assertEqual(self.leaked(), [])
@@ -963,11 +964,13 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
     def test_encrypt_vault_counts_a_missing_chunk_and_leaves_the_slot(self):
         self.encrypted_vault()
         self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
-        self.kr.delete_password(self.slot, "idp_AccessToken#1")
+        self.kr.delete_password(self.slot, idp._chunk_names("idp_AccessToken",
+                                                            self.kr.get_password(self.slot, "idp_AccessToken"))[1])
+        before = {k: v for k, v in self.kr.store.items() if k[0] == self.slot}
         with patch("builtins.print") as printed:
             self.mgr.encrypt_vault("pass-1")
         self.assertIn("1 session(s)", " ".join(str(c.args[0]) for c in printed.call_args_list))
-        self.assertIsNotNone(self.kr.get_password(self.slot, "idp_refresh_token#0"))
+        self.assertEqual({k: v for k, v in self.kr.store.items() if k[0] == self.slot}, before)
 
     def test_session_whose_token_cant_be_decrypted_is_not_valid(self):
         """_get_token_meta returned _is_valid True with an empty AccessToken when a side entry didn't decrypt."""
@@ -1109,7 +1112,7 @@ class TestPasswordSessionChunking(VaultFixture):
         self.assertGreater(len(_fake_encrypt(self.pw, "pass-1")), 1280)   # would not fit in one entry
         self.encrypted_vault()
         self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
-        self.assertTrue(self.kr.get_password(self.slot, "current_token").isdigit())
+        self.assertTrue(self.kr.get_password(self.slot, "current_token").startswith("chunks:"))
         self.assertEqual(self.leaked(), [])
         self.check_round_trip()
 
@@ -1125,7 +1128,7 @@ class TestPasswordSessionChunking(VaultFixture):
         self.jwt = self.pw["AccessToken"] = _jwt(1500)
         self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
         self.mgr.touch_session(self.slot, dict(self.pw), "pilot")
-        self.assertTrue(self.kr.get_password(self.slot, "current_token").isdigit())
+        self.assertTrue(self.kr.get_password(self.slot, "current_token").startswith("chunks:"))
         self.check_round_trip()
 
     def test_old_single_entry_form_still_reads(self):
@@ -1146,7 +1149,7 @@ class TestPasswordSessionChunking(VaultFixture):
         self.mgr.touch_session(self.slot, dict(self.pw), "pilot")   # clear: one entry
         with patch("builtins.print"):
             self.mgr.encrypt_vault("pass-1")
-        self.assertTrue(self.kr.get_password(self.slot, "current_token").isdigit())
+        self.assertTrue(self.kr.get_password(self.slot, "current_token").startswith("chunks:"))
         self.assertEqual(self.leaked(), [])
         self.check_round_trip()
         with patch("builtins.print"):
@@ -1160,7 +1163,7 @@ class TestPasswordSessionChunking(VaultFixture):
         self.mgr.rename("pilot", "pilot2")
         new_slot = self.mgr._get_token_key("pilot2", "alice", "API-KEY-SECRET")
         self.assertEqual(self.entries(), {})
-        self.assertTrue(self.kr.get_password(new_slot, "current_token").isdigit())
+        self.assertTrue(self.kr.get_password(new_slot, "current_token").startswith("chunks:"))
         self.check_round_trip(new_slot)
 
     def test_logout_removes_the_chunks(self):
@@ -1178,6 +1181,171 @@ class TestPasswordSessionChunking(VaultFixture):
         report = " ".join(str(a) for c in printed.call_args_list for a in c.args)
         self.assertNotIn("removed", report)
         self.assertNotIn("missing AccessToken", report)
+
+
+class InterruptingKeyring(FakeKeyring):
+    """FakeKeyring that runs hook(service, user) after every write, or raises on the write it names."""
+
+    def __init__(self):
+        super().__init__()
+        self.hook = None
+        self.fail_on = None
+
+    def set_password(self, service, user, value):
+        if self.fail_on and self.fail_on(service, user):
+            raise OSError("killed")
+        super().set_password(service, user, value)
+        if self.hook:
+            self.hook(service, user)
+
+
+class TestChunkedWritesAreNeverTorn(unittest.TestCase):
+    """Review finding: a chunked value that stayed chunked was overwritten in place (chunks first, then the count),
+    so a reader between two chunk writes got a mix (unreadable), and a writer stopped after the first chunk left the
+    slot unreadable for good. Each chunked write is now a new generation, switched to by one write."""
+
+    OLD, NEW = "o" * 2500, "n" * 2600   # both over the limit: chunked, three chunks each
+
+    def setUp(self):
+        self.kr = InterruptingKeyring()
+        self.patch = patch.object(idp, "keyring", self.kr)
+        self.patch.start()
+        idp.write_token_entry("slot", self.OLD)
+
+    def tearDown(self):
+        self.patch.stop()
+
+    def test_a_reader_between_any_two_writes_sees_the_old_or_the_new_value(self):
+        seen = []
+        self.kr.hook = lambda service, user: seen.append(idp.read_token_entry("slot"))
+        idp.write_token_entry("slot", self.NEW)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen) - {self.OLD, self.NEW}, set())
+        self.assertEqual(idp.read_token_entry("slot"), self.NEW)
+
+    def test_a_reader_during_the_old_chunks_clean_up_sees_the_new_value(self):
+        seen = []
+        real_delete = self.kr.delete_password
+
+        def delete(service, user):
+            real_delete(service, user)
+            seen.append(idp.read_token_entry("slot"))
+        with patch.object(self.kr, "delete_password", side_effect=delete):
+            idp.write_token_entry("slot", self.NEW)
+        self.assertEqual(set(seen), {self.NEW})
+
+    def test_a_write_stopped_after_its_first_chunk_leaves_the_old_value(self):
+        written = []
+
+        def fail(service, user):
+            written.append(user)
+            return len(written) == 2   # the first new chunk went in; the second write fails
+        self.kr.fail_on = fail
+        with self.assertRaises(OSError):
+            idp.write_token_entry("slot", self.NEW)
+        self.assertEqual(idp.read_token_entry("slot"), self.OLD)
+
+    def test_going_to_one_entry_is_one_write_and_drops_the_chunks(self):
+        seen = []
+        self.kr.hook = lambda service, user: seen.append(idp.read_token_entry("slot"))
+        idp.write_token_entry("slot", '{"AccessToken": "short"}')
+        self.assertEqual(seen, ['{"AccessToken": "short"}'])
+        self.assertEqual(list(self.kr.store), [("slot", "current_token")])
+
+    def test_idp_side_entries_are_written_as_generations_too(self):
+        idp.pack("slot", {"auth_method": "idp", "AccessToken": self.OLD, "refresh_token": "r"})
+        seen = []
+        self.kr.hook = lambda service, user: seen.append(idp._get_chunked("slot", "idp_AccessToken"))
+        idp.pack("slot", {"auth_method": "idp", "AccessToken": self.NEW, "refresh_token": "r"})
+        self.assertEqual(set(seen) - {self.OLD, self.NEW}, set())
+
+    def test_marker_is_neither_json_nor_digits(self):
+        marker = self.kr.get_password("slot", "current_token")
+        self.assertRegex(marker, r"^chunks:[0-9a-f]+:3$")
+        with self.assertRaises(ValueError):
+            json.loads(marker)   # older versions read the entry as missing, instead of failing on an int
+
+    def test_earlier_forms_still_read_and_are_cleaned_up(self):
+        kr = FakeKeyring()
+        with patch.object(idp, "keyring", kr):
+            # a bare count with numbered chunks (IdP side entries before generations; this branch's first chunking)
+            kr.set_password("s", "current_token", "2")
+            kr.set_password("s", "current_token#0", '{"AccessToken": ')
+            kr.set_password("s", "current_token#1", '"legacy"}')
+            kr.set_password("s", "idp_AccessToken", "1")
+            kr.set_password("s", "idp_AccessToken#0", "AT-LEGACY")
+            self.assertEqual(idp.read_token_entry("s"), '{"AccessToken": "legacy"}')
+            self.assertEqual(idp.unpack("s", {"_idp_split": True})["AccessToken"], "AT-LEGACY")
+            idp.write_token_entry("s", "x" * 1500)
+            idp.pack("s", {"auth_method": "idp", "AccessToken": "AT-NEW", "refresh_token": "r"})
+            self.assertNotIn(("s", "current_token#0"), kr.store)
+            self.assertNotIn(("s", "idp_AccessToken#0"), kr.store)
+            self.assertEqual(idp.read_token_entry("s"), "x" * 1500)
+            idp.delete_secrets("s")
+            kr.delete_password("s", "current_token")
+            self.assertEqual(kr.store, {})
+
+
+class TestUnreadableTokensAreNeverSaved(VaultFixture):
+    """Review finding: an IdP session whose side entries didn't decrypt read as AccessToken/refresh_token "", and
+    set_current_company / touch_from_headers saved that, encrypting the empty strings over the real tokens."""
+
+    def half_encrypted_slot(self):
+        """A clear stub with encrypted side entries, as an interrupted encrypt-vault can leave it."""
+        self.encrypted_vault()
+        stub = idp.pack(self.slot, dict(self.meta), "pass-1")
+        idp.write_token_entry(self.slot, json.dumps(stub))
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        self.mgr._vault_pass = None
+        self.mgr.vault_prompt = "every"
+
+    def tokens(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            meta = self.mgr._get_token_meta(self.slot)
+        return meta["AccessToken"], meta["refresh_token"]
+
+    def test_the_passphrase_is_asked_for_encrypted_side_entries_under_a_clear_stub(self):
+        self.half_encrypted_slot()
+        with patch.object(sys.stdout, "isatty", return_value=True), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="pass-1") as ask:
+            meta = self.mgr._get_token_meta(self.slot)
+        ask.assert_called_once()
+        self.assertEqual(meta["refresh_token"], "RT-SECRET")
+        self.assertNotIn("_tokens_unreadable", meta)
+
+    def test_set_current_company_doesnt_save_tokens_it_couldnt_read(self):
+        self.half_encrypted_slot()
+        before = self.tokens()
+        with patch.object(sys.stdout, "isatty", return_value=True), patch("builtins.print"), \
+             patch("kinetic_devops.auth.getpass.getpass", side_effect=["pass-1", "typo"]):
+            self.mgr.set_current_company("pilot", "alice", "BETA")
+        self.assertEqual(self.tokens(), before)
+
+    def test_save_refuses_a_meta_whose_tokens_didnt_read(self):
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        with self.assertRaisesRegex(auth.VaultError, "couldn't be decrypted"):
+            self.mgr._save_token_meta(self.slot, dict(self.meta, AccessToken="", _tokens_unreadable=True))
+        self.assertEqual(self.tokens(), (self.meta["AccessToken"], "RT-SECRET"))
+
+    def test_touch_from_headers_skips_a_session_whose_tokens_didnt_read(self):
+        unreadable = dict(self.meta, refresh_token="", _tokens_unreadable=True)
+        with patch.object(self.mgr, "get_session_by_bearer", return_value=("pilot", "alice")), \
+             patch.object(self.mgr, "_get_api_key", return_value="API-KEY-SECRET"), \
+             patch.object(self.mgr, "_get_token_meta", return_value=unreadable), \
+             patch.object(self.mgr, "touch_session") as touch:
+            self.mgr.touch_from_headers({"Authorization": "Bearer AT", "X-Epicor-Company": "BETA"})
+        touch.assert_not_called()
+
+    def test_refresh_saves_new_tokens_over_an_unreadable_access_token(self):
+        stored = []
+        meta = {"AccessToken": "", "refresh_token": "RT1", "idp_tenant": "42", "idp_token_endpoint": SETTINGS["token"],
+                "_is_valid": False, "_tokens_unreadable": True}
+        req = MagicMock()
+        req.post.return_value = _resp({"access_token": "NEW", "refresh_token": "RT2", "expires_in": 3600})
+        with patch.object(idp, "requests", req), patch.object(idp, "get_client_id", return_value="cid"):
+            idp.refresh_session(meta, reread=lambda: dict(meta), store=stored.append, slot=f"s-{time.time()}")
+        self.assertNotIn("_tokens_unreadable", stored[-1])
 
 
 class TestVaultPromptMode(unittest.TestCase):
@@ -1282,7 +1450,7 @@ class TestEncryptedVaultIdpTokensNative(unittest.TestCase):
             raise
         except RuntimeError as exc:   # cryptography not installed, or not loadable
             self.skipTest(f"vault encryption unavailable: {exc}")
-        self.assertTrue(kr.get_password("slot", "current_token").isdigit())
+        self.assertTrue(kr.get_password("slot", "current_token").startswith("chunks:"))
         self.assertEqual(back["AccessToken"], meta["AccessToken"])
         self.assertFalse([k for k, v in kr.store.items() if meta["AccessToken"][100:160] in v])
 
