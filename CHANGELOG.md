@@ -37,7 +37,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
   `idp-login` asks for what isn't passed when run at a terminal: the environment (from the configured list), the
   Epicor User ID (an existing session, or a new ID with the IdP sign-in name offered) and the company; without a
-  terminal a missing environment or user stops before the browser opens.
+  terminal a missing environment or user stops before the browser opens. `idp-login --new-session` reuses nothing
+  from before: it doesn't offer the existing sessions or `KIN_USER` (it asks for the User ID and company) and
+  sends `prompt=login`, so the IdP asks for the sign-in again instead of reusing the browser's; it needs a terminal.
   Hardened before release: https-only remote endpoints with certificate checks (the loopback redirect stays http,
   RFC 8252); the discovery issuer must be the endpoint Kinetic names, with the authorize and token endpoints on its
   host; the callback takes only the first response with the right `state` and checks `Host` and `iss` (RFC 9207);
@@ -141,8 +143,23 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
+- IdP: a network error or malformed JSON during a token request (e.g. a refresh with the network down) was a
+  traceback; it now takes the "sign in again" path.
+- IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
+  the new holder's lock, so two processes could use the same rotating refresh token. The lock is now an OS file
+  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale.
+- `auth` session resolution raised `IndexError` when no company was given and the environment had none
+  configured; it now raises `SessionResolutionError` saying to pass `--co`.
 
 ### Security
+- With the vault encrypted (`encrypt-vault`), IdP access and refresh tokens were stored in clear in the
+  keyring's `idp_*` side entries, and every sign-in or refresh rewrote the session's `current_token` (and the
+  servers map, when it registered a user) as plain JSON, undoing the encryption. All writes of token material
+  and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
+  without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
+  now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
+  A typed vault passphrase is kept in memory until the command ends (said once; never stored);
+  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.
@@ -153,7 +170,6 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   token without the permission read as "nothing found"). A guard that can't read its list (403, network error)
   now refuses promotion, as does a failed issue lookup for "Closes #N". Lists follow GitHub's `Link` pagination
   past the first 100 results.
-
 - GitHub workflows pin every action to a full commit SHA (the version in a comment) instead of a movable tag
   or branch: the PyPI publish job holds `id-token: write`, so a moved or compromised upstream ref could have
   published as kinetic-devops. Dependabot now updates the pins (`github-actions` ecosystem).
