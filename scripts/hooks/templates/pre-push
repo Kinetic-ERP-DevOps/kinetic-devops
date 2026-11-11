@@ -6,10 +6,16 @@
 REFS="$(cat)"
 
 # Local branch guard (always on): main only as exactly public/main, never to public;
-# dev never pushed. See branch-guard.sh next to this hook.
+# dev never pushed. See branch-guard.sh next to this hook. Fails closed: a missing guard
+# refuses the push (KINETIC_ALLOW_MAIN=1 skips it once).
 GUARD="$(git rev-parse --git-path hooks)/branch-guard.sh"
 if [ -f "$GUARD" ]; then
     printf '%s\n' "$REFS" | sh "$GUARD" push "$1" "$2" || exit 1
+elif [ "$KINETIC_ALLOW_MAIN" != "1" ]; then
+    echo "pre-push: REFUSED: the branch guard is not installed ($GUARD)." >&2
+    echo "pre-push: reinstall the hooks: sh scripts/install-hook.sh (or scripts/install-hook.ps1)." >&2
+    echo "pre-push: (deliberate repair only: KINETIC_ALLOW_MAIN=1 skips this guard once)" >&2
+    exit 1
 fi
 
 # Windows Sandbox check (opt-in).
@@ -44,7 +50,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     case " $TESTED " in *" $local_sha "*) continue ;; esac
     TESTED="$TESTED $local_sha"
     if grep -qx "$local_sha" "$(git rev-parse --git-path kinetic-sandbox-passed)" 2>/dev/null; then
-        echo "pre-push: $local_sha already passed the Windows Sandbox test."
+    echo "pre-push: $local_sha already passed the Windows Sandbox test."
         continue
     fi
     echo "pre-push: Windows Sandbox test of $local_ref ($local_sha)..."
@@ -58,9 +64,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     )
     status=$?
     if [ $status -eq 2 ]; then
-        echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2
+    echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2
     elif [ $status -ne 0 ]; then
-        echo "pre-push: Windows Sandbox test failed; push aborted. (Skip once with --no-verify.)" >&2
+    echo "pre-push: Windows Sandbox test failed; push aborted. (Skip once with --no-verify.)" >&2
         exit 1
     fi
 done <<EOF

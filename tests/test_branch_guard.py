@@ -106,6 +106,32 @@ class TestBranchGuard(unittest.TestCase):
         self.assertRefused(self.run_in_repo(["git", "push", "origin", "feat/x:dev"]), "dev is local scratch")
         self.assertAllowed(self.run_in_repo(["git", "push", "-q", "origin", "feat/x"]))
 
+    def test_commit_on_main_during_a_rebase_is_refused(self):
+        # A rebase detaches HEAD; the guard reads the branch from rebase-merge/head-name.
+        env = {**self.env, "GIT_SEQUENCE_EDITOR": "sh -c 'printf \"break\\n\" > \"$1\"' -"}
+        self.addCleanup(self.run_in_repo, ["git", "rebase", "--abort"])
+        self.assertAllowed(self.run_in_repo(["git", "rebase", "-i", "HEAD"], env=env))
+        self.assertEqual(self.run_in_repo(["git", "symbolic-ref", "-q", "HEAD"]).returncode, 1)
+        self.assertRefused(self.run_in_repo(["git", "commit", "--allow-empty", "-m", "during rebase"]),
+                           "no commits on main")
+
+    def test_missing_guard_fails_closed(self):
+        guard = self.hooks / "branch-guard.sh"
+        moved = self.hooks / "branch-guard.sh.moved"
+        guard.rename(moved)
+        self.addCleanup(moved.rename, guard)
+        missing = "branch guard is not installed"
+        self.assertRefused(self.run_in_repo(["git", "commit", "--allow-empty", "-m", "unguarded"]), missing)
+        self.assertRefused(self.run_in_repo(["git", "push", "origin", "feat/x"]), missing)
+        result = self.run_in_repo(["git", "merge", "--no-ff", "-m", "merge feat/x", "feat/x"])
+        self.run_in_repo(["git", "merge", "--abort"])
+        self.assertRefused(result, missing)
+        self.assertIn("install-hook.sh", result.stderr)
+        self.assertEqual(self._git_out("rev-parse", "main"), self.main)
+        # The escape hatch still works without the guard (pre-push goes on to the sandbox check, off here).
+        env = {**self.env, "KINETIC_ALLOW_MAIN": "1"}
+        self.assertAllowed(self.run_in_repo(["git", "push", "-q", "origin", "feat/x"], env=env))
+
     # --- push rules, by calling the guard as pre-push does ---
 
     def test_main_goes_to_origin_only_as_exactly_public_main(self):

@@ -128,6 +128,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   password prompt now raises a `RuntimeError` naming `python -m kinetic_devops.auth renew <env>`
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
+- The branch guard hooks (pre-commit, pre-merge-commit, pre-push) skipped the guard silently when
+  `branch-guard.sh` was missing; they now refuse and say how to reinstall (`KINETIC_ALLOW_MAIN=1` still skips
+  once). Commits on `main` during a rebase (detached HEAD) are now refused too: the guard reads the branch from
+  `rebase-merge/head-name` / `rebase-apply/head-name`. Re-run `scripts/install-hook.sh` to pick this up.
 
 ### Security
 - Repo host detection (`repo_context`, branch protection, repo maker) took the host from the URL's netloc, so

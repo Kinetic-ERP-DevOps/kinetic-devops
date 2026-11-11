@@ -27,6 +27,17 @@ refuse() {
 case "$1" in
 commit)
     branch="$(git symbolic-ref --short -q HEAD)"
+    # During a rebase HEAD is detached; the branch being rebased is in head-name
+    # ("refs/heads/<name>", or "detached HEAD"). --git-path finds it in worktrees too.
+    if [ -z "$branch" ]; then
+        for state in rebase-merge rebase-apply; do
+            head_name="$(git rev-parse --git-path "$state/head-name")"
+            if [ -f "$head_name" ]; then
+                branch="$(sed -n '1s|^refs/heads/||p' "$head_name")"
+                break
+            fi
+        done
+    fi
     if [ "$branch" = "main" ]; then
         refuse "no commits on main. main moves only to public/main via scripts/sync-main.sh;" \
                "commit on a feature branch, or merge into dev to try branches together."
