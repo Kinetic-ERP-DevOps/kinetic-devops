@@ -357,8 +357,12 @@ def session_meta(tok: Dict, settings: Dict[str, str], user_id: str, nickname: st
 #   the marker "chunks:<gen>:<n>" (the commit point), then the old generation is deleted.
 # - An IdP session's tokens go to fresh entries "idp_<field>#<gen>.<i>", which the stub names in "_idp_gens"
 #   ({field: "chunks:<gen>:<n>"}); writing the stub is the commit point, then the generations the old stub used
-#   are deleted. "idp_gens" (in clear: names and counts only, no secrets) lists the generations that may exist, so
-#   they can be found for clean-up, rename and logout without decrypting the stub. It is written before any chunk.
+#   are deleted.
+# The index "idp_gens" (in clear: entry names and counts only, no secrets) lists every chunk generation of the slot
+# that may exist, "current_token"'s included; a generation is listed before any of its chunks is written. So
+# clean-up, rename and logout find them all without decrypting the stub, including what a crash left behind.
+# Every write, logout and rename of a slot holds the slot's lock (slot_lock, reentrant within a thread), so writers
+# never interleave: no writer deletes another's generation in flight, and the index has no lost updates.
 # The marker is neither JSON nor digits, so versions that don't know it read the entry as missing (sign in again)
 # instead of failing on it. Also read: a bare chunk count "<n>" with chunks "<name>#<i>" (per-field "idp_<field>"
 # entries of IdP sessions stored before "_idp_gens"; an unreleased chunked "current_token"), and a single JSON entry.
@@ -464,14 +468,25 @@ def _get_chunked(service: str, name: str, strict: bool = False) -> str:
 
 def write_token_entry(slot: str, value: str) -> None:
     """Store a slot's "current_token" value (already sealed): as one entry when it fits the keyring limit (a single,
-    atomic write), else as a new chunk generation switched to by one write. The value it replaces is removed after."""
-    old = keyring.get_password(slot, TOKEN_ENTRY)
-    if len(value) > MAX_ENTRY_CHARS:
-        marker = _write_chunks(slot, TOKEN_ENTRY, _split(value), _new_gen([old]))
-        keyring.set_password(slot, TOKEN_ENTRY, marker)   # the commit point
-    else:
-        keyring.set_password(slot, TOKEN_ENTRY, value)    # the commit point
-    _delete_names(slot, _chunk_names(TOKEN_ENTRY, old))
+    atomic write), else as a new chunk generation (listed in the index before its chunks are written) switched to by
+    one write. The chunks of the value it replaces are removed after the switch. Holds the slot's lock."""
+    with slot_lock(slot):
+        old = keyring.get_password(slot, TOKEN_ENTRY)
+        listed = _read_gens(slot)
+        if len(value) > MAX_ENTRY_CHARS:
+            chunks = _split(value)
+            gen = _new_gen([old] + [m for _, m in listed])
+            marker = f"{CHUNK_MARKER}{gen}:{len(chunks)}"
+            listed.append([TOKEN_ENTRY, marker])
+            _write_gens(slot, listed)                         # before any chunk: a crash leaves nothing unlisted
+            _write_chunks(slot, TOKEN_ENTRY, chunks, gen)
+            keyring.set_password(slot, TOKEN_ENTRY, marker)   # the commit point
+        else:
+            keyring.set_password(slot, TOKEN_ENTRY, value)    # the commit point
+        old_names = _chunk_names(TOKEN_ENTRY, old)
+        _delete_names(slot, old_names)
+        if old_names and [TOKEN_ENTRY, old] in listed:
+            _write_gens(slot, [item for item in listed if item != [TOKEN_ENTRY, old]])
 
 
 def read_token_entry(slot: str) -> Optional[str]:
@@ -483,13 +498,28 @@ def read_token_entry(slot: str) -> Optional[str]:
     return raw
 
 
+MAX_INDEX = 64
+
+
+def _indexable(entry: str) -> bool:
+    return entry in (TOKEN_ENTRY,) + tuple(_side(f) for f in SECRET_FIELDS)
+
+
 def _read_gens(slot: str) -> List[List[str]]:
-    """The [entry, marker] pairs listed in "idp_gens" (side-entry generations that may exist)."""
+    """The [entry, marker] pairs listed in the index ("idp_gens"): every chunk generation of the slot that may exist.
+    Anything malformed in it is ignored (and dropped at the next write)."""
     try:
         items = json.loads(keyring.get_password(slot, GENS_ENTRY) or "[]")
     except ValueError:
         return []
-    return [list(i) for i in items if isinstance(i, list) and len(i) == 2 and all(isinstance(x, str) for x in i)]
+    if not isinstance(items, list):
+        return []
+    found = []
+    for item in items[:MAX_INDEX]:
+        if (isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item)
+                and _indexable(item[0]) and _chunk_names(item[0], item[1]) is not None and item not in found):
+            found.append(item)
+    return found
 
 
 def _write_gens(slot: str, items: List[List[str]]) -> None:
@@ -514,13 +544,31 @@ def _legacy_sides(slot: str) -> List[List[str]]:
     return found
 
 
+def _stored_chunk_sets(slot: str) -> List[List[str]]:
+    """Generations the stored session uses that can be found without the vault passphrase: the chunked
+    "current_token" marker, and the "_idp_gens" of a stub stored in clear. (With the index damaged, these are still
+    cleaned up.)"""
+    raw = keyring.get_password(slot, TOKEN_ENTRY)
+    found = [[TOKEN_ENTRY, raw]] if _chunk_names(TOKEN_ENTRY, raw) is not None else []
+    value = read_token_entry(slot)
+    try:
+        stub = json.loads(value) if value and not crypto.is_encrypted_blob(value) else {}
+    except ValueError:
+        stub = {}
+    gens = stub.get("_idp_gens") if isinstance(stub, dict) else None
+    if isinstance(gens, dict):
+        found += [[_side(f), m] for f, m in gens.items()
+                  if f in SECRET_FIELDS and isinstance(m, str) and _chunk_names(_side(f), m) is not None]
+    return found
+
+
 def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
     """Write an IdP session's tokens to new side-entry generations; return the stub to store in "current_token".
 
     Nothing is read from the new generations until the stub naming them is written (the commit point; see
-    store_session for the whole write). passphrase: the vault's, when the vault is encrypted. Each token is then
-    encrypted (crypto.encrypt_json) before it is chunked, so no side entry holds a token in clear. The caller
-    encrypts the returned stub the same way.
+    store_session for the whole write, which holds the slot's lock). passphrase: the vault's, when the vault is
+    encrypted. Each token is then encrypted (crypto.encrypt_json) before it is chunked, so no side entry holds a
+    token in clear. The caller encrypts the returned stub the same way.
     """
     if meta.get("auth_method") != "idp":
         return meta
@@ -545,26 +593,34 @@ def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
 
 
 def store_session(slot: str, meta: Dict, passphrase: Optional[str], write_stub: Callable[[Dict], None]) -> None:
-    """Store a session's token material with one commit point: the new token side entries (IdP sessions) are written
-    under new names, write_stub stores what goes in "current_token", and only then are the side entries the previous
-    session used removed. A crash anywhere leaves the old session or the new one, readable."""
-    previous = _read_gens(slot) + _legacy_sides(slot)
-    stored = pack(slot, meta, passphrase)
-    write_stub(stored)
-    _drop_side_entries(slot, previous, stored)
+    """Store a session's token material with one commit point, holding the slot's lock (reentrant: a refresh that
+    holds it already just goes on): the new token chunks are written under new names, write_stub stores what goes
+    in "current_token" (the commit point), and only then is every generation the stored session doesn't use removed.
+    A crash anywhere leaves the old session or the new one, readable, and whatever it left behind is listed in the
+    index for the next write (or logout) to remove. Every writer of a slot holds its lock, so no other writer's
+    generation is ever in flight here."""
+    with slot_lock(slot):
+        previous = _read_gens(slot) + _legacy_sides(slot) + _stored_chunk_sets(slot)
+        stored = pack(slot, meta, passphrase)
+        write_stub(stored)
+        _drop_unused(slot, previous)
 
 
-def _drop_side_entries(slot: str, previous: List[List[str]], stored: Dict) -> None:
-    """After the commit point: delete the side entries listed in `previous` that the stored stub doesn't use (entries
-    written meanwhile by another writer aren't in `previous`, so they are left for the next write to clean up)."""
-    keep = [[_side(f), m] for f, m in (stored.get("_idp_gens") or {}).items()] if stored.get("_idp_split") else []
-    gone = [item for item in previous if item not in keep]
-    for entry, marker in gone:
+def _drop_unused(slot: str, previous: List[List[str]]) -> None:
+    """Under the slot's lock, after the commit point: delete every listed (or previously used) generation the stored
+    session doesn't use, and leave the index listing exactly the ones it uses."""
+    keep = _stored_chunk_sets(slot)
+    raw = read_token_entry(slot)
+    if raw and crypto.is_encrypted_blob(raw):
+        # An encrypted stub: its "_idp_gens" are the side-entry generations this write just indexed and committed.
+        keep += [item for item in _read_gens(slot) if item[0] != TOKEN_ENTRY and item not in previous]
+    for entry, marker in _read_gens(slot) + previous:
+        if [entry, marker] in keep:
+            continue
         _delete_names(slot, _chunk_names(entry, marker))
-        if entry in [_side(f) for f in SECRET_FIELDS] and keyring.get_password(slot, entry) == marker:
+        if entry != TOKEN_ENTRY and keyring.get_password(slot, entry) == marker:
             _delete_names(slot, [entry])   # a legacy per-field marker entry
-    if gone:
-        _write_gens(slot, [item for item in _read_gens(slot) if item not in gone])
+    _write_gens(slot, keep)
 
 
 def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool = False) -> Dict:
@@ -604,41 +660,44 @@ def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool
 
 
 def delete_session(slot: str) -> bool:
-    """Remove a slot's session: "current_token" first (the commit point: the session is gone at once, so a crash
-    part-way can't leave a usable refresh token behind), then its chunks and the token side entries.
-    Returns whether there was a "current_token"."""
-    raw = keyring.get_password(slot, TOKEN_ENTRY)
-    if raw is not None:
-        _delete_names(slot, [TOKEN_ENTRY])
-    _delete_names(slot, _chunk_names(TOKEN_ENTRY, raw))
-    i = 0
-    while i < MAX_CHUNKS and keyring.get_password(slot, f"{TOKEN_ENTRY}#{i}") is not None:   # legacy numbered
-        _delete_names(slot, [f"{TOKEN_ENTRY}#{i}"])
-        i += 1
-    for entry, marker in _read_gens(slot) + _legacy_sides(slot):
-        _delete_names(slot, _chunk_names(entry, marker))
-    _delete_names(slot, [_side("refresh_token"), _side("AccessToken"), GENS_ENTRY])
-    return raw is not None
+    """Remove a slot's session, holding its lock: "current_token" first (the commit point: the session is gone at
+    once, so a crash part-way can't leave a usable refresh token behind), then every chunk generation that is listed
+    or that the stored session names, and the index. Returns whether there was a "current_token"."""
+    with slot_lock(slot):
+        raw = keyring.get_password(slot, TOKEN_ENTRY)
+        sets = _read_gens(slot) + _legacy_sides(slot) + _stored_chunk_sets(slot)
+        if raw is not None:
+            _delete_names(slot, [TOKEN_ENTRY])
+        i = 0
+        while i < MAX_CHUNKS and keyring.get_password(slot, f"{TOKEN_ENTRY}#{i}") is not None:   # legacy numbered
+            _delete_names(slot, [f"{TOKEN_ENTRY}#{i}"])
+            i += 1
+        for entry, marker in sets:
+            _delete_names(slot, _chunk_names(entry, marker))
+        _delete_names(slot, [_side("refresh_token"), _side("AccessToken"), GENS_ENTRY])
+        return raw is not None
 
 
 def move_secrets(old_slot: str, new_slot: str) -> Optional[str]:
-    """Copy a slot's side entries ("current_token" chunks, IdP token side entries) to new_slot and return the
-    "current_token" value they belong to (read once, here), for the caller to write to new_slot last; None if there
-    is none."""
-    raw = keyring.get_password(old_slot, TOKEN_ENTRY)
-    entries = list(_chunk_names(TOKEN_ENTRY, raw) or [])
-    listed, legacy = _read_gens(old_slot), _legacy_sides(old_slot)
-    for entry, marker in listed + legacy:
-        entries += _chunk_names(entry, marker) or []
-    for entry in entries:
-        part = keyring.get_password(old_slot, entry)
-        if part is not None:
-            keyring.set_password(new_slot, entry, part)
-    for entry, marker in legacy:
-        keyring.set_password(new_slot, entry, marker)
-    if listed:
-        _write_gens(new_slot, listed)
-    return raw
+    """Copy a slot's side entries ("current_token" chunks, IdP token side entries) and its index to new_slot, holding
+    old_slot's lock, and return the "current_token" value they belong to (read once, under the lock), for the caller
+    to write to new_slot last; None if there is none."""
+    with slot_lock(old_slot):
+        raw = keyring.get_password(old_slot, TOKEN_ENTRY)
+        listed, legacy = _read_gens(old_slot), _legacy_sides(old_slot)
+        sets = listed + [item for item in _stored_chunk_sets(old_slot) if item not in listed]
+        entries = list(_chunk_names(TOKEN_ENTRY, raw) or [])
+        for entry, marker in sets + legacy:
+            entries += [name for name in _chunk_names(entry, marker) or [] if name not in entries]
+        for entry in entries:
+            part = keyring.get_password(old_slot, entry)
+            if part is not None:
+                keyring.set_password(new_slot, entry, part)
+        for entry, marker in legacy:
+            keyring.set_password(new_slot, entry, marker)
+        if sets:
+            _write_gens(new_slot, sets)
+        return raw
 
 
 def lock_dir() -> str:
@@ -700,9 +759,20 @@ def _unlock(fd: int) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+class LockTimeout(IdPError):
+    """Another process held the session's lock for longer than the wait."""
+
+
+_held = threading.local()   # per thread: {slot: depth} of the slot locks this thread holds
+
+
 @contextlib.contextmanager
 def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
-    """Cross-process lock around a refresh, so a rotated refresh token is used exactly once.
+    """Cross-process lock on a session's slot: around a refresh (so a rotated refresh token is used exactly once)
+    and around every write, logout and rename of the slot (so writers never interleave).
+
+    Reentrant within a thread: a thread that holds the slot's lock (a refresh, storing what it got) takes it again
+    at once. Other threads and processes wait.
 
     An OS file lock (flock on POSIX, msvcrt.locking on Windows) on a per-slot file that is never deleted. The OS
     drops the lock when its holder closes the file or dies, so a crashed process can't leave a stale lock and no
@@ -716,6 +786,14 @@ def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
     removed or replaced (its file is no longer the one at the path) is let go and taken again (POSIX;
     on Windows the file can't be removed or replaced while it is open).
     """
+    held = _held.__dict__.setdefault("slots", {})
+    if held.get(slot):
+        held[slot] += 1
+        try:
+            yield
+        finally:
+            held[slot] -= 1
+        return
     name = "kinetic-idp-" + hashlib.sha256(slot.encode()).hexdigest()[:16] + ".lock"
     path = os.path.join(lock_dir(), name)
     deadline = time.time() + wait
@@ -742,15 +820,17 @@ def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
             _unlock(fd)
             os.close(fd)
             if time.time() > deadline:
-                raise IdPError("Timed out taking the IdP refresh lock: its lock file keeps being replaced.")
+                raise LockTimeout("Timed out taking the IdP session lock: its lock file keeps being replaced.")
             continue   # the file at the path is another one now: lock that one
         os.close(fd)
         if time.time() > deadline:
-            raise IdPError("Timed out waiting for another process to finish refreshing the IdP session.")
+            raise LockTimeout("Timed out waiting for another process to finish refreshing or saving the session.")
         time.sleep(0.2)
+    held[slot] = 1
     try:
         yield
     finally:
+        held.pop(slot, None)
         _unlock(fd)
         os.close(fd)
 

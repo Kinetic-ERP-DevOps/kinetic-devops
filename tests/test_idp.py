@@ -1385,12 +1385,14 @@ class TestUnreadableTokensAreNeverSaved(VaultFixture):
         self.assertNotIn("_tokens_unreadable", meta)
 
     def test_set_current_company_doesnt_save_tokens_it_couldnt_read(self):
-        self.half_encrypted_slot()
-        before = self.tokens()
-        with patch.object(sys.stdout, "isatty", return_value=True), patch("builtins.print"), \
-             patch("kinetic_devops.auth.getpass.getpass", side_effect=["pass-1", "typo"]):
+        """Side entries encrypted with a passphrase other than the vault's: they don't read, nothing is saved."""
+        self.encrypted_vault()
+        idp.write_token_entry(self.slot, json.dumps(idp.pack(self.slot, dict(self.meta), "other-pass")))
+        before = {k: v for k, v in self.kr.store.items() if k[0] == self.slot}
+        with patch("builtins.print") as printed:
             self.mgr.set_current_company("pilot", "alice", "BETA")
-        self.assertEqual(self.tokens(), before)
+        self.assertIn("couldn't be decrypted", str(printed.call_args))
+        self.assertEqual({k: v for k, v in self.kr.store.items() if k[0] == self.slot}, before)
 
     def test_save_refuses_a_meta_whose_tokens_didnt_read(self):
         self.encrypted_vault()
@@ -1567,6 +1569,45 @@ class TestCrashAtEveryWrite(unittest.TestCase):
                     self.crash_everywhere(base, lambda: self.mgr().touch_session(self.slot, copy.deepcopy(new),
                                                                                    "pilot"), check)
 
+    def entries(self):
+        return sorted(u for (s, u) in self.kr.store if s == self.slot)
+
+    def used_entries(self):
+        """The entries the stored session uses: "current_token", the index, and the chunks they name."""
+        used = {"current_token"}
+        listed = idp._read_gens(self.slot)
+        if listed:
+            used.add(idp.GENS_ENTRY)
+        for entry, marker in listed:
+            used.update(idp._chunk_names(entry, marker))
+        return sorted(used)
+
+    def test_nothing_is_left_behind_after_a_crash(self):
+        """Review finding: chunks of a crashed chunked "current_token" write were in no index, so nothing (logout
+        included) ever deleted them, and on a clear vault they hold the token response in clear. Every generation
+        is now listed before its chunks are written: after a crash, logout removes everything, and the next write
+        removes what the crash left."""
+        cases = [("idp->idp", self.idp_meta("A" * 2500, "RA" * 600), self.idp_meta("B" * 2500, "RB" * 600)),
+                 ("pw->idp", self.pw_meta("A" * 1500), self.idp_meta("B" * 2500, "RB" * 600)),
+                 ("idp->pw", self.idp_meta("A" * 2500, "RA" * 600), self.pw_meta("B" * 1500)),
+                 ("pw big->big", self.pw_meta("A" * 1500), self.pw_meta("B" * 1500))]
+        for encrypted in (False, True):
+            for label, old, new in cases:
+                with self.subTest(label, encrypted=encrypted):
+                    base = self.prepare(encrypted, old)
+
+                    def check(k, done):
+                        crashed = copy.deepcopy(self.kr.store)
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.mgr().logout("pilot")
+                        self.assertEqual(self.entries(), [], f"left after a crash at write {k} and logout")
+                        self.kr.store = copy.deepcopy(crashed)
+                        self.mgr().touch_session(self.slot, copy.deepcopy(new), "pilot")
+                        self.assertEqual(self.entries(), self.used_entries(), f"crash at write {k}, then a write")
+                        self.assertEqual(self.readback(), self.sig(new))
+                    self.crash_everywhere(base, lambda: self.mgr().touch_session(self.slot, copy.deepcopy(new),
+                                                                                   "pilot"), check)
+
     def test_set_current_company(self):
         meta = self.idp_meta("A" * 2500, "RA" * 600)
         for encrypted in (False, True):
@@ -1661,6 +1702,154 @@ class TestReadersRacingAWriter(VaultFixture):
         ask.assert_not_called()
         self.assertEqual((meta["AccessToken"], meta["refresh_token"]), (newer["AccessToken"], "RT-NEW"))
         self.assertNotIn("_tokens_unreadable", meta)
+
+
+class TestWritersNeverInterleave(VaultFixture):
+    """Review finding: only a refresh took the slot lock. A company update (touch_from_headers runs after every API
+    call) that ran while a refresh stored its rotated tokens indexed and then deleted the refresh's uncommitted
+    chunks, or lost its index update: the refreshed session read as ('', '') after its refresh token was spent, and
+    logout or rename then missed chunks. Every write, logout and rename now holds the slot's lock, and a
+    read-modify-write re-reads the session under it. Writers run in separate threads here (the lock is reentrant
+    within a thread, as a refresh storing its result needs)."""
+
+    def setUp(self):
+        super().setUp()
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta, AccessToken="A0" * 1250, refresh_token="R0" * 650), "pilot")
+
+    def other(self):
+        return KineticConfigManager.__new__(KineticConfigManager)
+
+    def race(self, when, second):
+        """Run a store of rotated tokens (A1/R1) in one thread; when its keyring write matches when(user), start
+        second() in another thread and give it time to run. Returns (second was still waiting, its thread)."""
+        real_set = FakeKeyring.set_password
+        state = {}
+
+        def set_password(service, user, value):
+            if service == self.slot and when(user) and "thread" not in state:
+                state["thread"] = threading.Thread(target=second, daemon=True)
+                state["thread"].start()
+                state["thread"].join(0.5)
+                state["blocked"] = state["thread"].is_alive()
+            return real_set(self.kr, service, user, value)
+
+        def first():
+            with patch.object(self.kr, "set_password", side_effect=set_password):
+                self.other().touch_session(self.slot, dict(self.meta, AccessToken="A1" * 1250,
+                                                            refresh_token="R1" * 650), "pilot")
+        t = threading.Thread(target=first)
+        t.start()
+        t.join(30)
+        state["thread"].join(30)
+        return state["blocked"]
+
+    def check_session(self, company):
+        meta = self.mgr._get_token_meta(self.slot)
+        self.assertEqual((meta["AccessToken"], meta["refresh_token"], meta["current_company"]),
+                         ("A1" * 1250, "R1" * 650, company))
+        self.assertFalse(set(meta) & set(idp.UNREAD_FLAGS))
+        used = {"current_token", idp.GENS_ENTRY}
+        for entry, marker in idp._read_gens(self.slot):
+            used.update(idp._chunk_names(entry, marker))
+        self.assertEqual({u for (s, u) in self.kr.store if s == self.slot}, used)   # nothing unlisted, nothing missing
+
+    def test_company_update_waits_for_a_store_in_progress(self):
+        for label, when in (("at the commit point", lambda u: u == "current_token"),
+                            ("after the index write", lambda u: "#" in u)):
+            with self.subTest(label):
+                self.setUp()
+                blocked = self.race(when, lambda: self.other().set_current_company("pilot", "alice", "BETA"))
+                self.assertTrue(blocked, "the company update didn't wait for the store's lock")
+                self.check_session("BETA")   # re-read under the lock: the rotated tokens are kept
+                self.tearDown()
+
+    def test_touch_from_headers_waits_and_re_reads(self):
+        def touch():
+            other = self.other()
+            with patch.object(other, "get_session_by_bearer", return_value=("pilot", "alice")):
+                other.touch_from_headers({"Authorization": "Bearer A0", "X-Epicor-Company": "BETA"})
+        self.assertTrue(self.race(lambda u: u == "current_token", touch))
+        self.check_session("BETA")
+
+    def test_logout_after_racing_writers_leaves_nothing(self):
+        self.race(lambda u: "#" in u, lambda: self.other().set_current_company("pilot", "alice", "BETA"))
+        with patch("builtins.print"):
+            self.mgr.logout("pilot")
+        self.assertEqual([u for (s, u) in self.kr.store if s == self.slot], [])
+
+    def test_hot_path_skips_the_write_when_the_lock_is_busy(self):
+        """touch_from_headers runs after every API call: when another process holds the lock (a refresh), it waits a
+        moment, then skips recording the company instead of failing or holding up the call."""
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with idp.slot_lock(self.slot):
+                held.set()
+                release.wait(10)
+        t = threading.Thread(target=holder)
+        t.start()
+        held.wait(5)
+        before = dict(self.kr.store)
+        try:
+            with patch.object(auth, "HOT_PATH_LOCK_WAIT_SEC", 0.3), \
+                 patch.object(self.mgr, "get_session_by_bearer", return_value=("pilot", "alice")):
+                start = time.time()
+                self.mgr.touch_from_headers({"Authorization": "Bearer A0", "X-Epicor-Company": "BETA"})
+                self.assertLess(time.time() - start, 3)
+        finally:
+            release.set()
+            t.join(10)
+        self.assertEqual(self.kr.store, before)
+
+    def test_set_current_company_says_so_on_a_lock_timeout(self):
+        with patch.object(idp, "slot_lock", side_effect=idp.LockTimeout("Timed out waiting.")), \
+             patch("builtins.print") as printed:
+            self.mgr.set_current_company("pilot", "alice", "BETA")
+        self.assertIn("wasn't saved", str(printed.call_args))
+
+    def test_the_lock_is_reentrant_in_a_thread_and_exclusive_across_threads(self):
+        outcome = []
+        with idp.slot_lock(self.slot):
+            with idp.slot_lock(self.slot, wait=0):
+                outcome.append("reentered")
+
+            def other_thread():
+                try:
+                    with idp.slot_lock(self.slot, wait=0.3):
+                        outcome.append("taken")
+                except idp.LockTimeout:
+                    outcome.append("waited")
+            t = threading.Thread(target=other_thread)
+            t.start()
+            t.join(5)
+        self.assertEqual(outcome, ["reentered", "waited"])
+        with idp.slot_lock(self.slot, wait=0):   # released by the outer block
+            pass
+
+
+class TestDamagedIndex(VaultFixture):
+    """Review finding: an index of null or 5 made every write fail with TypeError (after a refresh had rotated the
+    token), and logout's bare except hid it and left the chunks. A damaged index is ignored, and what the stored
+    session uses is still found (the chunked "current_token" marker, a clear stub's "_idp_gens")."""
+
+    def test_reads_writes_and_logout_survive_a_damaged_index(self):
+        for bad in ("null", "5", '{"a":1}', "not json", '[["idp_AccessToken"]]',
+                    json.dumps([["x", "chunks:ab:1"]] * 200), json.dumps([["idp_AccessToken", "chunks:ab:999"]])):
+            with self.subTest(bad=bad[:20]):
+                self.kr.store = {}
+                self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+                self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+                self.kr.store[(self.slot, idp.GENS_ENTRY)] = bad
+                self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+                self.mgr.set_current_company("pilot", "alice", "BETA")
+                meta = self.mgr._get_token_meta(self.slot)
+                self.assertEqual((meta["refresh_token"], meta["current_company"]), ("RT-SECRET", "BETA"))
+                self.assertIsInstance(json.loads(self.kr.get_password(self.slot, idp.GENS_ENTRY)), list)
+                self.kr.store[(self.slot, idp.GENS_ENTRY)] = bad
+                with patch("builtins.print"):
+                    self.mgr.logout("pilot")
+                self.assertEqual([u for (s, u) in self.kr.store if s == self.slot], [])
 
 
 class TestVaultPromptMode(unittest.TestCase):

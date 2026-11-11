@@ -124,8 +124,9 @@ terminal: without one it stops before the browser opens; pass ENV, `--user` and 
   program from using an intercepted code. The page is sent with `no-store` and `no-referrer`.
 - The ID token is checked (issuer, audience, expiry, and a `nonce` tied to this sign-in). The session keeps the IdP
   identity (`idp_username`); `idp-login` warns if it doesn't look like the `--user` you named the session for.
-- Refreshes are serialised with an OS file lock (released when its process ends, so it never goes stale and is
-  never taken over) on a file in a directory only you can access (`$XDG_RUNTIME_DIR/kinetic-devops`
+- Refreshes, and every other write of a session (company updates, sign-ins, logout, rename), are serialised with
+  an OS file lock (released when its process ends, so it never goes stale and is never taken over) on a file in a
+  directory only you can access (`$XDG_RUNTIME_DIR/kinetic-devops`
   or `<tmp>/kinetic-devops-<uid>`, mode 0700; the per-user temp directory on Windows). A refresh token the IdP
   rejects (`invalid_grant`) is dropped, so the next run asks for a new sign-in.
 - Tokens are stored where password-session tokens are: the OS keyring (Windows Credential Manager by default).

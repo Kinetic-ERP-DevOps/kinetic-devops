@@ -399,6 +399,10 @@ class SessionResolutionError(RuntimeError):
     """
 
 
+# How long the bookkeeping write after an API call (touch_from_headers) waits for a session's lock before skipping.
+HOT_PATH_LOCK_WAIT_SEC = 2.0
+
+
 class VaultError(RuntimeError):
     """The encrypted vault can't be read or written: no passphrase at hand, or one that doesn't open it."""
 
@@ -581,18 +585,26 @@ class KineticConfigManager(KineticCore):
             api_key = cfg.get("api_key", "")
             for user in cfg.get("sessions", []) or []:
                 slot = self._get_token_key(name, user, api_key)
-                raw = idp.read_token_entry(slot)
-                if not raw:
-                    if keyring.get_password(slot, idp.TOKEN_ENTRY):   # a chunk marker whose chunks aren't all there
-                        failed += 1
-                    continue
                 try:
-                    data = crypto.decrypt_json(raw, read_pass) if crypto.is_encrypted_blob(raw) else json.loads(raw)
-                    data = idp.unpack(slot, data, read_pass, strict=True)   # unreadable token: raises, slot kept
-                    self._write_token_material(slot, data, write_pass)
-                except Exception:
+                    with idp.slot_lock(slot):   # read and rewrite with no other writer in between
+                        raw = idp.read_token_entry(slot)
+                        if not raw:
+                            if keyring.get_password(slot, idp.TOKEN_ENTRY):   # a marker whose chunks aren't there
+                                failed += 1
+                            continue
+                        data = crypto.decrypt_json(raw, read_pass) if crypto.is_encrypted_blob(raw) else json.loads(raw)
+                        data = idp.unpack(slot, data, read_pass, strict=True)   # unreadable token: raises, slot kept
+                        self._write_token_material(slot, data, write_pass)
+                except Exception:   # includes a lock timeout: the slot is left as it was and counted
                     failed += 1
         return failed
+
+    @contextlib.contextmanager
+    def _session_write(self, slot: str, wait: float = 30.0) -> Iterator[None]:
+        """A read-modify-write of a session: the vault passphrase for the write is asked for (and checked) first,
+        then the slot's lock is taken (reentrant), so nothing is asked while the lock is held."""
+        with self._vault_pass_pinned(self._write_passphrase()), idp.slot_lock(slot, wait=wait):
+            yield
 
     def encrypt_vault(self, passphrase: str) -> None:
         """Encrypt the servers map and every session's token material (IdP token side entries included)."""
@@ -832,13 +844,19 @@ class KineticConfigManager(KineticCore):
         if token:
             # Find who this token belongs to
             nickname, user_id = self.get_session_by_bearer(token, ("nickname", "user_id"))
-            if nickname and user_id:
+            if nickname and user_id and co_id:
                 slot = self._get_token_key(nickname, user_id, self._get_api_key(nickname))
-                # Retrieve existing metadata and update company
-                meta = self._get_token_meta(slot)
-                if meta and co_id and not meta.get("_tokens_unreadable"):
-                    meta['current_company'] = co_id
-                    self.touch_session(slot, meta, nickname)
+                # Bookkeeping after an API call: never fail (or hold up) the call for it. The session is re-read
+                # under the slot's lock (a refresh may have just rotated its tokens); if another process holds the
+                # lock for more than a moment, or the vault can't be written, the company isn't recorded this time.
+                try:
+                    with self._session_write(slot, wait=HOT_PATH_LOCK_WAIT_SEC):
+                        meta = self._get_token_meta(slot)
+                        if meta and not meta.get("_tokens_unreadable"):
+                            meta['current_company'] = co_id
+                            self.touch_session(slot, meta, nickname)
+                except (idp.IdPError, VaultError):
+                    pass
 
     def sync_companies(self, env_name: str, passive: bool = False):
         """Sync authorized companies from server to local config for one environment."""
@@ -1321,15 +1339,20 @@ class KineticConfigManager(KineticCore):
         if not cfg: return
 
         slot = self._get_token_key(name, user_id, cfg['api_key'])
-        data = self._get_token_meta(slot)
-        
-        if data:
-            if data.get("_tokens_unreadable"):
-                print(f"⚠️ The session's tokens for {name}/{user_id} couldn't be decrypted; the company wasn't saved.")
-                return
-            data['current_company'] = company_id
-            # Re-save the updated JSON blob to the keyring
-            self._save_token_meta(slot, data)
+        try:
+            # Re-read and save under the slot's lock, so a refresh in another process isn't overwritten.
+            with self._session_write(slot):
+                data = self._get_token_meta(slot)
+                if data:
+                    if data.get("_tokens_unreadable"):
+                        print(f"⚠️ The session's tokens for {name}/{user_id} couldn't be decrypted; the company "
+                              "wasn't saved.")
+                        return
+                    data['current_company'] = company_id
+                    # Re-save the updated JSON blob to the keyring
+                    self._save_token_meta(slot, data)
+        except idp.LockTimeout as exc:
+            print(f"⚠️ {exc} The company for {name}/{user_id} wasn't saved; try again.")
 
     def get_all_configs(self) -> Dict[str, Dict]:
         """Module API: Returns a dictionary of all stored configs with their current token status."""

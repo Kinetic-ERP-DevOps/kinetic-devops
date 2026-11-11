@@ -193,9 +193,14 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   session's token entries) go under new names first, then one write of `current_token` switches to them, and only
   then are the old ones removed. So a crash part-way leaves the previous session whole (never a new access token
   with an already rotated-away refresh token), and a reader that races a writer reads the session again instead of
-  seeing it as gone. Logout removes `current_token` first, so an interrupted logout can't leave a usable refresh
-  token. Versions without this read a chunked entry as missing (sign in again). Sessions stored the earlier ways
-  are read, and `rename`, `logout` and the clean-up commands handle the chunks.
+  seeing it as gone. Every chunk generation is listed in a clear index (names and counts, no secrets) before it is
+  written, so what a crash leaves behind is removed by the next write or by logout. Every write, logout and rename
+  of a session holds the session's lock (the refresh lock, reentrant within a thread), and company updates re-read
+  the session under it, so a write in one process never undoes or breaks a refresh in another; the company update
+  after each API call waits at most 2 s for the lock and is skipped otherwise. Logout removes `current_token`
+  first, so an interrupted logout can't leave a usable refresh token. Versions without this read a chunked entry
+  as missing (sign in again). Sessions stored the earlier ways are read, and `rename`, `logout` and the clean-up
+  commands handle the chunks.
   A typed vault passphrase is kept in memory for the rest of the run (said once; never stored; only a passphrase
   that opens the servers map is kept); `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time
   instead. An IdP refresh asks for (and checks) the passphrase before it spends the refresh token, and not again
