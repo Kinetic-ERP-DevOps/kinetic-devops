@@ -167,7 +167,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   traceback; it now takes the "sign in again" path.
 - IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted
   the new holder's lock, so two processes could use the same rotating refresh token. The lock is now an OS file
-  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale.
+  lock (flock / msvcrt.locking), released when its process ends, so it never goes stale. Only a lock held by
+  another process is waited for: a lock file that can't be opened or locked (permissions, a full disk) is reported
+  at once with the reason, and (on POSIX) a lock taken on a file that was meanwhile removed or replaced is taken
+  again.
 - `auth` session resolution raised `IndexError` when no company was given and the environment had none
   configured; it now raises `SessionResolutionError` saying to pass `--co`.
 - `analysis diff`: the review prompt now fences the commit metadata and diff as untrusted data and tells the
@@ -180,8 +183,36 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
   without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
-  A typed vault passphrase is kept in memory until the command ends (said once; never stored);
-  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead.
+  A session they can't read (a token encrypted with another passphrase, a missing entry) is left as it was and
+  counted, never rewritten as an empty token; a session whose token can't be decrypted reads as expired and is
+  never saved back (the vault passphrase is asked for when an IdP session's token entries are encrypted and none
+  is at hand).
+  Encryption makes a token entry ~1.4x longer, so any session's `current_token` over the keyring's ~1280-character
+  limit (Windows Credential Manager), such as a password session with a typical Kinetic token in an encrypted
+  vault, is split over several entries. Every write of a session has one commit point: the chunks (and an IdP
+  session's token entries) go under new names first, then one write of `current_token` switches to them, and only
+  then are the old ones removed. So a crash part-way leaves the previous session whole (never a new access token
+  with an already rotated-away refresh token), and a reader that races a writer reads the session again instead of
+  seeing it as gone. Every chunk generation is listed in a clear index (names and counts, no secrets) before it is
+  written, so what a crash leaves behind is removed by the next write or by logout. Every write, logout and rename
+  of a session holds the session's lock (the refresh lock, reentrant within a thread), and company updates re-read
+  the session under it, so a write in one process never undoes or breaks a refresh in another; the company update
+  after each API call waits at most 2 s for the lock and is skipped otherwise. A refresh's request to the IdP
+  times out sooner (5 s to connect, 20 s to answer) than others wait for the lock; storing a completed sign-in
+  waits up to 90 s (and says so). Rename holds each session's lock from the copy to the delete, and a refresh
+  that waited for it doesn't refresh the session it no longer finds. `encrypt-vault` / `decrypt-vault` hold every
+  session's lock while they change the vault, and a refresh that waited through one starts over (asking for the
+  passphrase if it now needs one) instead of spending its refresh token and being refused the store. A session
+  that stays busy is never reported as done: logout and `clean-sessions` keep it listed and say to run them again,
+  and an API-key change, rename, `encrypt-vault` and `decrypt-vault` change nothing and say to run them again.
+  The company update after an API call never fails the call. Logout removes `current_token`
+  first, so an interrupted logout can't leave a usable refresh token. Versions without this read a chunked entry
+  as missing (sign in again). Sessions stored the earlier ways are read, and `rename`, `logout` and the clean-up
+  commands handle the chunks.
+  A typed vault passphrase is kept in memory for the rest of the run (said once; never stored; only a passphrase
+  that opens the servers map is kept); `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time
+  instead. An IdP refresh asks for (and checks) the passphrase before it spends the refresh token, and not again
+  during that refresh, so a mistyped passphrase can't lose a rotated refresh token; it takes the sign-in-again path.
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.
