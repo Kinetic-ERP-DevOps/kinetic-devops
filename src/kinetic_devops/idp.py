@@ -152,6 +152,7 @@ def login_browser(
     port: int = DEFAULT_PORT,
     timeout: int = LOGIN_TIMEOUT_SEC,
     open_url: Callable[[str], bool] = webbrowser.open,
+    force_login: bool = False,
 ) -> Dict:
     """Authorization code + PKCE with a loopback redirect. Returns the token response (not stored here).
 
@@ -159,6 +160,8 @@ def login_browser(
     else gets 400 and is ignored, so another local program or a web page can't end or hijack the sign-in: a wrong or
     missing state, a second callback, or a Host header other than 127.0.0.1:<port> (DNS rebinding: a page on another
     name that resolves to 127.0.0.1). An iss parameter (RFC 9207), if the IdP sends one, must be the issuer.
+    force_login sends prompt=login (OIDC Core 3.1.2.1): the IdP asks for the sign-in again instead of reusing the
+    browser's existing IdP session.
     """
     redirect_uri = f"http://127.0.0.1:{port}/callback"
     expected_host = f"127.0.0.1:{port}"
@@ -201,10 +204,13 @@ def login_browser(
         raise IdPError(f"Port {port} is busy; pass --port with one of the client's registered redirect ports.") from exc
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        url = settings["authorize"] + "?" + urllib.parse.urlencode({
+        params = {
             "client_id": client_id, "response_type": "code", "redirect_uri": redirect_uri,
             "scope": f"{BASE_SCOPES} {settings['api_scope']}", "state": state, "nonce": nonce,
-            "code_challenge": challenge, "code_challenge_method": "S256"})
+            "code_challenge": challenge, "code_challenge_method": "S256"}
+        if force_login:
+            params["prompt"] = "login"
+        url = settings["authorize"] + "?" + urllib.parse.urlencode(params)
         print(f"Opening the browser for Epicor sign-in (waiting up to {timeout // 60} min)...", flush=True)
         if not open_url(url):
             print("Couldn't open a browser; open this address yourself:\n" + url, flush=True)

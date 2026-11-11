@@ -77,6 +77,10 @@ uv run python -m kinetic_devops.auth idp-login MyEnv --user jdoe --co ACME
 # offering your IdP sign-in name (jdoe for jdoe@corp.example), and the company if there are several
 uv run python -m kinetic_devops.auth idp-login
 
+# start a new session, reusing nothing from before (e.g. to sign in as someone else): no list of existing
+# sessions, KIN_USER is ignored, and the IdP asks for the sign-in again instead of reusing the browser's
+uv run python -m kinetic_devops.auth idp-login --new-session
+
 # from then on, everything works as with a password session, e.g.
 KIN_USER=jdoe uv run python -m kinetic_devops.baq ...
 uv run python -m kinetic_devops.auth renew MyEnv --user jdoe   # forces a refresh now
@@ -88,12 +92,18 @@ Anything passed on the command line (or `KIN_USER`) is used without asking. With
 environment or user stops at once with what to pass (before the browser opens); the company then defaults to the
 first configured.
 
+`--new-session` asks for the Epicor User ID (offering your IdP sign-in name) and the company even when sessions
+exist or `KIN_USER` is set, and the environment if ENV isn't given; ENV, `--user` and `--co` still count. It sends
+`prompt=login` (OIDC), so the IdP asks for the sign-in again even if the browser is still signed in. It needs a
+terminal: without one it stops before the browser opens; pass ENV, `--user` and `--co` instead.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | IdP error page about the redirect URI | The client doesn't list `http://127.0.0.1:<port>/callback` for the port in use. |
 | `unauthorized_client` | The client doesn't allow the authorization-code grant, or it's not a native/public client. |
+| `idp-login` signs in as the wrong person without asking | The browser is still signed in to the IdP; use `--new-session`. |
 | Signed in, but "Kinetic didn't accept the token" | The IdP identity isn't mapped to an ERP user, or the environment's API key is wrong for the company. |
 | No refresh token returned / sign-in every hour | Offline access isn't allowed on the client. |
 | "session has expired and can't be refreshed" in a script | The refresh token's lifetime ran out (or the IdP rejected it); run `auth idp-login` in a terminal. |

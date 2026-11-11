@@ -37,7 +37,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   native client in the IdP admin console: `Documents/EPICOR_IDP_SIGNIN.md`.
   `idp-login` asks for what isn't passed when run at a terminal: the environment (from the configured list), the
   Epicor User ID (an existing session, or a new ID with the IdP sign-in name offered) and the company; without a
-  terminal a missing environment or user stops before the browser opens.
+  terminal a missing environment or user stops before the browser opens. `idp-login --new-session` reuses nothing
+  from before: it doesn't offer the existing sessions or `KIN_USER` (it asks for the User ID and company) and
+  sends `prompt=login`, so the IdP asks for the sign-in again instead of reusing the browser's; it needs a terminal.
   Hardened before release: https-only remote endpoints with certificate checks (the loopback redirect stays http,
   RFC 8252); the discovery issuer must be the endpoint Kinetic names, with the authorize and token endpoints on its
   host; the callback takes only the first response with the right `state` and checks `Host` and `iss` (RFC 9207);

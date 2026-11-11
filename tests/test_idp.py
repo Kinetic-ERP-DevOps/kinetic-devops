@@ -155,7 +155,7 @@ def _get(url, headers=None):
 
 
 class TestLoginBrowser(unittest.TestCase):
-    def _run(self, reply, timeout=10, claims=None):
+    def _run(self, reply, timeout=10, claims=None, **kw):
         """reply(params) -> list of (query dict, extra headers) the 'browser' sends to the loopback redirect, in order."""
         port = _free_port()
         self.statuses = []
@@ -176,7 +176,7 @@ class TestLoginBrowser(unittest.TestCase):
             "access_token": "AT", "refresh_token": "RT", "expires_in": 3600,
             "id_token": _id_token(**(claims(self.seen["nonce"]) if claims else _claims(self.seen["nonce"])))})
         with patch.object(idp, "requests", req):
-            tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=timeout, open_url=browser)
+            tok = idp.login_browser(SETTINGS, "cid", port=port, timeout=timeout, open_url=browser, **kw)
         return tok, req, port
 
     def test_pkce_code_exchange(self):
@@ -192,6 +192,14 @@ class TestLoginBrowser(unittest.TestCase):
         status, headers = self.statuses[0]
         self.assertEqual(status, 200)
         self.assertEqual((headers.get("Cache-Control"), headers.get("Referrer-Policy")), ("no-store", "no-referrer"))
+
+    def test_force_login_asks_the_idp_for_a_new_sign_in(self):
+        self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})], force_login=True)
+        self.assertEqual(self.seen["prompt"], "login")
+
+    def test_default_reuses_the_browsers_idp_session(self):
+        self._run(lambda p: [({"code": "C1", "state": p["state"]}, {})])
+        self.assertNotIn("prompt", self.seen)
 
     def test_wrong_state_is_ignored_and_the_real_callback_still_wins(self):
         tok, req, _ = self._run(lambda p: [({"code": "EVIL", "state": "forged"}, {}),
@@ -634,6 +642,60 @@ class TestIdpLoginPrompts(unittest.TestCase):
         self.assertEqual(self.stored["current_company"], "ACME")
         ask.assert_not_called()
 
+    # --- without --new-session nothing changes ---
+
+    def test_without_new_session_existing_sessions_and_kin_user_are_reused(self):
+        self.cfg["sessions"] = ["alice", "bob"]
+        with patch.dict(os.environ, {"KIN_USER": ""}):
+            token, ask, _ = self.run_login("pilot", answers=["2", "1"])   # session list: bob; company ACME
+        self.assertEqual((self.stored["user_id"], self.stored["current_company"]), ("bob", "ACME"))
+        self.assertIn("Select Session", ask.call_args_list[0].args[0])
+        self.assertIs(self.login.call_args.kwargs.get("force_login"), False)
+        with patch.dict(os.environ, {"KIN_USER": "Carol"}):
+            _, ask, _ = self.run_login("pilot", company_id="ACME")
+        self.assertEqual(self.stored["user_id"], "carol")
+        ask.assert_not_called()
+
+    # --- --new-session ---
+
+    def test_new_session_offers_no_sessions_ignores_kin_user_and_forces_the_idp_sign_in(self):
+        self.cfg["sessions"] = ["alice", "bob"]
+        with patch.dict(os.environ, {"KIN_USER": "Carol"}):
+            token, ask, _ = self.run_login("pilot", answers=["", "2"], new_session=True)
+        prompts = [c.args[0] for c in ask.call_args_list]
+        self.assertTrue(prompts[0].startswith("Enter Epicor User ID [jdoe]"), prompts)   # no session list first
+        self.assertFalse([p for p in prompts if "Session" in p])
+        self.assertEqual((token, self.stored["user_id"], self.stored["current_company"]), ("AT", "jdoe", "BETA"))
+        self.assertIs(self.login.call_args.kwargs["force_login"], True)
+
+    def test_new_session_still_uses_values_passed(self):
+        with patch.dict(os.environ, {"KIN_USER": "Carol"}):
+            token, ask, pick = self.run_login("pilot", "BSmith", "BETA", new_session=True)
+        self.assertEqual((self.stored["user_id"], self.stored["current_company"]), ("bsmith", "BETA"))
+        ask.assert_not_called()
+        pick.assert_not_called()
+
+    def test_new_session_asks_for_the_environment_when_not_given(self):
+        token, _, pick = self.run_login(user_id="jdoe", company_id="ACME", new_session=True)
+        pick.assert_called_once_with(passive=True)
+        self.assertEqual(token, "AT")
+
+    def test_new_session_without_terminal_stops_before_the_browser(self):
+        with self.assertRaises(SessionResolutionError) as ctx:
+            self.run_login("pilot", "jdoe", "ACME", tty=False, new_session=True)
+        self.assertIn("--new-session", str(ctx.exception))
+        self.assertIn("pass ENV, --user and --co", str(ctx.exception))
+        self.login.assert_not_called()
+
+    def test_cli_flag_reaches_idp_login(self):
+        from kinetic_devops import auth as auth_mod
+        for argv, expected in ((["idp-login", "pilot", "--new-session"], True), (["idp-login", "pilot"], False)):
+            with patch.object(sys, "argv", ["auth"] + argv), \
+                 patch.object(auth_mod.KineticConfigManager, "__init__", return_value=None), \
+                 patch.object(auth_mod.KineticConfigManager, "idp_login") as login:
+                auth_mod.main()
+            self.assertIs(login.call_args.kwargs["new_session"], expected)
+
 
 class TestSelectSessionForEnv(unittest.TestCase):
     """The shared session/company picker (password sign-in uses it too) after splitting out the company choice."""
@@ -658,6 +720,10 @@ class TestSelectSessionForEnv(unittest.TestCase):
     def test_existing_session_and_single_company_unchanged(self):
         got, _ = self.pick(["2"], cfg={"sessions": ["alice", "bob"], "companies": "ACME"})
         self.assertEqual(got, ("bob", "ACME"))
+
+    def test_offer_sessions_false_always_asks_for_a_user_id(self):
+        got, _ = self.pick(["carol"], cfg={"sessions": ["alice", "bob"], "companies": "ACME"}, offer_sessions=False)
+        self.assertEqual(got, ("carol", "ACME"))
 
     def test_preferred_company_skips_the_company_prompt(self):
         got, _ = self.pick(["1"], cfg={"sessions": ["alice"], "companies": "ACME,BETA"}, preferred_company="BETA")

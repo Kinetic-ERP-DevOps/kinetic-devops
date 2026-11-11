@@ -1009,7 +1009,8 @@ class KineticConfigManager(KineticCore):
                 pass
 
     def _select_session_for_env(
-        self, selected_env: str, env_cfg: Dict, preferred_company: str = "", suggested_user: str = ""
+        self, selected_env: str, env_cfg: Dict, preferred_company: str = "", suggested_user: str = "",
+        offer_sessions: bool = True,
     ) -> Tuple[str, str]:
         """Interactively select an existing session or enter a new Epicor
         User ID for an already-known environment, then pick a company if
@@ -1026,8 +1027,10 @@ class KineticConfigManager(KineticCore):
 
         suggested_user (e.g. from an IdP sign-in) is offered as the default
         when a new User ID is entered: an empty answer takes it.
+        offer_sessions=False skips the list of existing sessions and always
+        asks for a User ID (idp-login --new-session).
         """
-        sessions = env_cfg.get("sessions", []) or []
+        sessions = (env_cfg.get("sessions", []) or []) if offer_sessions else []
         selected_user = None
         if sessions:
             print(f"\n👤 Sessions for {selected_env}:")
@@ -1676,15 +1679,24 @@ class KineticConfigManager(KineticCore):
         idp.set_client_id(settings["tenant"], client_id)
         print(f"✅ Stored the IdP client ID for the IdP tenant used by {name}.")
 
-    def idp_login(self, env_name: str = "", user_id: str = "", company_id: str = "", port: int = 0) -> Optional[str]:
+    def idp_login(self, env_name: str = "", user_id: str = "", company_id: str = "", port: int = 0,
+                  new_session: bool = False) -> Optional[str]:
         """Sign in through Epicor IdP in the browser and store the session like a password sign-in.
 
         Whatever isn't passed is asked for at a terminal: the environment (from the configured list) before the
         sign-in; the Epicor User ID (an existing session, or a new ID with the IdP sign-in name offered as the
         default) and the company (when there is more than one) after it. Without a terminal (stdin decides),
         a missing environment or user stops at once with what to pass; the company defaults to the first one.
+
+        new_session (--new-session) reuses nothing from before: the list of existing sessions and KIN_USER aren't
+        offered (the User ID is typed, with the IdP sign-in name as the default), and the IdP is asked for a new
+        sign-in (prompt=login) instead of reusing the browser's IdP session. Values passed here still count. It
+        needs a terminal: without one it stops at once, before the browser.
         """
         interactive = sys.stdin.isatty()
+        if new_session and not interactive:
+            raise SessionResolutionError("--new-session asks for the sign-in details and there is no terminal to ask "
+                                         "in; pass ENV, --user and --co instead (without --new-session).")
         servers = self._get_server_dict()
         if not env_name:
             if not interactive:
@@ -1696,7 +1708,7 @@ class KineticConfigManager(KineticCore):
         if not cfg:
             print(f"❌ No environment named '{env_name}' found.")
             return None
-        user_id = (user_id or os.environ.get("KIN_USER", "")).strip().lower()
+        user_id = (user_id or ("" if new_session else os.environ.get("KIN_USER", ""))).strip().lower()
         if not user_id and not interactive:
             raise SessionResolutionError("Pass --user (your Epicor user ID) or set KIN_USER; it names the session, and "
                                          "there is no terminal to ask in.")
@@ -1705,12 +1717,13 @@ class KineticConfigManager(KineticCore):
         if not client_id:
             raise idp.IdPError(f"No IdP client ID stored for {name}'s IdP tenant. Register a native client "
                                f"(Documents/EPICOR_IDP_SIGNIN.md), then run 'auth idp-client {name}'.")
-        tok = idp.login_browser(settings, client_id, port=port or idp.DEFAULT_PORT)
+        tok = idp.login_browser(settings, client_id, port=port or idp.DEFAULT_PORT, force_login=new_session)
         if not user_id:   # asked now, so the IdP sign-in name can be offered (jdoe from jdoe@corp.example)
             who = (tok.get("idp_identity") or {}).get("username", "")
             suggestion = who.split("@", 1)[0].rsplit("\\", 1)[-1].lower()
             user_id, picked_co = self._select_session_for_env(name, cfg, preferred_company=company_id,
-                                                               suggested_user=suggestion)
+                                                               suggested_user=suggestion,
+                                                               offer_sessions=not new_session)
             user_id, company_id = user_id.strip().lower(), company_id or picked_co
         elif not company_id:
             company_id = (self._select_company_for_env(name, cfg) if interactive else
@@ -1720,7 +1733,7 @@ class KineticConfigManager(KineticCore):
         who = meta.get("idp_username", "")
         if not idp.identity_matches(who, user_id):
             print(f"⚠️ Signed in to Epicor IdP as {who}, but the session is named for --user {user_id}. If that isn't "
-                  "the same person, sign out of the IdP in the browser and run idp-login again.")
+                  "the same person, run idp-login again with --new-session to sign in as someone else.")
         ok, reason = self._validate_bearer_access(url=cfg["url"], api_key=cfg.get("api_key", ""),
                                                   company=company_id, token=meta["AccessToken"], user_id=user_id)
         if not ok:
@@ -2750,7 +2763,8 @@ def main():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n  python -m kinetic_devops.auth idp-login                      (asks for everything)\n"
-               "  python -m kinetic_devops.auth idp-login MyTestEnv --user jdoe --co ACME",
+               "  python -m kinetic_devops.auth idp-login MyTestEnv --user jdoe --co ACME\n"
+               "  python -m kinetic_devops.auth idp-login --new-session        (sign in afresh, e.g. as someone else)",
     )
     idp_login_p.add_argument("env", metavar="ENV", nargs="?", default="",
                              help="Environment nickname. Omitted: chosen from the configured list (terminal only).")
@@ -2759,6 +2773,11 @@ def main():
                                   "sign-in with the IdP name offered (terminal only).")
     idp_login_p.add_argument("--co", default="", metavar="COMPANY",
                              help="Company. Default: asked when several are configured (terminal), else the first.")
+    idp_login_p.add_argument("--new-session", action="store_true",
+                             help="Reuse nothing from before: don't offer the existing sessions or KIN_USER (asks "
+                                  "for the User ID, offering your IdP name, and the company), and have the IdP ask "
+                                  "for the sign-in again instead of reusing the browser's. ENV, --user and --co still "
+                                  "count. Needs a terminal.")
     idp_login_p.add_argument("--port", type=int, default=0,
                              help="Loopback redirect port registered on the client (default 8765).")
 
@@ -3020,7 +3039,7 @@ def main():
                 allow_password_fallback=bool(args.allow_password_fallback),
             )
         elif args.command == "idp-login":
-            mgr.idp_login(args.env, args.user, args.co, port=args.port)
+            mgr.idp_login(args.env, args.user, args.co, port=args.port, new_session=args.new_session)
         elif args.command == "idp-client":
             mgr.idp_set_client(args.env)
         elif args.command == "reset-pointer": mgr.reset_pointer()
