@@ -108,6 +108,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- `analysis diff`: an answer without its leading `VERDICT:` line no longer passes as GO from a bare "GO" in
+  its last section, so "Do NOT GO: ..." is no longer read as GO. GO now needs the explicit `VERDICT: GO`
+  line; otherwise the chunk is UNKNOWN. NO-GO, including a negated GO ("not a GO", "don't GO"), still counts.
 - Forgejo sync failed on its first line since #66 (`mktemp: unrecognized option: suffix=.py`): the runner
   image's BusyBox `mktemp` has no long options. It now uses `mktemp -d`; a test keeps GNU-only `mktemp`
   options out of `.forgejo/workflows`.

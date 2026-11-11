@@ -427,11 +427,15 @@ VERDICTS = ("GO", "NO-GO", "UNKNOWN", "INCOMPLETE")
 
 _VERDICT_LINE = re.compile(r"^[\s*#>_`]*VERDICT[\s*_`]*:[\s*_`]*(NO[- ]GO|GO)\b(.*)$", re.IGNORECASE | re.MULTILINE)
 _VERDICT_WORD = re.compile(r"\bNO[- ]GO\b|\bGO\b", re.IGNORECASE)
+# NO-GO in words: "NO-GO", "no go", and negated GO ("NOT GO", "not a GO", "don't GO", "do not go").
+_NO_GO = re.compile(r"\bNO[- ]GO\b|\b(?:NOT|DON'?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
 
 
 def parse_verdict(review_text: str) -> str:
-    """GO / NO-GO from the leading "VERDICT:" line the prompt asks for; else from the final
-    GO/NO-GO section (NO-GO wins); else UNKNOWN (e.g. an answer cut off before any verdict).
+    """GO / NO-GO from the leading "VERDICT:" line the prompt asks for. Without one, only NO-GO
+    is read from the final GO/NO-GO section (or the tail); a bare "GO" there is UNKNOWN, never GO:
+    "do NOT GO" or "not a GO" must not pass, so GO needs the explicit VERDICT line (fail safe).
+    Negated GO ("NOT GO", "not a GO", "don't GO") counts as NO-GO wherever NO-GO is looked for.
     A VERDICT line naming both ("VERDICT: GO or VERDICT: NO-GO") is the instruction echoed back,
     not a decision: it is ignored, including by the fallback.
     A leading GO is overruled by a later explicit "VERDICT: NO-GO" line or a final GO/NO-GO section
@@ -452,15 +456,13 @@ def parse_verdict(review_text: str) -> str:
         later_no_go = any(m.group(1).upper().startswith("NO") and not _VERDICT_WORD.search(m.group(2))
                           for m in _VERDICT_LINE.finditer(text))
         section = text[idx + len("GO/NO-GO"):] if idx >= 0 else ""   # no heading: trust the lead line
-        if later_no_go or re.search(r"\bNO[- ]GO\b", section, re.IGNORECASE):
+        if later_no_go or _NO_GO.search(section):
             return "NO-GO"
         return "GO"
     tail = text[idx + len("GO/NO-GO"):] if idx >= 0 else text[-600:]
-    if re.search(r"\bNO[- ]GO\b", tail, re.IGNORECASE):
+    if _NO_GO.search(tail):
         return "NO-GO"
-    if re.search(r"\bGO\b", tail):
-        return "GO"
-    return "UNKNOWN"
+    return "UNKNOWN"   # no VERDICT line: a GO here is not trusted (negation, cut-off, format ignored)
 
 
 def combine_verdicts(verdicts: list[str], unreviewed_chunks: int = 0) -> str:
