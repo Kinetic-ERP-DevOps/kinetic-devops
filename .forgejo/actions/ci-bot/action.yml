@@ -31,6 +31,7 @@ runs:
         FORGEJO_TOKEN: ${{ inputs.bot-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
+        # Copied out of the workspace before use; the PR goes into a separate worktree (see ci_bot.py review()).
         REVIEW_SCRIPT: ${{ github.action_path }}/../ai-review/ai_review.py
       # System Python if there is one, else uv's (native distro runners ship none).
       run: |
