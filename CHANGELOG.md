@@ -129,6 +129,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   instead of waiting forever (on Windows, `getpass` reads the console directly, so closing stdin didn't help).
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
 
+### Security
+- GitHub workflows pin every action to a full commit SHA (the version in a comment) instead of a movable tag
+  or branch: the PyPI publish job holds `id-token: write`, so a moved or compromised upstream ref could have
+  published as kinetic-devops. Dependabot now updates the pins (`github-actions` ecosystem).
 
 ## [0.2.0.0a8] - 2026-11-01
 
