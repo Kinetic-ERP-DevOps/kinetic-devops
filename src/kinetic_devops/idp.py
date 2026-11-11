@@ -294,9 +294,19 @@ def refresh(token_endpoint: str, client_id: str, refresh_token: str) -> Dict:
 
 
 def _token_request(token_endpoint: str, data: Dict[str, str]) -> Dict:
+    """POST to the token endpoint. Every failure is an IdPError (callers then ask for a new sign-in), not a traceback."""
     _https(token_endpoint, "The IdP token endpoint")   # also guards a stored endpoint used for refreshes
-    resp = requests.post(token_endpoint, data=data, timeout=30, verify=True, allow_redirects=False)
-    body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        resp = requests.post(token_endpoint, data=data, timeout=30, verify=True, allow_redirects=False)
+    except requests.RequestException as exc:
+        raise IdPError(f"Couldn't reach the IdP token endpoint ({type(exc).__name__}); check the network, "
+                       "then sign in again.") from exc
+    try:
+        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    except ValueError as exc:
+        raise IdPError(f"The IdP token endpoint answered HTTP {resp.status_code} with malformed JSON.") from exc
+    if not isinstance(body, dict):
+        body = {}
     if not resp.ok or "access_token" not in body:
         raise IdPError(f"IdP token request failed: {resp.status_code} {body.get('error', '')} "
                        f"{body.get('error_description', '')}".strip(), error=str(body.get("error") or ""))

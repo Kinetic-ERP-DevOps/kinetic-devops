@@ -346,6 +346,25 @@ class TestRefreshSession(unittest.TestCase):
         self.assertIsNone(tok)
         self.assertEqual(self.stored, [])
 
+    def test_network_error_takes_the_sign_in_again_path(self):
+        """Review finding #9: a ConnectionError/Timeout during a refresh was a traceback, not "sign in again"."""
+        import requests
+        for exc in (requests.ConnectionError("network down"), requests.Timeout("slow")):
+            with patch("requests.post", side_effect=exc), patch.object(idp, "get_client_id", return_value="cid"):
+                tok = idp.refresh_session(self.meta, reread=lambda: dict(self.meta), store=self.stored.append,
+                                          slot=self.slot)
+            self.assertIsNone(tok)
+        self.assertEqual(self.stored, [])   # the refresh token is kept: the failure may be temporary
+
+    def test_malformed_json_is_an_idp_error(self):
+        bad = _resp({}, 200)
+        bad.json.side_effect = ValueError("Expecting value")
+        req = MagicMock()
+        req.post.return_value = bad
+        with patch.object(idp, "requests", req), self.assertRaises(idp.IdPError) as ctx:
+            idp.refresh(SETTINGS["token"], "cid", "RT")
+        self.assertIn("malformed JSON", str(ctx.exception))
+
     def test_lock_waits_and_times_out_when_the_lock_cant_be_checked(self):
         """Regression: an OSError while checking a held lock used to retry at once, forever (no sleep, no deadline)."""
         path = os.path.join(idp.lock_dir(), "kinetic-idp-" + hashlib.sha256(self.slot.encode()).hexdigest()[:16] + ".lock")
