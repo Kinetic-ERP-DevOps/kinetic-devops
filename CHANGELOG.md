@@ -182,6 +182,8 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   and of the servers map now encrypt with the vault passphrase when the vault is encrypted (and refuse to write
   without it); reads accept both forms, and unencrypted vaults are unchanged. `encrypt-vault` / `decrypt-vault`
   now cover the IdP side entries; run `encrypt-vault` again to encrypt sessions stored by earlier versions.
+  A session they can't read (a token encrypted with another passphrase, a missing entry) is left as it was and
+  counted, never rewritten as an empty token; a session whose token can't be decrypted reads as expired.
   Encryption makes a token entry ~1.4x longer, so any session's `current_token` over the keyring's ~1280-character
   limit (Windows Credential Manager), such as a password session with a typical Kinetic token in an encrypted
   vault, is split over `current_token#N` entries; both forms are read, and `rename`, `logout` and the clean-up

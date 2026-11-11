@@ -551,7 +551,8 @@ class KineticConfigManager(KineticCore):
 
     def _reseal_token_slots(self, servers: Dict, read_pass: Optional[str], write_pass: Optional[str]) -> int:
         """Rewrite every recorded session's token material with write_pass (None: plain JSON). For encrypt-vault and
-        decrypt-vault. Returns how many slots couldn't be read (left as they were)."""
+        decrypt-vault. Returns how many slots couldn't be read; those are left as they were (a token that can't be
+        decrypted is never written back as an empty one)."""
         failed = 0
         for name, cfg in servers.items():
             api_key = cfg.get("api_key", "")
@@ -564,7 +565,7 @@ class KineticConfigManager(KineticCore):
                     continue
                 try:
                     data = crypto.decrypt_json(raw, read_pass) if crypto.is_encrypted_blob(raw) else json.loads(raw)
-                    data = idp.unpack(slot, data, read_pass)
+                    data = idp.unpack(slot, data, read_pass, strict=True)   # unreadable token: raises, slot kept
                     idp.write_token_entry(slot, self._seal(idp.pack(slot, data, write_pass), write_pass))
                 except Exception:
                     failed += 1
@@ -667,7 +668,11 @@ class KineticConfigManager(KineticCore):
         return cfg.get('api_key', '')
 
     def _get_token_meta(self, token_slot: str) -> Optional[Dict]:
-        """Retrieves metadata using the unique token_slot identifier."""
+        """Retrieves metadata using the unique token_slot identifier.
+
+        A session whose access token can't be read (encrypted with a passphrase that isn't at hand) is returned
+        with _is_valid False, so it is renewed or signed in again, never used with an empty token.
+        """
         raw_data = idp.read_token_entry(token_slot)
         if not raw_data: return None
 
@@ -697,6 +702,8 @@ class KineticConfigManager(KineticCore):
             stored_at = data.get("_local_timestamp", 0)
             expires_in = data.get("expires_in") or data.get("ExpiresIn") or DEFAULT_TTL_SEC
             remaining = int(expires_in - (time.time() - stored_at))
+            if not (data.get("AccessToken") or data.get("access_token")):
+                remaining = 0   # the token couldn't be read (or there is none): not a usable session
             data["_remaining"] = remaining if remaining > 0 else 0
             data["_is_valid"] = remaining > 0
             return data

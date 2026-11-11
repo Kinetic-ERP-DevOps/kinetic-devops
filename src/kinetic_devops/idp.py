@@ -357,6 +357,10 @@ MAX_ENTRY_CHARS = 1280
 TOKEN_ENTRY = "current_token"
 
 
+class UnreadableTokenError(ValueError):
+    """A stored token is there but can't be read (wrong or missing passphrase, or a chunk is missing)."""
+
+
 def _side(field: str) -> str:
     return f"idp_{field}"
 
@@ -372,12 +376,19 @@ def _put_chunked(service: str, name: str, value: str) -> None:
             keyring.delete_password(service, f"{name}#{i}")
 
 
-def _get_chunked(service: str, name: str) -> str:
+def _get_chunked(service: str, name: str, strict: bool = False) -> str:
+    """The chunked value, or "" if there is none. strict: a count whose chunks aren't all there raises."""
     count = keyring.get_password(service, name) or ""
     if not count.isdigit():
+        if strict:
+            raise UnreadableTokenError(f"{name}: not there")
         return ""
     parts = [keyring.get_password(service, f"{name}#{i}") for i in range(int(count))]
-    return "" if any(p is None for p in parts) else "".join(parts)
+    if any(p is None for p in parts):
+        if strict:
+            raise UnreadableTokenError(f"{name}: a chunk is missing")
+        return ""
+    return "".join(parts)
 
 
 def _delete_chunked(service: str, name: str) -> None:
@@ -438,19 +449,24 @@ def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
     return stub
 
 
-def unpack(slot: str, data: Dict, passphrase: Optional[str] = None) -> Dict:
+def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool = False) -> Dict:
     """Inverse of pack (no-op for other sessions). Reads clear and encrypted side entries alike.
 
     An encrypted token that can't be decrypted (no passphrase, or a wrong one) reads as missing, like an encrypted
-    "current_token" does: the session then needs a new sign-in.
+    "current_token" does: the session then needs a new sign-in. strict (for re-encrypting the vault): that, or a
+    missing chunk, raises UnreadableTokenError instead, so the caller can leave the slot as it is.
     """
     if data.get("_idp_split"):
         for field in SECRET_FIELDS:
-            value = _get_chunked(slot, _side(field))
+            value = _get_chunked(slot, _side(field), strict=strict)
             if crypto.is_encrypted_blob(value):
                 try:
-                    value = str(crypto.decrypt_json(value, passphrase)) if passphrase else ""
-                except Exception:
+                    if not passphrase:
+                        raise UnreadableTokenError(f"{field}: encrypted, and no passphrase")
+                    value = str(crypto.decrypt_json(value, passphrase))
+                except Exception as exc:
+                    if strict:
+                        raise UnreadableTokenError(f"{field}: can't be decrypted") from exc
                     value = ""
             data[field] = value
     return data

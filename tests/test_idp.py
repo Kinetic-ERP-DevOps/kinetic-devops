@@ -946,6 +946,39 @@ class TestEncryptedVaultIdpTokens(VaultFixture):
         self.assertEqual(self.leaked(), [])
         self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
 
+    def test_encrypt_vault_leaves_a_token_it_cant_decrypt_as_it_is(self):
+        """A side entry encrypted with another passphrase was read as "" and written back as an empty token, and
+        not counted as a failure. Now the slot is left untouched and counted."""
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        idp._put_chunked(self.slot, "idp_refresh_token", _fake_encrypt("RT-OTHER", "other-pass"))
+        before = dict(self.kr.store)
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertIn("1 session(s) couldn't be read", out.getvalue())
+        self.assertEqual({k: v for k, v in self.kr.store.items() if k[0] == self.slot},
+                         {k: v for k, v in before.items() if k[0] == self.slot})
+
+    def test_encrypt_vault_counts_a_missing_chunk_and_leaves_the_slot(self):
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.kr.delete_password(self.slot, "idp_AccessToken#1")
+        with patch("builtins.print") as printed:
+            self.mgr.encrypt_vault("pass-1")
+        self.assertIn("1 session(s)", " ".join(str(c.args[0]) for c in printed.call_args_list))
+        self.assertIsNotNone(self.kr.get_password(self.slot, "idp_refresh_token#0"))
+
+    def test_session_whose_token_cant_be_decrypted_is_not_valid(self):
+        """_get_token_meta returned _is_valid True with an empty AccessToken when a side entry didn't decrypt."""
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        idp._put_chunked(self.slot, "idp_AccessToken", _fake_encrypt("AT-OTHER", "other-pass"))
+        meta = self.mgr._get_token_meta(self.slot)
+        self.assertEqual(meta["AccessToken"], "")
+        self.assertFalse(meta["_is_valid"])
+        self.assertEqual(meta["_remaining"], 0)
+
 
 class TestIdpRefreshAsksForThePassphraseFirst(VaultFixture):
     """Review finding: with --vault-prompt every, a refresh asked for the passphrase only to store the new tokens,
