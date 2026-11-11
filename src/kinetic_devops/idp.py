@@ -29,7 +29,7 @@ import urllib.parse
 import webbrowser
 from typing import Callable, Dict, Iterator, Optional
 
-from kinetic_devops import _lazy_import
+from kinetic_devops import _lazy_import, crypto
 
 keyring = _lazy_import("keyring")
 requests = _lazy_import("requests")
@@ -377,22 +377,37 @@ def _delete_chunked(service: str, name: str) -> None:
         keyring.delete_password(service, name)
 
 
-def pack(slot: str, meta: Dict) -> Dict:
-    """Store an IdP session's tokens in side entries; return the small metadata to keep in "current_token"."""
+def pack(slot: str, meta: Dict, passphrase: Optional[str] = None) -> Dict:
+    """Store an IdP session's tokens in side entries; return the small metadata to keep in "current_token".
+
+    passphrase: the vault's, when the vault is encrypted. Each token is then encrypted (crypto.encrypt_json) before
+    it is chunked, so no side entry holds a token in clear. The caller encrypts the returned metadata the same way.
+    """
     if meta.get("auth_method") != "idp":
         return meta
     for field in SECRET_FIELDS:
-        _put_chunked(slot, _side(field), str(meta.get(field) or ""))
+        value = str(meta.get(field) or "")
+        _put_chunked(slot, _side(field), crypto.encrypt_json(value, passphrase) if passphrase else value)
     stub = {k: v for k, v in meta.items() if k not in SECRET_FIELDS and k not in ("_is_valid", "_remaining")}
     stub["_idp_split"] = True
     return stub
 
 
-def unpack(slot: str, data: Dict) -> Dict:
-    """Inverse of pack (no-op for other sessions)."""
+def unpack(slot: str, data: Dict, passphrase: Optional[str] = None) -> Dict:
+    """Inverse of pack (no-op for other sessions). Reads clear and encrypted side entries alike.
+
+    An encrypted token that can't be decrypted (no passphrase, or a wrong one) reads as missing, like an encrypted
+    "current_token" does: the session then needs a new sign-in.
+    """
     if data.get("_idp_split"):
         for field in SECRET_FIELDS:
-            data[field] = _get_chunked(slot, _side(field))
+            value = _get_chunked(slot, _side(field))
+            if crypto.is_encrypted_blob(value):
+                try:
+                    value = str(crypto.decrypt_json(value, passphrase)) if passphrase else ""
+                except Exception:
+                    value = ""
+            data[field] = value
     return data
 
 

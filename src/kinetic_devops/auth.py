@@ -430,26 +430,143 @@ class KineticConfigManager(KineticCore):
         # If it's an encrypted blob, attempt to decrypt using environment
         # variable `KINETIC_VAULT_PASSPHRASE` or prompt interactively.
         if crypto.is_encrypted_blob(raw):
-            passphrase = os.environ.get("KINETIC_VAULT_PASSPHRASE")
-            if not passphrase and sys.stdout.isatty():
-                try:
-                    passphrase = getpass.getpass("Vault passphrase: ")
-                except Exception:
-                    passphrase = None
+            passphrase = self._vault_passphrase()
 
             if not passphrase:
                 raise RuntimeError("Vault is encrypted. Set KINETIC_VAULT_PASSPHRASE or run in interactive terminal to provide passphrase.")
 
             try:
-                return crypto.decrypt_json(raw, passphrase)
+                servers = crypto.decrypt_json(raw, passphrase)
             except Exception as e:
                 raise RuntimeError(f"Failed to decrypt vault: {e}")
+            self._vault_pass = passphrase   # it opened the vault: don't ask again in this process
+            return servers
 
         # Legacy plain JSON fallback
         try:
             return json.loads(raw)
         except Exception:
             return {}
+
+    # --- Encrypted vault (encrypt-vault) ---------------------------------------------------------------------
+    # The vault counts as encrypted when the servers map is an encrypted blob. Then every write of the servers map
+    # or of a session's token material (the slot's "current_token" and an IdP session's token side entries) is
+    # encrypted with the vault passphrase; writes go through _save_server_dict and _save_token_meta only. Reads
+    # accept clear and encrypted entries alike, so vaults that were never encrypted keep working unchanged.
+
+    def _vault_pass_if_known(self) -> Optional[str]:
+        """The vault passphrase if it's at hand without asking (already used, or KINETIC_VAULT_PASSPHRASE)."""
+        return getattr(self, "_vault_pass", None) or os.environ.get("KINETIC_VAULT_PASSPHRASE") or None
+
+    def _vault_passphrase(self) -> Optional[str]:
+        """The vault passphrase: one that already opened the vault in this process, else KINETIC_VAULT_PASSPHRASE,
+        else asked at a terminal. None if there is none of these."""
+        passphrase = getattr(self, "_vault_pass", None) or os.environ.get("KINETIC_VAULT_PASSPHRASE")
+        if not passphrase and sys.stdout.isatty():
+            try:
+                passphrase = getpass.getpass("Vault passphrase: ")
+            except Exception:
+                passphrase = None
+        return passphrase or None
+
+    def _write_passphrase(self) -> Optional[str]:
+        """Passphrase to encrypt a write with: None when the vault isn't encrypted (writes stay plain JSON).
+
+        With the vault encrypted, the passphrase must open the servers map, so a mistyped one can't seal entries
+        nobody can read. Without a (right) passphrase this raises: nothing is ever written in clear to an
+        encrypted vault.
+        """
+        raw = keyring.get_password(SERVICE_SERVERS, "config")
+        if not raw or not crypto.is_encrypted_blob(raw):
+            return None
+        passphrase = self._vault_passphrase()
+        if not passphrase:
+            raise RuntimeError("Vault is encrypted. Set KINETIC_VAULT_PASSPHRASE or run in an interactive terminal; "
+                               "refusing to store anything in clear.")
+        if passphrase != getattr(self, "_vault_pass", None):
+            try:
+                crypto.decrypt_json(raw, passphrase)
+            except Exception:
+                raise RuntimeError("That passphrase doesn't open the vault; nothing was stored.") from None
+            self._vault_pass = passphrase
+        return passphrase
+
+    def _seal(self, obj: Any, passphrase: Optional[str]) -> str:
+        return crypto.encrypt_json(obj, passphrase) if passphrase else json.dumps(obj)
+
+    def _save_server_dict(self, servers: Dict) -> None:
+        """Store the servers map, encrypted when the vault is."""
+        keyring.set_password(SERVICE_SERVERS, "config", self._seal(servers, self._write_passphrase()))
+
+    def _save_token_meta(self, slot: str, meta: Dict) -> None:
+        """The one write path for a session's token material ("current_token" plus an IdP session's token side
+        entries), encrypted when the vault is."""
+        passphrase = self._write_passphrase()
+        keyring.set_password(slot, "current_token", self._seal(idp.pack(slot, meta, passphrase), passphrase))
+
+    def _reseal_token_slots(self, servers: Dict, read_pass: Optional[str], write_pass: Optional[str]) -> int:
+        """Rewrite every recorded session's token material with write_pass (None: plain JSON). For encrypt-vault and
+        decrypt-vault. Returns how many slots couldn't be read (left as they were)."""
+        failed = 0
+        for name, cfg in servers.items():
+            api_key = cfg.get("api_key", "")
+            for user in cfg.get("sessions", []) or []:
+                slot = self._get_token_key(name, user, api_key)
+                raw = keyring.get_password(slot, "current_token")
+                if not raw:
+                    continue
+                try:
+                    data = crypto.decrypt_json(raw, read_pass) if crypto.is_encrypted_blob(raw) else json.loads(raw)
+                    data = idp.unpack(slot, data, read_pass)
+                    keyring.set_password(slot, "current_token", self._seal(idp.pack(slot, data, write_pass), write_pass))
+                except Exception:
+                    failed += 1
+        return failed
+
+    def encrypt_vault(self, passphrase: str) -> None:
+        """Encrypt the servers map and every session's token material (IdP token side entries included)."""
+        raw = keyring.get_password(SERVICE_SERVERS, "config")
+        if not raw:
+            print("No servers config to encrypt.")
+            return
+        try:
+            if crypto.is_encrypted_blob(raw):
+                servers = crypto.decrypt_json(raw, passphrase)   # also checks it's the vault's passphrase
+                print("Servers map already encrypted.")
+            else:
+                servers = json.loads(raw)
+                keyring.set_password(SERVICE_SERVERS, "config", crypto.encrypt_json(servers, passphrase))
+                print("✅ Servers map encrypted.")
+        except Exception as e:
+            print(f"Failed to encrypt servers: {str(e) or 'wrong passphrase'}")
+            sys.exit(1)
+        self._vault_pass = passphrase
+        failed = self._reseal_token_slots(servers, passphrase, passphrase)
+        if failed:
+            print(f"⚠️ {failed} session(s) couldn't be read and were left as they were; sign in to them again.")
+        print("✅ Vault encryption completed.")
+
+    def decrypt_vault(self, passphrase: str) -> None:
+        """Store the servers map and every session's token material as plain JSON again."""
+        raw = keyring.get_password(SERVICE_SERVERS, "config")
+        if not raw:
+            print("No servers config found.")
+            return
+        try:
+            if crypto.is_encrypted_blob(raw):
+                servers = crypto.decrypt_json(raw, passphrase)
+                keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+                print("✅ Servers map decrypted (now stored as plain JSON).")
+            else:
+                servers = json.loads(raw)
+                print("Servers map is not encrypted.")
+        except Exception as e:
+            print(f"Failed to decrypt servers: {str(e) or 'wrong passphrase'}")
+            sys.exit(1)
+        failed = self._reseal_token_slots(servers, passphrase, None)
+        if failed:
+            print(f"⚠️ {failed} session(s) couldn't be decrypted and were left as they were.")
+        print("✅ Vault decryption completed.")
 
     def _find_env(self, servers: Dict, name: str) -> Tuple[Optional[str], Optional[Dict]]:
         """Case-insensitive lookup for a saved server configuration.
@@ -508,13 +625,9 @@ class KineticConfigManager(KineticCore):
         if not raw_data: return None
 
         # If token slot is encrypted, decrypt it with same passphrase logic
+        passphrase = None
         if crypto.is_encrypted_blob(raw_data):
-            passphrase = os.environ.get("KINETIC_VAULT_PASSPHRASE")
-            if not passphrase and sys.stdout.isatty():
-                try:
-                    passphrase = getpass.getpass("Vault passphrase: ")
-                except Exception:
-                    passphrase = None
+            passphrase = self._vault_passphrase()
             if not passphrase:
                 # Can't decrypt non-interactively; treat as missing
                 return None
@@ -522,13 +635,15 @@ class KineticConfigManager(KineticCore):
                 data = crypto.decrypt_json(raw_data, passphrase)
             except Exception:
                 return None
+            self._vault_pass = passphrase
         else:
             try:
                 data = json.loads(raw_data)
             except Exception:
                 return None
 
-        data = idp.unpack(token_slot, data)
+        # The token side entries of an IdP session are encrypted with the vault too (when it is).
+        data = idp.unpack(token_slot, data, passphrase or self._vault_pass_if_known())
         try:
             stored_at = data.get("_local_timestamp", 0)
             expires_in = data.get("expires_in") or data.get("ExpiresIn") or DEFAULT_TTL_SEC
@@ -594,7 +709,7 @@ class KineticConfigManager(KineticCore):
         token_meta['_last_used'] = now
         
         # 3. Persist to Keyring (Obscured Slot)
-        keyring.set_password(slot, "current_token", json.dumps(idp.pack(slot, token_meta)))
+        self._save_token_meta(slot, token_meta)
         
         # 4. Register user in sessions list (CENTRALIZED LOGIC)
         if nickname:
@@ -607,7 +722,7 @@ class KineticConfigManager(KineticCore):
                     if user_id.lower() not in [s.lower() for s in sessions]:
                         sessions.append(user_id)
                         cfg["sessions"] = sessions
-                        keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+                        self._save_server_dict(servers)
         
         # 5. Promote to Global Last-Run Pointer
         # This is what prompt_for_env looks for first.
@@ -798,7 +913,7 @@ class KineticConfigManager(KineticCore):
                 return tuple(local_list)
 
             master_cfg["companies"] = ",".join(final_list)
-            keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+            self._save_server_dict(servers)
             print(f"✅ Updated list saved for {nickname or name}.")
             return tuple(final_list)
 
@@ -1057,7 +1172,7 @@ class KineticConfigManager(KineticCore):
         
         # Clear the session list in config too
         cfg["sessions"] = []
-        keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+        self._save_server_dict(servers)
         print(f"✅ All sessions for {name} have been purged.")
 
     def inspect(self, env_name: str):
@@ -1113,7 +1228,7 @@ class KineticConfigManager(KineticCore):
         if data:
             data['current_company'] = company_id
             # Re-save the updated JSON blob to the keyring
-            keyring.set_password(slot, "current_token", json.dumps(idp.pack(slot, data)))
+            self._save_token_meta(slot, data)
 
     def get_all_configs(self) -> Dict[str, Dict]:
         """Module API: Returns a dictionary of all stored configs with their current token status."""
@@ -1193,7 +1308,7 @@ class KineticConfigManager(KineticCore):
                 "api_key": key, 
                 "sessions": servers.get(name, {}).get("sessions", []) 
             }
-            keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+            self._save_server_dict(servers)
             print(f"✅ Stored {name}")
 
 
@@ -1352,7 +1467,7 @@ class KineticConfigManager(KineticCore):
             entry.pop("company", None)
             entry.setdefault("display_name", k)
             new_servers[k] = entry
-        keyring.set_password(SERVICE_SERVERS, "config", json.dumps(new_servers))
+        self._save_server_dict(new_servers)
         print("✅ Migration complete.")
 
     def set_api_key(self, env_name: str, value: str = ""):
@@ -1396,7 +1511,7 @@ class KineticConfigManager(KineticCore):
 
         cfg["api_key"] = new_key
         servers[name] = cfg
-        keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+        self._save_server_dict(servers)
 
         try:
             last_slot = keyring.get_password("KineticSDK", "LAST_GLOBAL_SESSION") or ""
@@ -1736,7 +1851,7 @@ class KineticConfigManager(KineticCore):
         name, _ = self._find_env(servers, env_name)
         if name:
             del servers[name]
-            keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+            self._save_server_dict(servers)
             print(f"Deleted '{name}'.")
 
     def rename(self, old_name: str, new_name: str, dry_run: bool = False) -> Dict[str, Any]:
@@ -2175,7 +2290,7 @@ class KineticConfigManager(KineticCore):
             servers[env_name] = cfg
         
         # Save updated config (with empty sessions lists)
-        keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+        self._save_server_dict(servers)
         print(f"✅ Deleted {deleted_count} token slots across all environments")
         print("✅ Cleared sessions lists for all environments")
         print("✅ Server configs preserved (URLs, API keys, companies)")
@@ -2461,7 +2576,7 @@ class KineticConfigManager(KineticCore):
         
         # Save repaired config
         if fixes_applied:
-            keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+            self._save_server_dict(servers)
         
         # Print report
         print("=" * 60)
@@ -2881,38 +2996,7 @@ def main():
             if not passphrase:
                 print("Provide KINETIC_VAULT_PASSPHRASE env var or run interactively.")
                 sys.exit(1)
-
-            # Encrypt servers map
-            raw = keyring.get_password(SERVICE_SERVERS, "config")
-            if not raw:
-                print("No servers config to encrypt.")
-            else:
-                if crypto.is_encrypted_blob(raw):
-                    print("Vault already encrypted.")
-                else:
-                    try:
-                        servers = json.loads(raw)
-                        enc = crypto.encrypt_json(servers, passphrase)
-                        keyring.set_password(SERVICE_SERVERS, "config", enc)
-                        print("✅ Servers map encrypted.")
-                    except Exception as e:
-                        print(f"Failed to encrypt servers: {e}")
-
-            # Encrypt token slots
-            servers = mgr._get_server_dict()
-            for name, cfg in servers.items():
-                api_key = cfg.get('api_key', '')
-                for user in cfg.get('sessions', []):
-                    slot = mgr._get_token_key(name, user, api_key)
-                    token_raw = keyring.get_password(slot, 'current_token')
-                    if token_raw and not crypto.is_encrypted_blob(token_raw):
-                        try:
-                            token_data = json.loads(token_raw)
-                            enc_token = crypto.encrypt_json(token_data, passphrase)
-                            keyring.set_password(slot, 'current_token', enc_token)
-                        except Exception:
-                            pass
-            print("✅ Vault encryption completed.")
+            mgr.encrypt_vault(passphrase)
 
         elif args.command == "decrypt-vault":
             passphrase = os.environ.get("KINETIC_VAULT_PASSPHRASE")
@@ -2921,35 +3005,7 @@ def main():
             if not passphrase:
                 print("Provide KINETIC_VAULT_PASSPHRASE env var or run interactively.")
                 sys.exit(1)
-
-            raw = keyring.get_password(SERVICE_SERVERS, "config")
-            if not raw:
-                print("No servers config found.")
-            else:
-                if not crypto.is_encrypted_blob(raw):
-                    print("Servers map is not encrypted.")
-                else:
-                    try:
-                        dec = crypto.decrypt_json(raw, passphrase)
-                        keyring.set_password(SERVICE_SERVERS, "config", json.dumps(dec))
-                        print("✅ Servers map decrypted (now stored as plain JSON).")
-                    except Exception as e:
-                        print(f"Failed to decrypt servers: {e}")
-
-            # Decrypt token slots
-            servers = mgr._get_server_dict()
-            for name, cfg in servers.items():
-                api_key = cfg.get('api_key', '')
-                for user in cfg.get('sessions', []):
-                    slot = mgr._get_token_key(name, user, api_key)
-                    token_raw = keyring.get_password(slot, 'current_token')
-                    if token_raw and crypto.is_encrypted_blob(token_raw):
-                        try:
-                            token_data = crypto.decrypt_json(token_raw, passphrase)
-                            keyring.set_password(slot, 'current_token', json.dumps(token_data))
-                        except Exception:
-                            pass
-            print("✅ Vault decryption completed.")
+            mgr.decrypt_vault(passphrase)
 
         elif args.command == "panic": mgr.panic()
         elif args.command == "validate": mgr.validate()

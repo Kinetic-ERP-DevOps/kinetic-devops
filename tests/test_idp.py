@@ -16,8 +16,9 @@ import urllib.parse
 import urllib.request
 from unittest.mock import MagicMock, patch
 
-from kinetic_devops import idp
+from kinetic_devops import auth, crypto, idp
 from kinetic_devops.auth import KineticConfigManager, SessionResolutionError
+from tests.cli_matrix import native_checks_enabled
 
 CONFIG = {"IdentityProvider": {"Enabled": True, "Endpoint": "https://idp.example/tid/42/",
                                "ApiScope": "epicor_erp idp_access"}}
@@ -718,6 +719,148 @@ class TestSlotStorage(unittest.TestCase):
         meta = {"AccessToken": "jwt", "user_id": "alice"}
         self.assertIs(idp.pack("slot", meta), meta)
         self.assertEqual(self.kr.store, {})
+
+
+def _fake_encrypt(obj, passphrase):
+    """Stand-in for crypto.encrypt_json (no native library): an {"_enc": true} blob that hides the plaintext."""
+    ct = base64.b64encode(json.dumps(obj).encode()).decode()[::-1]
+    return json.dumps({"_enc": True, "ver": 1, "salt": "", "iv": hashlib.sha256(passphrase.encode()).hexdigest(),
+                       "ct": ct})
+
+
+def _fake_decrypt(blob, passphrase):
+    wrapper = json.loads(blob)
+    if wrapper.get("iv") != hashlib.sha256(passphrase.encode()).hexdigest():
+        raise ValueError("InvalidTag")
+    return json.loads(base64.b64decode(wrapper["ct"][::-1]))
+
+
+class TestEncryptedVaultIdpTokens(unittest.TestCase):
+    """Review finding #8: with the vault encrypted, IdP tokens were written in clear (the idp_*#N side entries), and
+    touch_session rewrote "current_token" (and the servers map) as plain JSON, undoing encrypt-vault."""
+
+    SECRETS = ("AT-SECRET", "RT-SECRET", "API-KEY-SECRET")
+
+    def setUp(self):
+        self.kr = FakeKeyring()
+        self.servers = {"pilot": {"url": "https://pilot.example", "api_key": "API-KEY-SECRET", "companies": "ACME",
+                                  "sessions": ["alice"]}}
+        self.mgr = KineticConfigManager.__new__(KineticConfigManager)
+        self.slot = self.mgr._get_token_key("pilot", "alice", "API-KEY-SECRET")
+        self.meta = {"auth_method": "idp", "AccessToken": "AT-SECRET" + "a" * 2000, "refresh_token": "RT-SECRET",
+                     "expires_in": 3600, "_local_timestamp": time.time(), "user_id": "alice", "env_name": "pilot",
+                     "idp_tenant": "42", "idp_token_endpoint": SETTINGS["token"], "current_company": "ACME"}
+        self.patches = [patch.object(idp, "keyring", self.kr), patch.object(auth, "keyring", self.kr),
+                        patch.object(crypto, "encrypt_json", _fake_encrypt),
+                        patch.object(crypto, "decrypt_json", _fake_decrypt),
+                        patch.object(sys.stdout, "isatty", return_value=False),
+                        patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"})]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def leaked(self):
+        return sorted(n for (_, n), v in self.kr.store.items() if any(x in v for x in self.SECRETS))
+
+    def encrypted_vault(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+
+    def test_pack_with_the_vault_passphrase_stores_no_token_in_clear(self):
+        stub = idp.pack("slot", {"auth_method": "idp", "AccessToken": "AT-SECRET", "refresh_token": "RT-SECRET"},
+                        "pass-1")
+        self.assertEqual(self.leaked(), [])
+        back = idp.unpack("slot", dict(stub), "pass-1")
+        self.assertEqual((back["AccessToken"], back["refresh_token"]), ("AT-SECRET", "RT-SECRET"))
+        # without (or with a wrong) passphrase the tokens read as missing: sign in again, no traceback
+        self.assertEqual(idp.unpack("slot", dict(stub))["refresh_token"], "")
+        self.assertEqual(idp.unpack("slot", dict(stub), "wrong")["refresh_token"], "")
+
+    def test_sign_in_and_refresh_keep_an_encrypted_vault_encrypted(self):
+        self.encrypted_vault()
+        self.servers["pilot"]["sessions"] = []   # touch_session registers the user: the servers map is rewritten
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.assertEqual(self.leaked(), [])
+        self.assertTrue(crypto.is_encrypted_blob(self.kr.get_password(self.slot, "current_token")))
+        servers = _fake_decrypt(self.kr.get_password(auth.SERVICE_SERVERS, "config"), "pass-1")
+        self.assertEqual(servers["pilot"]["sessions"], ["alice"])
+        back = self.mgr._get_token_meta(self.slot)
+        self.assertEqual((back["AccessToken"], back["refresh_token"]), (self.meta["AccessToken"], "RT-SECRET"))
+        self.assertTrue(back["_is_valid"])
+        self.mgr.set_current_company("pilot", "alice", "BETA")   # the other write path
+        self.assertEqual(self.leaked(), [])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["current_company"], "BETA")
+
+    def test_unencrypted_vault_is_unchanged(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        stub = json.loads(self.kr.get_password(self.slot, "current_token"))
+        self.assertTrue(stub["_idp_split"])
+        self.assertEqual(idp._get_chunked(self.slot, "idp_refresh_token"), "RT-SECRET")
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+
+    def test_no_passphrase_refuses_to_write_in_clear(self):
+        self.encrypted_vault()
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.assertIn("KINETIC_VAULT_PASSPHRASE", str(ctx.exception))
+        self.assertEqual(self.leaked(), [])
+
+    def test_wrong_passphrase_refuses_to_write(self):
+        self.encrypted_vault()
+        os.environ["KINETIC_VAULT_PASSPHRASE"] = "typo"
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        self.assertIn("doesn't open the vault", str(ctx.exception))
+        self.assertIsNone(self.kr.get_password(self.slot, "current_token"))
+
+    def test_encrypt_vault_encrypts_idp_side_entries_and_decrypt_vault_restores_them(self):
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")   # plain vault: tokens in clear
+        self.assertTrue(self.leaked())
+        with patch("builtins.print"):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertEqual(self.leaked(), [])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+        with patch("builtins.print"):
+            self.mgr.decrypt_vault("pass-1")
+        self.assertFalse(crypto.is_encrypted_blob(self.kr.get_password(self.slot, "current_token")))
+        self.assertEqual(idp._get_chunked(self.slot, "idp_refresh_token"), "RT-SECRET")
+
+    def test_encrypt_vault_repairs_a_slot_left_half_clear_by_older_versions(self):
+        """Older encrypt-vault encrypted the stub but left the side entries in clear; running it again fixes that."""
+        self.encrypted_vault()
+        stub = idp.pack(self.slot, dict(self.meta))   # side entries in clear
+        self.kr.set_password(self.slot, "current_token", _fake_encrypt(stub, "pass-1"))
+        self.assertIn("idp_refresh_token#0", self.leaked())
+        with patch("builtins.print"):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertEqual(self.leaked(), [])
+        self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
+
+
+@unittest.skipUnless(native_checks_enabled(), "native check deferred (loads cryptography's native library)")
+class TestEncryptedVaultIdpTokensNative(unittest.TestCase):
+    def test_real_encryption_round_trip_fits_the_keyring_limit(self):
+        kr = FakeKeyring()
+        meta = {"auth_method": "idp", "AccessToken": "AT-SECRET" + "a" * 3000, "refresh_token": "RT-SECRET",
+                "idp_token_endpoint": SETTINGS["token"], "idp_tenant": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "user_id": "firstname.lastname", "env_name": "MyProductionEnvironment",
+                "idp_username": "firstname.lastname@corp.example", "idp_subject": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+        try:
+            with patch.object(idp, "keyring", kr):
+                stub = idp.pack("slot", meta, "pass-1")
+                kr.set_password("slot", "current_token", crypto.encrypt_json(stub, "pass-1"))  # FakeKeyring: <= 1280
+                back = idp.unpack("slot", crypto.decrypt_json(kr.get_password("slot", "current_token"), "pass-1"),
+                                  "pass-1")
+        except RuntimeError as exc:   # cryptography not installed, or not loadable
+            self.skipTest(f"vault encryption unavailable: {exc}")
+        self.assertEqual((back["AccessToken"], back["refresh_token"]), (meta["AccessToken"], "RT-SECRET"))
+        self.assertFalse([k for k, v in kr.store.items() if "RT-SECRET" in v or "AT-SECRET" in v])
 
 
 class TestScannerLearnsIdpIdentifiers(unittest.TestCase):

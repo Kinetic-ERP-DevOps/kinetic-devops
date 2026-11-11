@@ -119,6 +119,8 @@ first configured.
   or `<tmp>/kinetic-devops-<uid>`, mode 0700; the per-user temp directory on Windows). A refresh token the IdP
   rejects (`invalid_grant`) is dropped, so the next run asks for a new sign-in.
 - Tokens are stored where password-session tokens are: the OS keyring (Windows Credential Manager by default).
-  The refresh token is long-lived, so treat the keyring entry like a password. The client ID is stored per IdP
-  tenant under the keyring service `kinetic-idp`.
+  The refresh token is long-lived, so treat the keyring entry like a password. With the vault encrypted
+  (`auth encrypt-vault`) the tokens are encrypted with it too; run `encrypt-vault` again to encrypt IdP sessions
+  that earlier versions stored in clear. The client ID is stored per IdP tenant under the keyring service
+  `kinetic-idp`.
 - The tool never prints tokens. Revoke a session from the IdP side (or let it expire) if a machine is lost.
