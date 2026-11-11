@@ -1977,7 +1977,14 @@ class KineticConfigManager(KineticCore):
         # If no company provided, check meta, then fallback to first valid ID in sync list
         active_co = company_id or (meta.get('current_company') if meta else None)
         if not active_co or ',' in str(active_co):
-            active_co = [c.strip() for c in cfg.get('companies', '').split(',') if c.strip()][0]
+            configured = [c.strip() for c in str(cfg.get('companies') or cfg.get('company') or '').split(',')
+                          if c.strip()]
+            if not configured:
+                raise SessionResolutionError(
+                    f"Cannot resolve a company for '{name}': none was given and the environment has no companies "
+                    "configured. Pass the company (--co) or configure the environment's companies."
+                )
+            active_co = configured[0]
 
         # --- 4. MAP & RETURN ---
         source_map = {
