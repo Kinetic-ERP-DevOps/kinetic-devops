@@ -1945,32 +1945,50 @@ class TestBusySessions(VaultFixture):
         self.assertIsNone(self.tokens())
         self.assertEqual(self.mgr._get_server_dict()["pilot"]["sessions"], [])
 
-    def test_api_key_change_with_a_busy_session_keeps_the_key(self):
-        with LockHolder(self.slot), short_lock_waits(), patch("builtins.print") as printed:
+    def test_api_key_change_with_a_busy_session_changes_nothing(self):
+        """Review finding: a refused API-key change had already deleted the sessions before the busy one. Every
+        old slot's lock is taken first; one busy session and nothing is deleted or changed."""
+        servers = self.mgr._get_server_dict()
+        servers["pilot"]["sessions"] = ["alice", "bob"]
+        self.mgr._save_server_dict(servers)
+        bob = self.mgr._get_token_key("pilot", "bob", "API-KEY-SECRET")
+        self.mgr.touch_session(bob, dict(self.meta, user_id="bob", AccessToken="B0" * 1250,
+                                         refresh_token="S0" * 650), "pilot")
+        for busy in sorted([self.slot, bob]):   # whichever comes first in lock order
+            with self.subTest(busy=busy):
+                before = dict(self.kr.store)
+                with LockHolder(busy), short_lock_waits(), patch("builtins.print") as printed:
+                    self.mgr.set_api_key("pilot", "NEW-KEY")
+                self.assertIn("nothing was changed", str(printed.call_args_list))
+                self.assertEqual(self.kr.store, before)
+        with patch("builtins.print"):
             self.mgr.set_api_key("pilot", "NEW-KEY")
-        self.assertIn("was not changed", str(printed.call_args_list))
-        self.assertEqual(self.mgr._get_server_dict()["pilot"]["api_key"], "API-KEY-SECRET")
-        self.assertEqual(self.tokens(), ("A0", "R0"))
+        self.assertEqual(self.mgr._get_server_dict()["pilot"]["api_key"], "NEW-KEY")
+        self.assertEqual([u for (s, u) in self.kr.store if s in (self.slot, bob)], [])
 
     def test_vault_commands_report_a_busy_session_and_rerunning_finishes(self):
         """A busy slot was counted as unreadable and left in clear in an encrypted vault (or encrypted in a clear
-        one). It is retried at the end, waiting longer; if still busy, it is reported as busy, and a rerun does it."""
+        one). Every session's lock is now taken before the vault's encryption changes; a session that stays busy
+        changes nothing, and the command says to run it again."""
         with patch("builtins.print"):
             self.mgr.decrypt_vault("pass-1")
         clear = lambda: [u for (s, u), v in self.kr.store.items() if s == self.slot and ("R0R0" in v or "A0A0" in v)]
         self.assertTrue(clear())
-        with LockHolder(self.slot), short_lock_waits(), patch("builtins.print") as printed:
+        before = dict(self.kr.store)
+        with LockHolder(self.slot), short_lock_waits(), patch("builtins.print") as printed, \
+             self.assertRaises(SystemExit):
             self.mgr.encrypt_vault("pass-1")
         out = " ".join(str(c.args[0]) for c in printed.call_args_list)
         self.assertIn("busy", out)
-        self.assertIn("run encrypt-vault again", out)
+        self.assertIn("Run encrypt-vault again", out)
         self.assertNotIn("couldn't be read", out)
+        self.assertEqual(self.kr.store, before)
         with patch("builtins.print"):
             self.mgr.encrypt_vault("pass-1")
         self.assertEqual(clear(), [])
         self.assertEqual(self.tokens(), ("A0", "R0"))
 
-    def test_a_slot_busy_for_a_moment_is_resealed_by_the_retry(self):
+    def test_a_session_busy_for_a_moment_is_waited_for(self):
         holder = LockHolder(self.slot)
         calls = []
         real = idp.slot_lock
@@ -2014,6 +2032,112 @@ class TestBusySessions(VaultFixture):
         with patch.object(self.mgr, "get_session_by_bearer", return_value=("pilot", "alice")), \
              patch.object(self.mgr, "_get_token_meta", side_effect=ValueError("anything")):
             self.mgr.touch_from_headers({"Authorization": "Bearer A0", "X-Epicor-Company": "BETA"})
+
+
+class TestVaultChangesAndRefreshes(VaultFixture):
+    """Review findings: refreshes racing encrypt-vault, a vault left half decrypted, and touch_from_headers on a
+    vault it can't open (probe cases F, E, D2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+        self.mgr.touch_session(self.slot, dict(self.meta, AccessToken="A0" * 1250, refresh_token="R0" * 650), "pilot")
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        self.idp_rt = ["R0" * 650]
+
+    def idp_refresh(self, endpoint, client_id, rt, delay=0.0):
+        """A rotating IdP: a refresh token works once."""
+        time.sleep(delay)
+        if rt != self.idp_rt[-1]:
+            raise idp.IdPError("invalid_grant", error="invalid_grant")
+        self.idp_rt.append(f"R{len(self.idp_rt)}" * 650)
+        return {"access_token": f"A{len(self.idp_rt) - 1}" * 1250, "refresh_token": self.idp_rt[-1], "expires_in": 3600}
+
+    def expired(self):
+        """The caller's copy of the session: its access token was just rejected (force)."""
+        return dict(self.meta, AccessToken="A0" * 1250, refresh_token="R0" * 650, _is_valid=False)
+
+    def stored_rt(self):
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            meta = KineticConfigManager.__new__(KineticConfigManager)._get_token_meta(self.slot)
+        return meta["refresh_token"]
+
+    def test_encrypt_vault_during_a_refresh_waits_for_it(self):
+        """Probe F: encrypt-vault encrypted the map while a refresh (clear vault, no passphrase) was at the IdP; the
+        refresh then spent R0 and was refused its store: the rotated refresh token was lost. encrypt-vault now
+        waits for the refresh's lock, and the refresh's store happens first."""
+        result = {}
+
+        def refresh():
+            other = KineticConfigManager.__new__(KineticConfigManager)
+            with patch.object(sys, "stderr", io.StringIO()):
+                result["token"] = other._refresh_idp(self.slot, self.expired(), "pilot", force=True)
+        with patch.object(idp, "refresh", lambda e, c, rt: self.idp_refresh(e, c, rt, delay=1.0)), \
+             patch.object(idp, "get_client_id", return_value="cid"):
+            t = threading.Thread(target=refresh)
+            t.start()
+            time.sleep(0.3)   # the refresh holds the lock, at the IdP
+            with patch("builtins.print"):
+                self.mgr.encrypt_vault("pass-1")
+            t.join(30)
+        self.assertTrue(result["token"])
+        self.assertEqual(self.stored_rt(), self.idp_rt[-1])
+        self.assertEqual(self.leaked(), [])
+
+    def test_a_refresh_that_waited_through_encrypt_vault_spends_nothing(self):
+        """The refresh settled the vault (clear: nothing to pin) before taking the lock, then encrypt-vault ran.
+        Under the lock it sees the change and starts over; without a passphrase it stops before the IdP."""
+        real_lock, ran = idp.slot_lock, []
+
+        def lock(slot, wait=30.0):
+            if not ran:   # just before the refresh takes the lock, encrypt-vault runs to completion
+                ran.append(1)
+                with patch("builtins.print"):
+                    KineticConfigManager.__new__(KineticConfigManager).encrypt_vault("pass-1")
+            return real_lock(slot, wait=wait)
+        called = []
+        with patch.object(idp, "slot_lock", lock), patch.object(idp, "get_client_id", return_value="cid"), \
+             patch.object(idp, "refresh", lambda *a: called.append(a) or self.idp_refresh(*a)), \
+             patch.object(sys, "stderr", io.StringIO()) as err:
+            token = self.mgr._refresh_idp(self.slot, self.expired(), "pilot", force=True)
+        self.assertIsNone(token)
+        self.assertEqual(called, [])
+        self.assertIn("KINETIC_VAULT_PASSPHRASE", err.getvalue())
+        self.assertEqual(self.stored_rt(), "R0" * 650)
+
+    def test_half_decrypted_vault_asks_before_the_lock_and_a_typo_spends_nothing(self):
+        """Probe E: servers map clear, this session still encrypted (decrypt-vault left it busy). The refresh asks
+        for the passphrase before taking the lock and checks it against the session."""
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            KineticConfigManager.__new__(KineticConfigManager).touch_session(
+                self.slot, dict(self.meta, AccessToken="A0" * 1250, refresh_token="R0" * 650), "pilot")
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))   # map decrypted only
+        held_when_asked = []
+
+        def ask(prompt):
+            held_when_asked.append(bool(idp._held.__dict__.get("slots", {}).get(self.slot)))
+            return answers.pop(0)
+        for typed, expect_token in ((["typo"], False), (["pass-1"], True)):
+            answers = list(typed)
+            called = []
+            with patch.object(sys.stdout, "isatty", return_value=True), \
+                 patch("kinetic_devops.auth.getpass.getpass", side_effect=ask), \
+                 patch.object(idp, "get_client_id", return_value="cid"), \
+                 patch.object(idp, "refresh", lambda *a: called.append(a) or self.idp_refresh(*a)), \
+                 patch.object(sys, "stderr", io.StringIO()):
+                token = KineticConfigManager.__new__(KineticConfigManager)._refresh_idp(
+                    self.slot, self.expired(), "pilot", force=True)
+            self.assertEqual(bool(token), expect_token)
+            self.assertEqual(bool(called), expect_token)   # a typo spends nothing
+        self.assertNotIn(True, held_when_asked, "asked while holding the session's lock")
+        self.assertEqual(self.stored_rt(), self.idp_rt[-1])
+
+    def test_touch_from_headers_on_a_vault_it_cant_open_doesnt_fail_the_call(self):
+        """Probe D2: encrypted vault, no passphrase, no terminal: get_session_by_bearer raised VaultError, which
+        failed the API call."""
+        self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1"))
+        self.mgr.touch_from_headers({"Authorization": "Bearer " + "A0" * 1250, "X-Epicor-Company": "BETA"})
 
 
 class TestLockAndPassphraseDetails(VaultFixture):

@@ -412,6 +412,10 @@ class VaultError(RuntimeError):
     """The encrypted vault can't be read or written: no passphrase at hand, or one that doesn't open it."""
 
 
+class _VaultChanged(Exception):
+    """The vault was encrypted or decrypted while a refresh waited for the session's lock."""
+
+
 class KineticConfigManager(KineticCore):
     """Manager for Kinetic server configs and token lifecycle stored in keyring.
 
@@ -589,9 +593,9 @@ class KineticConfigManager(KineticCore):
     def _reseal_token_slots(self, servers: Dict, read_pass: Optional[str],
                             write_pass: Optional[str]) -> Tuple[int, int]:
         """Rewrite every recorded session's token material with write_pass (None: plain JSON). For encrypt-vault and
-        decrypt-vault. Returns (slots that couldn't be read, slots another process kept busy); both are left as they
-        were (a token that can't be decrypted is never written back as an empty one). A slot that is busy (a refresh
-        holding its lock) is tried again at the end, waiting longer."""
+        decrypt-vault, which hold every session's lock already (_all_sessions_locked). Returns (slots that couldn't be
+        read, slots that were busy); both are left as they were (a token that can't be decrypted is never written
+        back as an empty one)."""
         failed, busy = 0, []
         for name, cfg in servers.items():
             api_key = cfg.get("api_key", "")
@@ -601,9 +605,7 @@ class KineticConfigManager(KineticCore):
                 failed += outcome == "failed"
                 if outcome == "busy":
                     busy.append(slot)
-        still_busy = [slot for slot in busy
-                      if self._reseal_slot(slot, read_pass, write_pass, wait=SIGN_IN_LOCK_WAIT_SEC) == "busy"]
-        return failed, len(still_busy)
+        return failed, len(busy)
 
     def _reseal_slot(self, slot: str, read_pass: Optional[str], write_pass: Optional[str],
                      wait: float = 30.0) -> str:
@@ -622,6 +624,23 @@ class KineticConfigManager(KineticCore):
             return "busy"
         except Exception:
             return "failed"
+
+    @contextlib.contextmanager
+    def _all_sessions_locked(self, servers: Dict, command: str) -> Iterator[None]:
+        """Hold every recorded session's lock (sorted order, waiting up to SIGN_IN_LOCK_WAIT_SEC each) while the
+        vault's encryption changes, so no refresh is between its read and its store meanwhile (it would spend its
+        refresh token, then be refused the store, or store in the old form). A session that stays busy: nothing is
+        changed, and the command says to run it again."""
+        slots = sorted({self._get_token_key(name, user, cfg.get("api_key", ""))
+                        for name, cfg in servers.items() for user in cfg.get("sessions", []) or []})
+        with contextlib.ExitStack() as locks:
+            try:
+                for slot in slots:
+                    locks.enter_context(self._slot_lock_announced(slot, SIGN_IN_LOCK_WAIT_SEC, announce=True))
+            except idp.IdPError as exc:
+                print(f"❌ A session is busy ({exc}); nothing was changed. Run {command} again.")
+                sys.exit(1)
+            yield
 
     @contextlib.contextmanager
     def _session_write(self, slot: str, wait: float = 30.0, announce: bool = False) -> Iterator[None]:
@@ -657,18 +676,19 @@ class KineticConfigManager(KineticCore):
             print("No servers config to encrypt.")
             return
         try:
-            if crypto.is_encrypted_blob(raw):
-                servers = crypto.decrypt_json(raw, passphrase)   # also checks it's the vault's passphrase
-                print("Servers map already encrypted.")
-            else:
-                servers = json.loads(raw)
-                keyring.set_password(SERVICE_SERVERS, "config", crypto.encrypt_json(servers, passphrase))
-                print("✅ Servers map encrypted.")
+            encrypted = crypto.is_encrypted_blob(raw)
+            servers = crypto.decrypt_json(raw, passphrase) if encrypted else json.loads(raw)   # checks the passphrase
         except Exception as e:
             print(f"Failed to encrypt servers: {str(e) or 'wrong passphrase'}")
             sys.exit(1)
-        self._remember_vault_pass(passphrase)
-        failed, busy = self._reseal_token_slots(servers, passphrase, passphrase)
+        with self._all_sessions_locked(servers, "encrypt-vault"):
+            if encrypted:
+                print("Servers map already encrypted.")
+            else:
+                keyring.set_password(SERVICE_SERVERS, "config", crypto.encrypt_json(servers, passphrase))
+                print("✅ Servers map encrypted.")
+            self._remember_vault_pass(passphrase)
+            failed, busy = self._reseal_token_slots(servers, passphrase, passphrase)
         if failed:
             print(f"⚠️ {failed} session(s) couldn't be read and were left as they were; sign in to them again.")
         if busy:
@@ -683,17 +703,18 @@ class KineticConfigManager(KineticCore):
             print("No servers config found.")
             return
         try:
-            if crypto.is_encrypted_blob(raw):
-                servers = crypto.decrypt_json(raw, passphrase)
-                keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
-                print("✅ Servers map decrypted (now stored as plain JSON).")
-            else:
-                servers = json.loads(raw)
-                print("Servers map is not encrypted.")
+            encrypted = crypto.is_encrypted_blob(raw)
+            servers = crypto.decrypt_json(raw, passphrase) if encrypted else json.loads(raw)
         except Exception as e:
             print(f"Failed to decrypt servers: {str(e) or 'wrong passphrase'}")
             sys.exit(1)
-        failed, busy = self._reseal_token_slots(servers, passphrase, None)
+        with self._all_sessions_locked(servers, "decrypt-vault"):
+            if encrypted:
+                keyring.set_password(SERVICE_SERVERS, "config", json.dumps(servers))
+                print("✅ Servers map decrypted (now stored as plain JSON).")
+            else:
+                print("Servers map is not encrypted.")
+            failed, busy = self._reseal_token_slots(servers, passphrase, None)
         if failed:
             print(f"⚠️ {failed} session(s) couldn't be decrypted and were left as they were.")
         if busy:
@@ -886,27 +907,33 @@ class KineticConfigManager(KineticCore):
         keyring.set_password("KineticSDK", "LAST_GLOBAL_SESSION", slot)
 
     def touch_from_headers(self, headers: dict):
-        """Extracts context from wire headers and updates the session's current company."""
+        """Extracts context from wire headers and updates the session's current company.
+
+        Bookkeeping after an API call: it never fails (or holds up) the call. Any error (a vault it can't open, a
+        keyring error) is logged at debug level and the company isn't recorded this time. The session is re-read
+        under the slot's lock (a refresh may have just rotated its tokens); if another process holds the lock for
+        more than a moment, the company isn't recorded either.
+        """
+        try:
+            self._touch_from_headers(headers)
+        except Exception as exc:   # bookkeeping only (KeyboardInterrupt / SystemExit still propagate)
+            logging.getLogger(__name__).debug("Company not recorded after an API call: %s", exc)
+
+    def _touch_from_headers(self, headers: dict) -> None:
         auth = headers.get('Authorization', '')
         token = auth.replace("Bearer ", "").strip()
         co_id = headers.get('X-Epicor-Company')
-        
-        if token:
-            # Find who this token belongs to
-            nickname, user_id = self.get_session_by_bearer(token, ("nickname", "user_id"))
-            if nickname and user_id and co_id:
-                slot = self._get_token_key(nickname, user_id, self._get_api_key(nickname))
-                # Bookkeeping after an API call: never fail (or hold up) the call for it. The session is re-read
-                # under the slot's lock (a refresh may have just rotated its tokens); if another process holds the
-                # lock for more than a moment, or the vault can't be written, the company isn't recorded this time.
-                try:
-                    with self._session_write(slot, wait=HOT_PATH_LOCK_WAIT_SEC):
-                        meta = self._get_token_meta(slot)
-                        if meta and not meta.get("_tokens_unreadable"):
-                            meta['current_company'] = co_id
-                            self.touch_session(slot, meta, nickname)
-                except Exception as exc:   # bookkeeping only: never fail the API call for it
-                    logging.getLogger(__name__).debug("Company not recorded for %s: %s", nickname, exc)
+        if not token or not co_id:
+            return
+        # Find who this token belongs to
+        nickname, user_id = self.get_session_by_bearer(token, ("nickname", "user_id"))
+        if nickname and user_id:
+            slot = self._get_token_key(nickname, user_id, self._get_api_key(nickname))
+            with self._session_write(slot, wait=HOT_PATH_LOCK_WAIT_SEC):
+                meta = self._get_token_meta(slot)
+                if meta and not meta.get("_tokens_unreadable"):
+                    meta['current_company'] = co_id
+                    self.touch_session(slot, meta, nickname)
 
     def sync_companies(self, env_name: str, passive: bool = False):
         """Sync authorized companies from server to local config for one environment."""
@@ -1679,26 +1706,27 @@ class KineticConfigManager(KineticCore):
 
         deleted_slots = 0
         sessions = cfg.get("sessions", []) or []
-        for user in sessions:
-            user_id = str(user or "").strip()
-            if not user_id:
-                continue
+        old_slots = {str(user).strip(): self._get_token_key(name, str(user).strip(), old_key)
+                     for user in sessions if str(user or "").strip()}
+        # Every session under the old key is removed, and the key changed, with all of their locks held (taken in
+        # sorted order). A session that is busy (another process refreshing it) would be left unreachable, with its
+        # refresh token stored, once the key changes: then nothing is changed at all.
+        with contextlib.ExitStack() as locks:
             try:
-                old_slot = self._get_token_key(name, user_id, old_key)
-                if not idp.delete_session(old_slot, self._vault_pass_if_known()):   # "current_token" first
-                    raise LookupError("no session stored")
-                deleted_slots += 1
+                for old_slot in sorted(set(old_slots.values())):
+                    locks.enter_context(idp.slot_lock(old_slot))
             except idp.IdPError as exc:
-                # A session under the old key that can't be removed now would be left unreachable (and its refresh
-                # token stored) once the key changes: keep the old key, and say to retry.
-                print(f"❌ The session for {user_id} is busy ({exc}); the API key was not changed. Try again.")
+                print(f"❌ A session of {name} is busy ({exc}); nothing was changed. Try again.")
                 return
-            except Exception:
-                pass
-
-        cfg["api_key"] = new_key
-        servers[name] = cfg
-        self._save_server_dict(servers)
+            for user_id, old_slot in old_slots.items():
+                try:
+                    if idp.delete_session(old_slot, self._vault_pass_if_known()):   # lock held: reentrant
+                        deleted_slots += 1
+                except Exception:
+                    pass
+            cfg["api_key"] = new_key
+            servers[name] = cfg
+            self._save_server_dict(servers)
 
         try:
             last_slot = keyring.get_password("KineticSDK", "LAST_GLOBAL_SESSION") or ""
@@ -1938,15 +1966,47 @@ class KineticConfigManager(KineticCore):
         refresh token, so a mistyped passphrase can't lose the new one. A vault error is reported on stderr and
         takes the sign-in-again path (None), not a traceback.
         """
-        try:
-            write_pass = self._write_passphrase()
-            with self._vault_pass_pinned(write_pass):
-                return idp.refresh_session(meta, reread=lambda: self._get_token_meta(slot),
-                                           store=lambda m: self.touch_session(slot, m, nickname), slot=slot,
-                                           force=force)
-        except (VaultError, idp.LockTimeout) as exc:
-            print(f"⚠️ {exc} The IdP session for {nickname} wasn't refreshed.", file=sys.stderr)
-            return None
+        for _ in range(2):   # once more if encrypt-vault / decrypt-vault ran while this waited for the lock
+            try:
+                return self._refresh_idp_once(slot, meta, nickname, force)
+            except _VaultChanged:
+                continue
+            except (VaultError, idp.LockTimeout) as exc:
+                print(f"⚠️ {exc} The IdP session for {nickname} wasn't refreshed.", file=sys.stderr)
+                return None
+        print(f"⚠️ The vault's encryption keeps changing; the IdP session for {nickname} wasn't refreshed.",
+              file=sys.stderr)
+        return None
+
+    def _vault_encrypted(self) -> bool:
+        return crypto.is_encrypted_blob(keyring.get_password(SERVICE_SERVERS, "config") or "")
+
+    def _refresh_idp_once(self, slot: str, meta: Dict, nickname: str, force: bool) -> Optional[str]:
+        """One refresh attempt. Everything the vault needs is settled before the lock: the write passphrase (an
+        encrypted vault), or, when the servers map is clear but this session is still encrypted (decrypt-vault left
+        it busy), the passphrase that opens the session, checked against it. Under the lock, before the IdP is
+        called, the vault's encryption must be what it was then (else _VaultChanged: nothing spent)."""
+        encrypted = self._vault_encrypted()
+        passphrase = self._write_passphrase()
+        if not passphrase:
+            stored = idp.read_token_entry(slot)
+            if stored and crypto.is_encrypted_blob(stored):
+                passphrase = self._vault_pass_if_known() or self._vault_passphrase()
+                if not passphrase:
+                    raise VaultError("This session is encrypted with the vault passphrase. Set "
+                                     "KINETIC_VAULT_PASSPHRASE or run in an interactive terminal.")
+                try:
+                    crypto.decrypt_json(stored, passphrase)
+                except Exception:
+                    raise VaultError("That passphrase doesn't open this session.") from None
+
+        def reread() -> Optional[Dict]:
+            if self._vault_encrypted() != encrypted:
+                raise _VaultChanged()
+            return self._get_token_meta(slot)
+        with self._vault_pass_pinned(passphrase):
+            return idp.refresh_session(meta, reread=reread, store=lambda m: self.touch_session(slot, m, nickname),
+                                       slot=slot, force=force)
 
     def _renew_idp_or_raise(self, slot: str, meta: Dict, name: str, user_id: str, company: str,
                             force: bool = False) -> Optional[str]:

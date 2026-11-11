@@ -200,10 +200,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   after each API call waits at most 2 s for the lock and is skipped otherwise. A refresh's request to the IdP
   times out sooner (5 s to connect, 20 s to answer) than others wait for the lock; storing a completed sign-in
   waits up to 90 s (and says so). Rename holds each session's lock from the copy to the delete, and a refresh
-  that waited for it doesn't refresh the session it no longer finds. A session that stays busy is never reported
-  as done: logout and `clean-sessions` keep it listed and say to run them again, an API-key change is refused,
-  rename changes nothing, and `encrypt-vault` / `decrypt-vault` retry it and otherwise report it as busy, to run
-  again. Logout removes `current_token`
+  that waited for it doesn't refresh the session it no longer finds. `encrypt-vault` / `decrypt-vault` hold every
+  session's lock while they change the vault, and a refresh that waited through one starts over (asking for the
+  passphrase if it now needs one) instead of spending its refresh token and being refused the store. A session
+  that stays busy is never reported as done: logout and `clean-sessions` keep it listed and say to run them again,
+  and an API-key change, rename, `encrypt-vault` and `decrypt-vault` change nothing and say to run them again.
+  The company update after an API call never fails the call. Logout removes `current_token`
   first, so an interrupted logout can't leave a usable refresh token. Versions without this read a chunked entry
   as missing (sign in again). Sessions stored the earlier ways are read, and `rename`, `logout` and the clean-up
   commands handle the chunks.
