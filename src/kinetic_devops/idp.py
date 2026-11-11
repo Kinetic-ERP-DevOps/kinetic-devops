@@ -568,7 +568,8 @@ def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
 
     Only a lock held by someone else is waited for (up to wait seconds). A lock file that can't be opened or locked
     at all (permissions, a full disk) is an IdPError at once, saying why. A lock taken on a file that was meanwhile
-    removed or replaced (its file is no longer the one at the path) is let go and taken again.
+    removed or replaced (its file is no longer the one at the path) is let go and taken again (POSIX;
+    on Windows the file can't be removed or replaced while it is open).
     """
     name = "kinetic-idp-" + hashlib.sha256(slot.encode()).hexdigest()[:16] + ".lock"
     path = os.path.join(lock_dir(), name)
@@ -584,10 +585,13 @@ def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
             os.close(fd)
             raise
         if locked:
-            try:
-                same = os.path.samestat(os.fstat(fd), os.stat(path))
-            except OSError:   # removed since it was opened
-                same = False
+            if os.name == "nt":
+                same = True   # os.open doesn't share delete access: the file can't be removed or replaced while open
+            else:
+                try:
+                    same = os.path.samestat(os.fstat(fd), os.stat(path))
+                except OSError:   # removed since it was opened
+                    same = False
             if same:
                 break
             _unlock(fd)

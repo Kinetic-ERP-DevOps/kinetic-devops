@@ -169,7 +169,8 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   the new holder's lock, so two processes could use the same rotating refresh token. The lock is now an OS file
   lock (flock / msvcrt.locking), released when its process ends, so it never goes stale. Only a lock held by
   another process is waited for: a lock file that can't be opened or locked (permissions, a full disk) is reported
-  at once with the reason, and a lock taken on a file that was meanwhile removed or replaced is taken again.
+  at once with the reason, and (on POSIX) a lock taken on a file that was meanwhile removed or replaced is taken
+  again.
 - `auth` session resolution raised `IndexError` when no company was given and the environment had none
   configured; it now raises `SessionResolutionError` saying to pass `--co`.
 - `analysis diff`: the review prompt now fences the commit metadata and diff as untrusted data and tells the
