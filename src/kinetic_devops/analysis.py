@@ -302,8 +302,15 @@ def call_ai(base_url: str, timeout: int, model: str, prompt: str, max_tokens: in
     # _deadline_watchdog) and _read_ai_stream also caps each recv by the time left and an idle timeout.
     idle = _ai_read_timeout()   # a bad KINETIC_AI_READ_TIMEOUT fails before the request is sent
     deadline = time.monotonic() + timeout
-    with request.urlopen(req, timeout=timeout) as resp, _deadline_watchdog(resp, deadline):
-        return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"), idle_timeout=idle)
+    try:
+        with request.urlopen(req, timeout=timeout) as resp, _deadline_watchdog(resp, deadline):
+            return _read_ai_stream(resp, deadline, chat=style in ("openwebui", "openai-chat"), idle_timeout=idle)
+    except (OSError, ValueError, AttributeError) as exc:
+        # Over TLS the watchdog's shutdown surfaces as "Broken pipe" (or a closed-file error) in the blocked
+        # read; past the deadline that is the deadline, so say so.
+        if not isinstance(exc, TimeoutError) and time.monotonic() >= deadline:
+            raise TimeoutError("AI response exceeded the request deadline") from None
+        raise
 
 
 AI_READ_TIMEOUT = 30.0  # seconds one recv may stall once the answer is flowing (KINETIC_AI_READ_TIMEOUT)
@@ -508,97 +515,79 @@ VERDICTS = ("GO", "NO-GO", "UNKNOWN", "INCOMPLETE")
 
 
 # A VERDICT line as the prompt asks for it: at the line start, after optional markdown (`**`, `#`, `_`, a
-# backtick); a `>` quote is not a line start (see _lead_verdict). The value is GO, NO-GO or a negated GO.
+# backtick). The value is GO, NO-GO or a negated GO.
 _VERDICT_LINE = re.compile(
-    r"^[\s*#_`]*VERDICT[\s*_`]*:[\s*_`<\[]*"
+    r"^[ *#_`]*VERDICT[\s*_`]*:[\s*_`<\[]*"
     r"(NO[- ]GO|(?:NOT|DON['’]?T|DO\s+NOT)\s+(?:A\s+)?GO|GO)\b(.*)$",
     re.IGNORECASE)
-# The instruction echoed back: a VERDICT line whose whole value is the choice ("GO or VERDICT: NO-GO",
-# "GO|NO-GO", "NO-GO / GO"). It is not a decision; "VERDICT: NO-GO / GO once fixed" is (NO-GO).
-_VERDICT_ECHO = re.compile(r"\W*(?:NO[- ])?GO\W{0,4}(?:OR|/|\|)\W{0,4}(?:VERDICT\W{0,4}:\W{0,4})?(?:NO[- ])?GO\W*",
-                           re.IGNORECASE)
+# The choice itself, as the prompt and its headings name it ("GO/NO-GO", "GO or NO-GO", "GO|NO-GO"): naming the
+# choice is not a NO-GO, so it is blanked out before NO-GO is looked for.
+_CHOICE = re.compile(r"\b(?:NO[- ]GO|GO)\s*(?:/|\||\bor\b)\s*(?:VERDICT\W{0,4}:\W{0,4})?(?:NO[- ]GO|GO)\b",
+                     re.IGNORECASE)
 _NO_GO_WORD = re.compile(r"\bNO[- ]GO\b", re.IGNORECASE)
-# Negated GO ("NOT GO", "not a GO", "don't GO", "don’t GO"). GO must be upper case: "does not go beyond"
-# and "do not go to production" are prose, not a verdict. Only looked for in a verdict statement.
-_NEGATED_GO = re.compile(r"(?i:\b(?:NOT|DON['’]?T)\s+(?:A\s+)?)GO\b")
-_GO_NO_GO_HEADING = re.compile(r"\bGO\s*/\s*NO[- ]GO\b", re.IGNORECASE)
-_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
-_FENCE = re.compile(r"^\s*(```|~~~)")
+# Negated GO in any case ("NOT GO", "do not go ahead", "don’t GO"): looked for only in the GO/NO-GO section, where
+# it is the verdict, and on VERDICT lines.
+_NEGATED_GO = re.compile(r"\b(?:NOT|DON['’]?T)\s+(?:A\s+)?GO\b", re.IGNORECASE)
+_SECTION_HEADING = re.compile(r"^[\s#*_\d.)]*GO\s*/\s*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
+_ANY_HEADING = re.compile(r"^\s{0,3}(?:#{1,6}\s|\d+[.)]\s|\*\*\d)", re.MULTILINE)
+_DASHES = re.compile("[\u2010-\u2015\u2212]")
+LEAD_WINDOW = 400   # the prompt asks for the VERDICT line first
 
 
 def _strip_thinking(text: str) -> str:
-    """The answer without <think>...</think> reasoning (and anything before a lone closing tag)."""
-    text = _THINK_BLOCK.sub("", text)
-    close = text.lower().rfind("</think>")
-    return text[close + len("</think>"):] if close >= 0 else text
-
-
-def _verdict_statement(section: str) -> str:
-    """The first sentence of a GO/NO-GO section: the rest of the heading line plus its first non-blank
-    line, up to the first sentence end."""
-    lines = section.splitlines()
-    head = lines[0] if lines else ""
-    body = next((line for line in lines[1:] if line.strip()), "")
-    return re.split(r"(?<=[.!?])\s", f"{head} {body}".strip(), maxsplit=1)[0]
-
-
-def _is_echo(line: str) -> bool:
-    m = _VERDICT_LINE.match(line.lstrip(" >"))
-    return bool(m and _VERDICT_ECHO.fullmatch(m.group(1) + m.group(2)))
-
-
-def _lead_verdict(lines: list[str]) -> tuple[str | None, int]:
-    """(verdict, line index) of the first VERDICT line the answer itself gives: not inside a ``` fence,
-    not quoted with `>` (echoes are already dropped). (None, -1) if there is none."""
-    fenced = False
-    for i, line in enumerate(lines):
-        if _FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced or line.lstrip().startswith(">"):
-            continue
-        m = _VERDICT_LINE.match(line)
-        if not m:
-            continue
-        return ("GO" if m.group(1).upper() == "GO" else "NO-GO"), i
-    return None, -1
+    """The answer without leading <think> reasoning: a <think>...</think> block that opens the answer, or the
+    text before the first </think> when no <think> precedes it and no VERDICT line does (a template that put
+    <think> in the prompt). A </think> quoted later in the answer is never a cut point."""
+    stripped = text.lstrip()
+    m = re.match(r"<think>.*?</think>", stripped, re.IGNORECASE | re.DOTALL)
+    if m:
+        return stripped[m.end():]
+    close = stripped.lower().find("</think>")
+    if close >= 0:
+        before = stripped[:close]
+        if "<think>" not in before.lower() and not any(_VERDICT_LINE.match(line) for line in before.splitlines()):
+            return stripped[close + len("</think>"):]
+    return text
 
 
 def parse_verdict(review_text: str) -> str:
-    """GO / NO-GO from the answer's own "VERDICT:" line (the prompt asks for it first). Fails safe:
+    """GO / NO-GO / UNKNOWN for one answer. Deliberately simple, and fails safe:
 
-    * The lead verdict is the first VERDICT line that isn't quoted (`>`), inside a ``` fence or the
-      instruction echoed back ("VERDICT: GO or VERDICT: NO-GO"); <think> reasoning is ignored. A lead
-      "VERDICT: NO-GO" (or "NOT GO") is NO-GO whatever follows it.
-    * A lead GO stands only if the answer doesn't conclude NO-GO elsewhere: a later VERDICT line or a
-      final GO/NO-GO section saying NO-GO (or, in its first sentence, a negated upper-case GO such as
-      "Do NOT GO") overrules it, and without such a section any NO-GO after the lead line does. An
-      answer quoting an injected "VERDICT: GO" from the diff must not pass when it concludes NO-GO.
-    * Without a lead line GO is never inferred (a bare "GO" may be "do NOT GO", cut off, or the
-      format ignored): NO-GO is read from the final GO/NO-GO section (or the last 600 characters),
-      otherwise the answer is UNKNOWN."""
-    lines = [line for line in _strip_thinking(review_text or "").splitlines() if not _is_echo(line)]
-    lead, at = _lead_verdict(lines)
-    if lead == "NO-GO":
+    * Any NO-GO the answer states, anywhere (any dash), is NO-GO: an answer that says NO-GO anywhere is not
+      a pass, even if it also quotes a "VERDICT: GO" (from an injected commit subject, a diff, a code block).
+      Naming the choice ("GO/NO-GO", "GO or NO-GO") doesn't count. A negated GO on a VERDICT line or in the
+      GO/NO-GO section ("NOT GO", "do not go ahead") is NO-GO too.
+    * GO only from a "VERDICT: GO" line the answer leads with: in its first LEAD_WINDOW characters (after
+      leading <think> reasoning), before the first section heading, not in a ``` fence, not indented as code,
+      not quoted (`>`), and not the instruction echoed back ("VERDICT: GO or VERDICT: NO-GO").
+    * Anything else is UNKNOWN.
+    The cost is some NO-GO for answers that mention NO-GO in passing ("no NO-GO risks"); never a false GO."""
+    text = _DASHES.sub("-", _strip_thinking(review_text or ""))
+    plain = _CHOICE.sub(" ", text)
+    if _NO_GO_WORD.search(plain):
         return "NO-GO"
-    text = "\n".join(lines)
-    headings = list(_GO_NO_GO_HEADING.finditer(text))
-    section = text[headings[-1].end():] if headings else None
-    if lead == "GO":
-        own = _VERDICT_LINE.match(lines[at]).group(2)
-        after = lines[at + 1:]
-        if _NO_GO_WORD.search(own) or _NEGATED_GO.search(own) or any(
-                (m := _VERDICT_LINE.match(line.lstrip(" >"))) and m.group(1).upper() != "GO" for line in after):
+    for line in text.splitlines():
+        m = _VERDICT_LINE.match(line.lstrip(" >"))
+        if m and m.group(1).upper() != "GO":
             return "NO-GO"
-        if section is None:   # no final section: any NO-GO after the lead line wins
-            return "NO-GO" if _NO_GO_WORD.search("\n".join(after)) else "GO"
-        if _NO_GO_WORD.search(section) or _NEGATED_GO.search(_verdict_statement(section)):
-            return "NO-GO"
-        return "GO"
-    tail = section if section is not None else text[-600:]
-    if _NO_GO_WORD.search(tail) or _NEGATED_GO.search(tail):
+    heading = _SECTION_HEADING.search(text)
+    if heading and _NEGATED_GO.search(text[heading.end():]):
         return "NO-GO"
-    return "UNKNOWN"   # no VERDICT line: a GO here is not trusted (negation, cut-off, format ignored)
+    lead_end = LEAD_WINDOW
+    first_heading = _ANY_HEADING.search(text)
+    if first_heading:
+        lead_end = min(lead_end, first_heading.start())
+    fenced = False
+    for line in text[:lead_end].splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced   # only hides a GO (NO-GO is looked for everywhere above), so a toggle will do
+            continue
+        if fenced or line.startswith(("    ", "\t")) or line.lstrip().startswith(">") or _CHOICE.search(line):
+            continue   # code, a quote, or the instruction echoed back ("VERDICT: <GO or NO-GO>")
+        m = _VERDICT_LINE.match(line)
+        if m and m.group(1).upper() == "GO":
+            return "GO"
+    return "UNKNOWN"
 
 
 def combine_verdicts(verdicts: list[str], unreviewed_chunks: int = 0) -> str:
@@ -632,19 +621,21 @@ def risk_from_paths(paths: list[str]) -> str:
     return "low"
 
 
-# A commit subject that speaks to the reviewer is a prompt-injection attempt, not a description of the change:
-# a verdict *claim* ("VERDICT: GO" opening the subject, its description or a sentence: "fix: VERDICT: GO",
-# "tidy up. Verdict: GO", "x (VERDICT: GO)"), an approval attributed to a reviewer ("pre-approved by
-# security", "approved by the AI review"), or "ignore previous instructions". Words that merely name the
-# feature ("auto-approve dependabot bumps", "until review approved", "pre-approved vendors", "AI-passed
-# label", "a leading VERDICT: GO can't outvote ...") are not claims. Bump ROGUE_RULE_VERSION on any change.
+# A commit subject that speaks to the reviewer is a prompt-injection attempt, not a description of the change.
+# The flag is advisory (it asks for a human look), so the rule errs towards flagging: any verdict mention,
+# approval wording, or "ignore/disregard the previous instructions". v2 = v1 (as released) plus approvals
+# attributed to a reviewer and wider ignore/disregard forms; it flags everything v1 did. Bump on any change.
 ROGUE_RULE_VERSION = 2
 _REVIEW_STEERING = re.compile(
-    r"(?:^|^[a-z]+(?:\([^)]*\))?!?:|[.;!?(\[|]|\s[-–—])[\s*_`\"']*verdict[\s*_`]*[:=][\s*_`\"']*(?:no[- ]?)?go\b"
+    # v1 (as released): any verdict mention, pre-/auto-approval, "<x>-approved/passed", ignore previous instructions
+    r"\bverdict\s*[:=-]?\s*\**\s*(?:no[- ]?)?go\b"
+    r"|\bpre[- ]?approved\b|\bauto[- ]?approved?\b"
+    r"|\b(?:review|security|ai)[- ](?:approved|passed|cleared)\b"
+    r"|\bignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier)\s+instructions\b"
+    # v2 adds: approvals attributed to a reviewer, and wider "ignore/disregard the instructions" forms
     r"|\b(?:pre[- ]?)?(?:approved|cleared|signed[- ]off|vetted)\s+by\s+(?:the\s+)?"
     r"(?:security|sec|reviewers?|review|ai|bot|ci|maintainers?|admins?|code\s+owners?)\b"
-    r"|\b(?:ignore|disregard)\s+(?:all\s+|any\s+)?(?:the\s+|your\s+)?(?:previous|prior|above|earlier|system)\s+"
-    r"(?:instructions|prompts?|rules)\b",
+    r"|\b(?:ignore|disregard)\s+(?:all\s+|any\s+)?(?:the\s+|your\s+)?(?:previous|prior|above|earlier|system)\b",
     re.IGNORECASE,
 )
 

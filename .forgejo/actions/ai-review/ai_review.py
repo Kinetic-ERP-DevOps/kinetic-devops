@@ -79,8 +79,20 @@ def chat(url, payload, headers, deadline_s=900, idle_s=READ_TIMEOUT):
     server slot at once; an abandoned non-streaming request keeps the GPU busy until it finishes.
     The deadline bounds the whole answer, plain-JSON fallback included; once content flows (not on a
     blank, keep-alive or role-only line) a recv may stall at most idle_s. Stops at `data: [DONE]`."""
+    deadline = time.monotonic() + deadline_s
+    try:
+        return _chat(url, payload, headers, deadline, deadline_s, idle_s)
+    except (OSError, ValueError, AttributeError) as exc:
+        # Over TLS the watchdog's shutdown surfaces as "Broken pipe" (or a closed-file error) in the
+        # blocked read; past the deadline that is the deadline, so say so.
+        if not isinstance(exc, TimeoutError) and time.monotonic() >= deadline:
+            raise TimeoutError("review exceeded its deadline") from None
+        raise
+
+
+def _chat(url, payload, headers, deadline, deadline_s, idle_s):
     req = urllib.request.Request(url, json.dumps(dict(payload, stream=True)).encode(), headers, method="POST")
-    deadline, parts, idle = time.monotonic() + deadline_s, [], None
+    parts, idle = [], None
     with urllib.request.urlopen(req, timeout=deadline_s) as r, deadline_watchdog(r, deadline):
         while True:
             bound_next_read(r, deadline, idle)
@@ -106,7 +118,11 @@ def chat(url, payload, headers, deadline_s=900, idle_s=READ_TIMEOUT):
                         body.append(piece)
                     return json.loads(b"".join(body).decode("utf-8", "replace"))["choices"][0]["message"]["content"]
                 continue
-            for c in json.loads(line[5:]).get("choices") or []:
+            event = json.loads(line[5:])
+            if event.get("error"):   # the server gave up mid-answer: don't post a partial review as the review
+                err = event["error"]
+                raise RuntimeError(f"AI server error: {err.get('message') if isinstance(err, dict) else err}")
+            for c in event.get("choices") or []:
                 delta = c.get("delta") or {}
                 if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
                     idle = idle_s
