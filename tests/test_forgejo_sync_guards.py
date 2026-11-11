@@ -12,6 +12,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 SYNC = REPO / ".forgejo" / "actions" / "sync" / "sync.py"
@@ -66,6 +67,89 @@ class TestSyncTestEnvironment(unittest.TestCase):
         runs = [line for line in src.splitlines() if '"bash", "-c", cmd' in line]
         self.assertEqual(len(runs), 1, runs)
         self.assertIn("env=test_env(E)", runs[0])
+
+
+class FakeResponse:
+    def __init__(self, data, link=None):
+        self._data, self.headers = json.dumps(data).encode(), {"Link": link} if link else {}
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def http_error(code):
+    return urllib.error.HTTPError("https://api.github.com/x", code, "status", {}, None)
+
+
+class TestSyncGuardsRefuseWhenBlind(unittest.TestCase):
+    """Finding 3: a guard endpoint that answers 403 (token without the permission) must refuse promotion,
+    not read as "nothing found"; and lists are read past the first 100 results."""
+
+    def load(self):
+        self.notes, self.problems = [], []
+        return sync_defs("GitHubError", "gh", "gh_all", "guard_list",
+                         API="https://api.github.com", TOKEN="t", notes=self.notes, problems=self.problems)
+
+    def test_gh_403_is_not_silently_none(self):
+        ns = self.load()
+        with patch("urllib.request.urlopen", side_effect=http_error(403)):
+            with self.assertRaises(SystemExit):
+                ns["gh"]("/repos/o/r/security-advisories?state=draft")
+
+    def test_guard_403_refuses_promotion(self):
+        ns = self.load()
+        for path, ok404 in (("/repos/o/r/security-advisories?state=draft", False),
+                            ("/repos/o/r/secret-scanning/alerts?state=open", True)):
+            self.problems.clear()
+            with patch("urllib.request.urlopen", side_effect=http_error(403)):
+                self.assertEqual(ns["guard_list"](path, "something", ok404=ok404), [])
+            self.assertEqual(len(self.problems), 1, path)
+            self.assertIn("refused", self.problems[0])
+
+    def test_guard_network_failure_refuses_promotion(self):
+        ns = self.load()
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no route")):
+            ns["guard_list"]("/repos/o/r/security-advisories?state=draft", "draft security advisories")
+        self.assertEqual(len(self.problems), 1)
+
+    def test_secret_scanning_404_means_not_enabled(self):
+        ns = self.load()
+        with patch("urllib.request.urlopen", side_effect=http_error(404)):
+            self.assertIsNone(ns["guard_list"]("/repos/o/r/secret-scanning/alerts?state=open", "x", ok404=True))
+        self.assertEqual(self.problems, [])
+
+    def test_informational_403_is_a_note(self):
+        ns = self.load()
+        with patch("urllib.request.urlopen", side_effect=http_error(403)):
+            self.assertIsNone(ns["gh_all"]("/repos/o/r/dependabot/alerts?state=open", ok404=True, ok403=True))
+        self.assertEqual(len(self.notes), 1)
+        self.assertEqual(self.problems, [])
+
+    def test_lists_follow_the_link_header_past_100(self):
+        ns = self.load()
+        api = "https://api.github.com/repos/o/r/security-advisories"
+        pages = [FakeResponse([{"ghsa_id": f"GHSA-{i}"} for i in range(100)], f'<{api}?after=c1&per_page=100>; rel="next"'),
+                 FakeResponse([{"ghsa_id": "GHSA-last"}], f'<{api}?per_page=100>; rel="first"')]
+        seen = []
+        with patch("urllib.request.urlopen", side_effect=lambda req, timeout: (seen.append(req.full_url), pages.pop(0))[1]):
+            items = ns["guard_list"]("/repos/o/r/security-advisories?state=draft", "draft security advisories")
+        self.assertEqual(len(items), 101)
+        self.assertEqual(items[-1]["ghsa_id"], "GHSA-last")
+        self.assertEqual(seen, [f"{api}?state=draft&per_page=100", f"{api}?after=c1&per_page=100"])
+        self.assertEqual(self.problems, [])
+
+    def test_next_page_off_the_api_host_is_refused(self):
+        ns = self.load()
+        page = FakeResponse([{}] * 100, '<https://elsewhere.example/x?page=2>; rel="next"')
+        with patch("urllib.request.urlopen", return_value=page):
+            ns["guard_list"]("/repos/o/r/security-advisories?state=draft", "draft security advisories")
+        self.assertEqual(len(self.problems), 1)
 
 
 if __name__ == "__main__":

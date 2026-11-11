@@ -139,6 +139,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - Forgejo sync runs the branch's tests (`SYNC_TEST_CMD`) without `GH_TOKEN`: they run the promoted branch's
   code and got the whole environment. They now get an allowlist (`PATH`, `HOME`, locale, proxy, CA, `UV_*`, ...)
   with secret-looking names dropped; set anything else inline in `SYNC_TEST_CMD`.
+- Forgejo sync's draft-advisory and secret-scanning guards passed silently when GitHub answered HTTP 403 (a
+  token without the permission read as "nothing found"). A guard that can't read its list (403, network error)
+  now refuses promotion, as does a failed issue lookup for "Closes #N". Lists follow GitHub's `Link` pagination
+  past the first 100 results.
 
 
 ## [0.2.0.0a8] - 2026-11-01

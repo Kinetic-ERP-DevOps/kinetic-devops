@@ -42,19 +42,63 @@ def sh(*cmd, check=True, env=None, input=None):
     return r.stdout
 
 
-def gh(path, method="GET", body=None, ok404=False):
-    req = urllib.request.Request(API + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+class GitHubError(SystemExit):  # uncaught, it stops the run like any other SystemExit
+    pass
+
+
+def gh(path, method="GET", body=None, ok404=False, ok403=False, links=None):
+    """ok404/ok403: that status means "nothing there" (None). A 403 is only tolerable where the answer is
+    informational: a guard that can't see (token without the permission) must refuse, not pass (review F3).
+    links: a dict to receive the response's Link header relations (pagination)."""
+    url = path if path.startswith(API + "/") else API + path
+    where = f"GitHub {method} {url[len(API):].split('?')[0]}"
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
                                           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "forgejo-sync"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
+            if links is not None:
+                links.update({rel: u for u, rel in re.findall(r'<([^>]+)>;\s*rel="(\w+)"', r.headers.get("Link") or "")})
             data = r.read(); return json.loads(data) if data else {}
     except urllib.error.HTTPError as e:
         if ok404 and e.code == 404:
             return None
-        if e.code == 403:  # missing permission or feature disabled: say which, don't crash
-            notes.append(f"GitHub {path.split('?')[0]}: HTTP 403 (token permission or feature not enabled)"); return None
-        raise SystemExit(f"GitHub {method} {path}: HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
+        if ok403 and e.code == 403:  # missing permission or feature disabled: say which, don't crash
+            notes.append(f"{where}: HTTP 403 (token permission or feature not enabled)"); return None
+        detail = e.read().decode(errors="replace")[:300] if e.fp else e.reason
+        raise GitHubError(f"{where}: HTTP {e.code} {detail}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise GitHubError(f"{where}: {e}")
+
+
+def gh_all(path, ok404=False, ok403=False, max_pages=50):
+    """Every item of a list endpoint, 100 per page, following the Link header (page- and cursor-paginated
+    endpoints alike). None if the first page is a tolerated 404/403."""
+    items, url = [], path + ("&" if "?" in path else "?") + "per_page=100"
+    for _ in range(max_pages):
+        links = {}
+        batch = gh(url, ok404=ok404, ok403=ok403, links=links)
+        if batch is None:
+            return items or None
+        if not isinstance(batch, list):
+            raise GitHubError(f"GitHub GET {path.split('?')[0]}: expected a list, got {type(batch).__name__}")
+        items += batch
+        url = links.get("next")
+        if not url:
+            return items
+        if not url.startswith(API + "/"):   # the token goes only to the API
+            raise GitHubError(f"GitHub GET {path.split('?')[0]}: next page outside {API}: {url}")
+    raise GitHubError(f"GitHub GET {path.split('?')[0]}: more than {max_pages} pages")
+
+
+def guard_list(path, what, ok404=False):
+    """A list a guard depends on. Any failure to read it (403, network, too many pages) refuses promotion."""
+    try:
+        return gh_all(path, ok404=ok404)
+    except GitHubError as e:
+        problems.append(f"can't check {what}, so promotion is refused: {e} "
+                        "(check GH_PUSH_TOKEN's permissions, see sync.yml)")
+        return []
 
 
 def git_auth():  # token only in a per-command header, never in a URL or the config file
@@ -223,7 +267,10 @@ if wf:
 refs = sorted({int(n) for n in re.findall(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", log)})
 closes = []
 for n in refs:
-    i = gh(f"/repos/{REPO}/issues/{n}", ok404=True)
+    try:
+        i = gh(f"/repos/{REPO}/issues/{n}", ok404=True)
+    except GitHubError as e:
+        problems.append(f"can't check #{n}, so promotion is refused: {e}"); continue
     if not i or "pull_request" in i:
         problems.append(f"#{n} is referenced as closed but isn't a GitHub issue")
     elif i.get("state") != "open":
@@ -232,13 +279,17 @@ for n in refs:
         closes.append(f"Closes #{n} ({i['title']})")
 
 text = (log + "\n" + sh("git", "diff", "github/main..HEAD")).lower()
-for adv in gh(f"/repos/{REPO}/security-advisories?state=draft&per_page=100") or []:
+# Guards: a list that can't be read (403: token without the permission) refuses promotion; it never passes as
+# empty (review 2026-11-09 F3). Published advisories and Dependabot alerts only add lines to the PR body.
+for adv in guard_list(f"/repos/{REPO}/security-advisories?state=draft", "draft security advisories"):
     if adv["ghsa_id"].lower() in text or (adv.get("summary") and adv["summary"].lower() in text):
         problems.append(f"mentions draft advisory {adv['ghsa_id']}: undisclosed fixes go through its private fork, not a public PR")
-fixes_ghsa = [f"Fixes {a['ghsa_id']} ({a.get('summary','')})" for a in gh(f"/repos/{REPO}/security-advisories?state=published&per_page=100") or []
+fixes_ghsa = [f"Fixes {a['ghsa_id']} ({a.get('summary','')})"
+              for a in gh_all(f"/repos/{REPO}/security-advisories?state=published", ok403=True) or []
               if a["ghsa_id"].lower() in text]
 
-secrets = gh(f"/repos/{REPO}/secret-scanning/alerts?state=open&per_page=100", ok404=True)
+# 404 = secret scanning not enabled (nothing to check); 403 = can't see the alerts (refused)
+secrets = guard_list(f"/repos/{REPO}/secret-scanning/alerts?state=open", "secret-scanning alerts", ok404=True)
 if secrets is None:
     notes.append("secret scanning isn't enabled on the GitHub repo (no alerts to check)")
 elif secrets:
@@ -255,7 +306,7 @@ if lock_branch:
         problems.append("introduces vulnerable dependencies: " + ", ".join(f"{k} ({v})" for k, v in introduced.items()))
     vuln_lines += [f"Fixes {k} ({v})" for k, v in fixed.items()]
     vers = locked_versions(lock_branch)
-    dependabot = gh(f"/repos/{REPO}/dependabot/alerts?state=open&per_page=100", ok404=True)
+    dependabot = gh_all(f"/repos/{REPO}/dependabot/alerts?state=open", ok404=True, ok403=True)
     if dependabot is None:
         notes.append("Dependabot alerts aren't enabled on the GitHub repo (none to match)")
     for a in dependabot or []:
