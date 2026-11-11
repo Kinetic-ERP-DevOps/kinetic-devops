@@ -50,7 +50,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     case " $TESTED " in *" $local_sha "*) continue ;; esac
     TESTED="$TESTED $local_sha"
     if grep -qx "$local_sha" "$(git rev-parse --git-path kinetic-sandbox-passed)" 2>/dev/null; then
-    echo "pre-push: $local_sha already passed the Windows Sandbox test."
+        echo "pre-push: $local_sha already passed the Windows Sandbox test."
         continue
     fi
     echo "pre-push: Windows Sandbox test of $local_ref ($local_sha)..."
@@ -64,9 +64,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     )
     status=$?
     if [ $status -eq 2 ]; then
-    echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2
+        echo "pre-push: Windows Sandbox test skipped (see above); continuing the push." >&2
     elif [ $status -ne 0 ]; then
-    echo "pre-push: Windows Sandbox test failed; push aborted. (Skip once with --no-verify.)" >&2
+        echo "pre-push: Windows Sandbox test failed; push aborted. (Skip once with --no-verify.)" >&2
         exit 1
     fi
 done <<EOF

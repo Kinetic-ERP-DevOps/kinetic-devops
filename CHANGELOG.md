@@ -65,12 +65,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   removes the sampling fields again. `temperature` is no longer a reserved request field, so a profile may
   set it; without one, requests still use 0.15. On Qwen3.6-35B-A3B, thinking reviews with Qwen's sampling
   got 34 of 102 labelled review cases right vs 16 at temperature 0.15 (#47).
-- Local branch guard in the git hooks: no commits (merge commits included) on `main`; `main` is pushed
+- Local branch guard in the git hooks: no commits (merge commits included) or rebases on `main`; `main` is pushed
   only as exactly `public/main` and never to `public`; the scratch `dev` branch is never pushed.
   `KINETIC_ALLOW_MAIN=1` skips it once. See CONTRIBUTING.md, "Local branch guard".
 - `scripts/install-hook.sh` installs the hooks from Git Bash, with no PowerShell script execution.
   The hooks now live as files in `scripts/hooks/templates/` (kept LF by `.gitattributes`), which both
-  installers copy; `install-hook.ps1` no longer embeds them. New hook: pre-merge-commit.
+  installers copy; `install-hook.ps1` no longer embeds them. New hooks: pre-merge-commit, pre-rebase.
 - `scripts/sync-main.sh`: after a PR merges, fast-forwards the local `main` and the fork's `main` to
   `public/main` (stops if either has a commit that isn't there) and tags each merged `sync/<name>` PR as
   `synced/<name>` on the fork, at the PR head that was merged. The branch guard already pointed to it.
@@ -155,14 +155,25 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   Only stdin decides: a piped stdout (`... | tee log`) with a person at the terminal still gets the prompt.
 - The branch guard hooks (pre-commit, pre-merge-commit, pre-push) skipped the guard silently when
   `branch-guard.sh` was missing; they now refuse and say how to reinstall (`KINETIC_ALLOW_MAIN=1` still skips
-  once). Commits on `main` during a rebase (detached HEAD) are now refused too: the guard reads the branch from
-  `rebase-merge/head-name` / `rebase-apply/head-name`. Re-run `scripts/install-hook.sh` to pick this up.
+  once). Rebasing `main` was not guarded at all (a rebase with clean picks, or finished by
+  `git rebase --continue`, runs no commit hook): a new pre-rebase hook refuses it, and a `git commit` during a
+  rebase of `main` started anyway is refused too (the guard reads the branch from `rebase-merge/head-name` /
+  `rebase-apply/head-name`). `cherry-pick`, `am` and fast-forward merges still run none of these hooks; pre-push
+  remains the backstop (CONTRIBUTING.md lists exactly what is covered). Re-run `scripts/install-hook.sh` to pick
+  this up.
 
 ### Security
 - Repo host detection (`repo_context`, branch protection, repo maker) took the host from the URL's netloc, so
   `ssh://git@github.com/...` was classified as Forgejo and a `user:token@` in the remote URL could reach the host
   value (keyring account names, messages). The host is now the bare host name; a web port is kept only for API
-  URLs and port-qualified keyring accounts (still tried first, then the bare host). SSH ports are ignored.
+  URLs and the keyring accounts, which stay as before: a server on a non-default port uses only
+  `host:port/owner` and `host:port` (never the bare host's accounts, which belong to the default-port server),
+  then the legacy account, with a warning naming it (it isn't tied to a server). `repo_maker --forgejo-url`
+  without `--owner` looks the token up for that URL's server, not the git remote's. SSH ports are ignored. scp-like remotes follow git's rule (no `://` and a `:` before
+  any `/`): ssh-config aliases (`myalias:owner/repo`) and bracketed hosts (`git@[::1]:o/r`,
+  `[git@host:2222]:o/r`) parse, and `./a@b:c/...` is a local path. Error messages never show the URL's user
+  info or query (a password containing `/` or `@` is cut whole; the branch guard's push messages too), and a malformed URL (e.g. an unclosed IPv6
+  bracket) raises the command's own error instead of a bare `ValueError` traceback.
 - IdP: a network error or malformed JSON during a token request (e.g. a refresh with the network down) was a
   traceback; it now takes the "sign in again" path.
 - IdP: the refresh lock could be taken over from a holder running longer than 60 s, whose clean-up then deleted

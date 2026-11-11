@@ -63,12 +63,14 @@ sh scripts/install-hook.sh
 `.\scripts\install-hook.ps1` installs the same files. Both copy `scripts/hooks/templates/` into the
 real hooks directory (shared by all worktrees of the clone).
 
-- **branch guard** (always on, in all three hooks): no commits on `main`, `main` pushed only as
-  exactly `public/main` and never to `public`, `dev` never pushed. See CONTRIBUTING.md, "Local branch
-  guard". `KINETIC_ALLOW_MAIN=1` skips it for one command.
+- **branch guard** (always on, in all four hooks): no commits, merge commits or rebases on `main`,
+  `main` pushed only as exactly `public/main` and never to `public`, `dev` never pushed. See
+  CONTRIBUTING.md, "Local branch guard" (including what it doesn't cover: cherry-pick, am).
+  `KINETIC_ALLOW_MAIN=1` skips it for one command.
 - **pre-commit** (always on): the branch guard, then a blocking sensitive-data scan of the staged
   content, then the test suite with native checks deferred (see below). It runs through `uv run`.
 - **pre-merge-commit** (always on): the branch guard.
+- **pre-rebase** (always on): the branch guard (no rebasing `main`).
 - **pre-push**: the branch guard (always on), then (opt-in) tests each pushed commit on a clean Windows in Windows Sandbox
   (`scripts/sandbox_test.py`, several minutes). Enable with `git config kinetic.prepushSandbox true`.
   Without Windows Sandbox (not every developer has it) the check is skipped with a warning and the

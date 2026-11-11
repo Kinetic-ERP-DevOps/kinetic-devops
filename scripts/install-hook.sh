@@ -7,8 +7,9 @@
 # Installs, into the real hooks directory (shared by all worktrees of this clone):
 #   pre-commit        branch guard, then the sensitive-data scan and the test suite
 #   pre-merge-commit  branch guard (no merge commits on main)
+#   pre-rebase        branch guard (no rebasing main)
 #   pre-push          branch guard (always), then the opt-in Windows Sandbox test
-#   branch-guard.sh   the guard the three hooks call
+#   branch-guard.sh   the guard the four hooks call
 # Re-run after pulling changes to scripts/hooks/templates/. Same result as install-hook.ps1;
 # this one needs no PowerShell script execution (which endpoint security may block).
 set -eu
@@ -20,7 +21,7 @@ hooks_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-path hoo
 templates="$(cd "$(dirname "$0")" && pwd)/hooks/templates"
 
 mkdir -p "$hooks_dir"
-for name in pre-commit pre-merge-commit pre-push branch-guard.sh; do
+for name in pre-commit pre-merge-commit pre-rebase pre-push branch-guard.sh; do
     # Strip any CR so a CRLF checkout still gives sh-runnable files.
     tr -d '\r' < "$templates/$name" > "$hooks_dir/$name"
     chmod +x "$hooks_dir/$name"

@@ -81,7 +81,7 @@ class TestBranchGuard(unittest.TestCase):
         self.assertIn(text, result.stderr)
 
     def test_installs_lf_hooks(self):
-        for name in ("pre-commit", "pre-merge-commit", "pre-push", "branch-guard.sh"):
+        for name in ("pre-commit", "pre-merge-commit", "pre-rebase", "pre-push", "branch-guard.sh"):
             with self.subTest(hook=name):
                 self.assertNotIn(b"\r", (self.hooks / name).read_bytes())
 
@@ -106,9 +106,31 @@ class TestBranchGuard(unittest.TestCase):
         self.assertRefused(self.run_in_repo(["git", "push", "origin", "feat/x:dev"]), "dev is local scratch")
         self.assertAllowed(self.run_in_repo(["git", "push", "-q", "origin", "feat/x"]))
 
+    def test_no_rebase_of_main(self):
+        # A rebase with clean picks (or finished by --continue) never runs pre-commit: pre-rebase refuses it.
+        env = {**self.env, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
+        self.addCleanup(self.run_in_repo, ["git", "checkout", "-q", "main"])
+        self.addCleanup(self.run_in_repo, ["git", "rebase", "--abort"])
+        self.assertRefused(self.run_in_repo(["git", "rebase", "feat/x"], env=env), "no rebasing main")
+        self.assertAllowed(self.run_in_repo(["git", "checkout", "-q", "feat/x"]))
+        # Naming main from another branch ($2 of pre-rebase) is refused too.
+        self.assertRefused(self.run_in_repo(["git", "rebase", "feat/x", "main"], env=env), "no rebasing main")
+        self.assertRefused(self.run_in_repo(["git", "rebase", "-i", "feat/x", "main"], env=env), "no rebasing main")
+        self.assertEqual(self._git_out("rev-parse", "main"), self.main)
+
+    def test_rebasing_other_branches_is_allowed(self):
+        self.addCleanup(self.run_in_repo, ["git", "checkout", "-q", "main"])
+        self.assertAllowed(self.run_in_repo(["git", "rebase", "-q", "main", "feat/x"]))
+        self.assertAllowed(self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "rebase", "feat/x"]))
+        self.assertAllowed(self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "rebase"]))
+        self.assertRefused(self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "rebase", "refs/heads/main"]),
+                           "no rebasing main")
+
     def test_commit_on_main_during_a_rebase_is_refused(self):
         # A rebase detaches HEAD; the guard reads the branch from rebase-merge/head-name.
-        env = {**self.env, "GIT_SEQUENCE_EDITOR": "sh -c 'printf \"break\\n\" > \"$1\"' -"}
+        # (Starting it needs the escape hatch now that pre-rebase refuses rebasing main.)
+        env = {**self.env, "KINETIC_ALLOW_MAIN": "1",
+               "GIT_SEQUENCE_EDITOR": "sh -c 'printf \"break\\n\" > \"$1\"' -"}
         self.addCleanup(self.run_in_repo, ["git", "rebase", "--abort"])
         self.assertAllowed(self.run_in_repo(["git", "rebase", "-i", "HEAD"], env=env))
         self.assertEqual(self.run_in_repo(["git", "symbolic-ref", "-q", "HEAD"]).returncode, 1)
@@ -127,6 +149,7 @@ class TestBranchGuard(unittest.TestCase):
         self.run_in_repo(["git", "merge", "--abort"])
         self.assertRefused(result, missing)
         self.assertIn("install-hook.sh", result.stderr)
+        self.assertRefused(self.run_in_repo(["git", "rebase", "feat/x"]), missing)
         self.assertEqual(self._git_out("rev-parse", "main"), self.main)
         # The escape hatch still works without the guard (pre-push goes on to the sandbox check, off here).
         env = {**self.env, "KINETIC_ALLOW_MAIN": "1"}
@@ -145,6 +168,15 @@ class TestBranchGuard(unittest.TestCase):
         self.assertRefused(self.guard_push("public", "refs/heads/main", self.main, "refs/heads/main"),
                            "never pushed to the public remote")
 
+    def test_push_refusal_never_prints_a_url_token(self):
+        # Pushing to a URL: git passes the URL itself as the remote name.
+        url = "https://user:SECRET/TO@KEN@forgejo.example.com/o/r.git"   # "/" and "@" in the password
+        result = self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "push", url, url],
+                                  stdin=f"refs/heads/dev {self.feat} refs/heads/dev {ZERO}\n")
+        self.assertRefused(result, "https://***@forgejo.example.com/o/r.git")
+        self.assertNotIn("SECRET", result.stderr + result.stdout)
+        self.assertNotIn("KEN", result.stderr + result.stdout)
+
     def test_dev_is_never_pushed(self):
         self.assertRefused(self.guard_push("origin", "refs/heads/dev", self.feat, "refs/heads/dev"),
                            "dev is local scratch")
@@ -156,6 +188,7 @@ class TestBranchGuard(unittest.TestCase):
         env = {**self.env, "KINETIC_ALLOW_MAIN": "1"}
         self.assertAllowed(self.guard_push("public", "refs/heads/main", self.feat, "refs/heads/main", env=env))
         self.assertAllowed(self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "commit"], env=env))
+        self.assertAllowed(self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "rebase"], env=env))
 
 
 if __name__ == "__main__":
