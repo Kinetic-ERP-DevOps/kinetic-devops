@@ -1050,7 +1050,7 @@ class TestIdpRefreshAsksForThePassphraseFirst(VaultFixture):
         self.req.post.assert_called_once()
         self.assertEqual((self.stored()["AccessToken"], self.stored()["refresh_token"]), ("AT-NEW", "RT-NEW"))
         self.assertEqual(self.leaked(), [])
-        self.assertIsNone(getattr(self.mgr, "_pinned_vault_pass", None))   # nothing kept after the refresh
+        self.assertIsNone(self.mgr._pinned_pass())   # nothing kept after the refresh
 
     def test_typo_spends_nothing_and_takes_the_sign_in_again_path(self):
         token, asked, err = self.refresh("typo")
@@ -1834,11 +1834,13 @@ class TestDamagedIndex(VaultFixture):
     session uses is still found (the chunked "current_token" marker, a clear stub's "_idp_gens")."""
 
     def test_reads_writes_and_logout_survive_a_damaged_index(self):
-        for bad in ("null", "5", '{"a":1}', "not json", '[["idp_AccessToken"]]',
-                    json.dumps([["x", "chunks:ab:1"]] * 200), json.dumps([["idp_AccessToken", "chunks:ab:999"]])):
-            with self.subTest(bad=bad[:20]):
+        bads = ("null", "5", '{"a":1}', "not json", '[["idp_AccessToken"]]',
+                json.dumps([["x", "chunks:ab:1"]] * 200), json.dumps([["idp_AccessToken", "chunks:ab:999"]]))
+        for encrypted, bad in [(e, b) for e in (False, True) for b in bads]:
+            with self.subTest(bad=bad[:20], encrypted=encrypted):
                 self.kr.store = {}
-                self.kr.set_password(auth.SERVICE_SERVERS, "config", json.dumps(self.servers))
+                self.kr.set_password(auth.SERVICE_SERVERS, "config", _fake_encrypt(self.servers, "pass-1")
+                                     if encrypted else json.dumps(self.servers))
                 self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
                 self.kr.store[(self.slot, idp.GENS_ENTRY)] = bad
                 self.assertEqual(self.mgr._get_token_meta(self.slot)["refresh_token"], "RT-SECRET")
@@ -1850,6 +1852,249 @@ class TestDamagedIndex(VaultFixture):
                 with patch("builtins.print"):
                     self.mgr.logout("pilot")
                 self.assertEqual([u for (s, u) in self.kr.store if s == self.slot], [])
+
+
+class LockHolder:
+    """Holds a slot's lock in another thread (another process refreshing) until released."""
+
+    def __init__(self, slot):
+        self.slot, self.held, self.release = slot, threading.Event(), threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        with idp.slot_lock(self.slot):
+            self.held.set()
+            self.release.wait(30)
+
+    def __enter__(self):
+        self.thread.start()
+        self.held.wait(5)
+        return self
+
+    def __exit__(self, *exc):
+        self.release.set()
+        self.thread.join(10)
+
+
+def short_lock_waits(seconds=0.3):
+    """Every lock wait cut to `seconds` (a busy session times out quickly)."""
+    real = idp.slot_lock
+    return patch.object(idp, "slot_lock", lambda slot, wait=30.0: real(slot, wait=min(wait, seconds)))
+
+
+class TestBusySessions(VaultFixture):
+    """Review findings: what a session another process holds (a refresh) does to rename, logout, the vault commands
+    and sign-in."""
+
+    def setUp(self):
+        super().setUp()
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta, AccessToken="A0" * 1250, refresh_token="R0" * 650), "pilot")
+
+    def tokens(self, slot=None):
+        meta = self.mgr._get_token_meta(slot or self.slot)
+        return None if meta is None else (meta["AccessToken"][:2], meta["refresh_token"][:2])
+
+    def test_rename_holds_the_old_slot_until_it_is_deleted(self):
+        """A refresh under the old name between rename's copy and its delete spent R0 and stored R1 in the old slot;
+        rename then deleted it, leaving the new slot with the spent R0. The refresh now waits for rename, finds the
+        session gone and doesn't refresh; the new slot keeps the unspent R0."""
+        req = MagicMock()
+        req.post.return_value = _resp({"access_token": "A1" * 1250, "refresh_token": "R1" * 650, "expires_in": 3600})
+        real_move, started = idp.move_secrets, {}
+
+        def refresh_in_another_process():
+            other = KineticConfigManager.__new__(KineticConfigManager)
+            started["token"] = other._refresh_idp(self.slot, dict(self.meta, _is_valid=False), "pilot", force=True)
+
+        def move(old, new):
+            current = real_move(old, new)
+            started["thread"] = threading.Thread(target=refresh_in_another_process)
+            started["thread"].start()
+            started["thread"].join(0.5)
+            started["waited"] = started["thread"].is_alive()
+            return current
+        with patch.object(idp, "requests", req), patch.object(idp, "get_client_id", return_value="cid"), \
+             patch.object(idp, "move_secrets", move), patch.object(sys, "stderr", io.StringIO()):
+            self.mgr.rename("pilot", "pilot2")
+            started["thread"].join(30)
+        self.assertTrue(started["waited"])
+        self.assertIsNone(started["token"])
+        req.post.assert_not_called()   # R0 not spent
+        self.assertEqual(self.tokens(self.mgr._get_token_key("pilot2", "alice", "API-KEY-SECRET")), ("A0", "R0"))
+        self.assertEqual([u for (s, u) in self.kr.store if s == self.slot], [])
+
+    def test_rename_of_a_busy_session_changes_nothing(self):
+        before = dict(self.kr.store)
+        with LockHolder(self.slot), short_lock_waits(), self.assertRaisesRegex(RuntimeError, "nothing was renamed"):
+            self.mgr.rename("pilot", "pilot2")
+        self.assertEqual(self.kr.store, before)
+
+    def test_logout_of_a_busy_session_keeps_it_listed(self):
+        """logout counted a lock timeout as done: the user left the sessions list and "purged" was printed while
+        the slot still held the refresh token."""
+        with LockHolder(self.slot), short_lock_waits(), patch("builtins.print") as printed:
+            self.mgr.logout("pilot")
+        out = " ".join(str(c.args[0]) for c in printed.call_args_list)
+        self.assertIn("not cleared", out)
+        self.assertNotIn("purged", out)
+        self.assertEqual(self.mgr._get_server_dict()["pilot"]["sessions"], ["alice"])
+        self.assertEqual(self.tokens(), ("A0", "R0"))
+        with patch("builtins.print"):
+            self.mgr.logout("pilot")   # not busy any more
+        self.assertIsNone(self.tokens())
+        self.assertEqual(self.mgr._get_server_dict()["pilot"]["sessions"], [])
+
+    def test_api_key_change_with_a_busy_session_keeps_the_key(self):
+        with LockHolder(self.slot), short_lock_waits(), patch("builtins.print") as printed:
+            self.mgr.set_api_key("pilot", "NEW-KEY")
+        self.assertIn("was not changed", str(printed.call_args_list))
+        self.assertEqual(self.mgr._get_server_dict()["pilot"]["api_key"], "API-KEY-SECRET")
+        self.assertEqual(self.tokens(), ("A0", "R0"))
+
+    def test_vault_commands_report_a_busy_session_and_rerunning_finishes(self):
+        """A busy slot was counted as unreadable and left in clear in an encrypted vault (or encrypted in a clear
+        one). It is retried at the end, waiting longer; if still busy, it is reported as busy, and a rerun does it."""
+        with patch("builtins.print"):
+            self.mgr.decrypt_vault("pass-1")
+        clear = lambda: [u for (s, u), v in self.kr.store.items() if s == self.slot and ("R0R0" in v or "A0A0" in v)]
+        self.assertTrue(clear())
+        with LockHolder(self.slot), short_lock_waits(), patch("builtins.print") as printed:
+            self.mgr.encrypt_vault("pass-1")
+        out = " ".join(str(c.args[0]) for c in printed.call_args_list)
+        self.assertIn("busy", out)
+        self.assertIn("run encrypt-vault again", out)
+        self.assertNotIn("couldn't be read", out)
+        with patch("builtins.print"):
+            self.mgr.encrypt_vault("pass-1")
+        self.assertEqual(clear(), [])
+        self.assertEqual(self.tokens(), ("A0", "R0"))
+
+    def test_a_slot_busy_for_a_moment_is_resealed_by_the_retry(self):
+        holder = LockHolder(self.slot)
+        calls = []
+        real = idp.slot_lock
+
+        def lock(slot, wait=30.0):
+            calls.append(wait)
+            if len(calls) == 1:
+                return real(slot, wait=0.2)   # busy on the first pass ...
+            holder.release.set()               # ... free for the retry
+            holder.thread.join(10)
+            return real(slot, wait=wait)
+        with patch("builtins.print"):
+            self.mgr.decrypt_vault("pass-1")
+        with holder, patch.object(idp, "slot_lock", lock), patch("builtins.print") as printed:
+            self.mgr.encrypt_vault("pass-1")
+        self.assertNotIn("busy", str(printed.call_args_list))
+        self.assertEqual(calls[1], auth.SIGN_IN_LOCK_WAIT_SEC)
+
+    def test_storing_a_sign_in_waits_longer_and_says_so(self):
+        holder = LockHolder(self.slot)
+        with holder, patch("builtins.print") as printed:
+            threading.Timer(0.5, holder.release.set).start()
+            self.mgr._store_sign_in(self.slot, dict(self.meta, AccessToken="A2" * 1250, refresh_token="R2" * 650),
+                                    "pilot")
+        self.assertIn("Waiting for another process", str(printed.call_args_list))
+        self.assertEqual(self.tokens(), ("A2", "R2"))
+
+    def test_refresh_uses_short_timeouts_and_a_busy_lock_takes_the_sign_in_again_path(self):
+        req = MagicMock()
+        req.post.return_value = _resp({"access_token": "A1", "refresh_token": "R1"})
+        with patch.object(idp, "requests", req):
+            idp.refresh(SETTINGS["token"], "cid", "R0")
+        self.assertEqual(req.post.call_args.kwargs["timeout"], idp.REFRESH_TIMEOUT)
+        self.assertLessEqual(sum(idp.REFRESH_TIMEOUT), 30)   # never longer than others wait for the lock
+        with patch.object(idp, "refresh_session", side_effect=idp.LockTimeout("Timed out waiting.")), \
+             patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertIsNone(self.mgr._refresh_idp(self.slot, dict(self.meta), "pilot"))
+        self.assertIn("wasn't refreshed", err.getvalue())
+
+    def test_touch_from_headers_never_fails_the_api_call(self):
+        with patch.object(self.mgr, "get_session_by_bearer", return_value=("pilot", "alice")), \
+             patch.object(self.mgr, "_get_token_meta", side_effect=ValueError("anything")):
+            self.mgr.touch_from_headers({"Authorization": "Bearer A0", "X-Epicor-Company": "BETA"})
+
+
+class TestLockAndPassphraseDetails(VaultFixture):
+    def test_reentering_twice_keeps_other_threads_out(self):
+        """Mutation check: the inner exit must restore the depth, not forget the lock."""
+        slot = f"reenter-{time.time()}"
+        outcome = []
+
+        def other():
+            try:
+                with idp.slot_lock(slot, wait=0.2):
+                    outcome.append("taken")
+            except idp.LockTimeout:
+                outcome.append("waited")
+        with idp.slot_lock(slot):
+            with idp.slot_lock(slot, wait=0):
+                pass
+            with idp.slot_lock(slot, wait=0):
+                t = threading.Thread(target=other)
+                t.start()
+                t.join(5)
+            t = threading.Thread(target=other)
+            t.start()
+            t.join(5)
+        self.assertEqual(outcome, ["waited", "waited"])
+
+    def test_the_write_passphrase_is_asked_before_the_lock_is_taken(self):
+        """set_current_company asks for the passphrase (--vault-prompt every) while the session's lock is still free,
+        so nobody waits on a person typing."""
+        self.encrypted_vault()
+        self.mgr.touch_session(self.slot, dict(self.meta), "pilot")
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        self.mgr._vault_pass = None
+        self.mgr.vault_prompt = "every"
+        free_when_asked = []
+
+        def ask(prompt):
+            def probe():
+                try:
+                    with idp.slot_lock(self.slot, wait=0):
+                        free_when_asked.append(True)
+                except idp.LockTimeout:
+                    free_when_asked.append(False)
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join(5)
+            return "pass-1"
+        with patch.object(sys.stdout, "isatty", return_value=True), patch.object(sys, "stderr", io.StringIO()), \
+             patch("kinetic_devops.auth.getpass.getpass", side_effect=ask):
+            self.mgr.set_current_company("pilot", "alice", "BETA")
+        self.assertTrue(free_when_asked)
+        self.assertNotIn(False, free_when_asked, "asked for the passphrase while holding the lock")
+        with patch.dict(os.environ, {"KINETIC_VAULT_PASSPHRASE": "pass-1"}):
+            self.assertEqual(self.mgr._get_token_meta(self.slot)["current_company"], "BETA")
+
+    def test_pinned_passphrase_is_per_thread(self):
+        seen = []
+        with self.mgr._vault_pass_pinned("pass-A"):
+            t = threading.Thread(target=lambda: seen.append(self.mgr._pinned_pass()))
+            t.start()
+            t.join(5)
+            self.assertEqual(self.mgr._pinned_pass(), "pass-A")
+        self.assertEqual(seen, [None])
+        self.assertIsNone(self.mgr._pinned_pass())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork")
+    def test_a_forked_child_holds_none_of_its_parents_locks(self):
+        slot = f"fork-{time.time()}"
+        with idp.slot_lock(slot):
+            pid = os.fork()
+            if pid == 0:   # child: the parent holds the lock; the child must wait for it, not re-enter
+                code = 1
+                try:
+                    with idp.slot_lock(slot, wait=0.2):
+                        code = 2
+                except idp.LockTimeout:
+                    code = 0
+                finally:
+                    os._exit(code)
+            _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
 
 
 class TestVaultPromptMode(unittest.TestCase):

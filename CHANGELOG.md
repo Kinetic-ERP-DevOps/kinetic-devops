@@ -197,7 +197,13 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   written, so what a crash leaves behind is removed by the next write or by logout. Every write, logout and rename
   of a session holds the session's lock (the refresh lock, reentrant within a thread), and company updates re-read
   the session under it, so a write in one process never undoes or breaks a refresh in another; the company update
-  after each API call waits at most 2 s for the lock and is skipped otherwise. Logout removes `current_token`
+  after each API call waits at most 2 s for the lock and is skipped otherwise. A refresh's request to the IdP
+  times out sooner (5 s to connect, 20 s to answer) than others wait for the lock; storing a completed sign-in
+  waits up to 90 s (and says so). Rename holds each session's lock from the copy to the delete, and a refresh
+  that waited for it doesn't refresh the session it no longer finds. A session that stays busy is never reported
+  as done: logout and `clean-sessions` keep it listed and say to run them again, an API-key change is refused,
+  rename changes nothing, and `encrypt-vault` / `decrypt-vault` retry it and otherwise report it as busy, to run
+  again. Logout removes `current_token`
   first, so an interrupted logout can't leave a usable refresh token. Versions without this read a chunked entry
   as missing (sign in again). Sessions stored the earlier ways are read, and `rename`, `logout` and the clean-up
   commands handle the chunks.

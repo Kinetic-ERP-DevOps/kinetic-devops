@@ -293,17 +293,22 @@ def identity_matches(identity: str, user_id: str) -> bool:
     return user == local or user in who or local in user
 
 
+# A refresh runs while it holds the session's lock, so a stalled IdP must not hold it for longer than others wait
+# (slot_lock's default 30 s): (connect, read) timeouts in seconds.
+REFRESH_TIMEOUT = (5, 20)
+
+
 def refresh(token_endpoint: str, client_id: str, refresh_token: str) -> Dict:
     """Exchange a refresh token. With rotation the response carries the new refresh token to store."""
     return _token_request(token_endpoint, {"grant_type": "refresh_token", "refresh_token": refresh_token,
-                                           "client_id": client_id})
+                                           "client_id": client_id}, timeout=REFRESH_TIMEOUT)
 
 
-def _token_request(token_endpoint: str, data: Dict[str, str]) -> Dict:
+def _token_request(token_endpoint: str, data: Dict[str, str], timeout=30) -> Dict:
     """POST to the token endpoint. Every failure is an IdPError (callers then ask for a new sign-in), not a traceback."""
     _https(token_endpoint, "The IdP token endpoint")   # also guards a stored endpoint used for refreshes
     try:
-        resp = requests.post(token_endpoint, data=data, timeout=30, verify=True, allow_redirects=False)
+        resp = requests.post(token_endpoint, data=data, timeout=timeout, verify=True, allow_redirects=False)
     except requests.RequestException as exc:
         raise IdPError(f"Couldn't reach the IdP token endpoint ({type(exc).__name__}); check the network, "
                        "then sign in again.") from exc
@@ -544,16 +549,31 @@ def _legacy_sides(slot: str) -> List[List[str]]:
     return found
 
 
-def _stored_chunk_sets(slot: str) -> List[List[str]]:
-    """Generations the stored session uses that can be found without the vault passphrase: the chunked
-    "current_token" marker, and the "_idp_gens" of a stub stored in clear. (With the index damaged, these are still
-    cleaned up.)"""
+def _index_damaged(slot: str) -> bool:
+    """Is the index there but not (entirely) readable? Then the stored stub is the only record of its generations."""
+    raw = keyring.get_password(slot, GENS_ENTRY)
+    if raw is None:
+        return False
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return True
+    return not isinstance(items, list) or len(_read_gens(slot)) != len(items)
+
+
+def _stored_chunk_sets(slot: str, passphrase: Optional[str] = None) -> List[List[str]]:
+    """Generations the stored session uses: the chunked "current_token" marker, and the stub's "_idp_gens" (from a
+    stub stored in clear; from an encrypted one only when the index is damaged and the passphrase is given, as the
+    index lists them otherwise). So a damaged index still loses nothing."""
     raw = keyring.get_password(slot, TOKEN_ENTRY)
     found = [[TOKEN_ENTRY, raw]] if _chunk_names(TOKEN_ENTRY, raw) is not None else []
     value = read_token_entry(slot)
     try:
-        stub = json.loads(value) if value and not crypto.is_encrypted_blob(value) else {}
-    except ValueError:
+        if value and crypto.is_encrypted_blob(value):
+            stub = crypto.decrypt_json(value, passphrase) if passphrase and _index_damaged(slot) else {}
+        else:
+            stub = json.loads(value) if value else {}
+    except Exception:
         stub = {}
     gens = stub.get("_idp_gens") if isinstance(stub, dict) else None
     if isinstance(gens, dict):
@@ -600,7 +620,7 @@ def store_session(slot: str, meta: Dict, passphrase: Optional[str], write_stub: 
     index for the next write (or logout) to remove. Every writer of a slot holds its lock, so no other writer's
     generation is ever in flight here."""
     with slot_lock(slot):
-        previous = _read_gens(slot) + _legacy_sides(slot) + _stored_chunk_sets(slot)
+        previous = _read_gens(slot) + _legacy_sides(slot) + _stored_chunk_sets(slot, passphrase)
         stored = pack(slot, meta, passphrase)
         write_stub(stored)
         _drop_unused(slot, previous)
@@ -659,13 +679,15 @@ def unpack(slot: str, data: Dict, passphrase: Optional[str] = None, strict: bool
     return data
 
 
-def delete_session(slot: str) -> bool:
+def delete_session(slot: str, passphrase: Optional[str] = None, wait: float = 30.0) -> bool:
     """Remove a slot's session, holding its lock: "current_token" first (the commit point: the session is gone at
     once, so a crash part-way can't leave a usable refresh token behind), then every chunk generation that is listed
-    or that the stored session names, and the index. Returns whether there was a "current_token"."""
-    with slot_lock(slot):
+    or that the stored session names, and the index. passphrase: the vault's, if at hand (finds the generations of
+    an encrypted stub when the index is damaged). Returns whether there was a "current_token". Raises LockTimeout
+    when another process holds the session (a refresh) for longer than wait: nothing is deleted then."""
+    with slot_lock(slot, wait=wait):
         raw = keyring.get_password(slot, TOKEN_ENTRY)
-        sets = _read_gens(slot) + _legacy_sides(slot) + _stored_chunk_sets(slot)
+        sets = _read_gens(slot) + _legacy_sides(slot) + _stored_chunk_sets(slot, passphrase)
         if raw is not None:
             _delete_names(slot, [TOKEN_ENTRY])
         i = 0
@@ -766,6 +788,15 @@ class LockTimeout(IdPError):
 _held = threading.local()   # per thread: {slot: depth} of the slot locks this thread holds
 
 
+def _forget_held_locks() -> None:
+    """In a forked child: it holds none of the parent's slot locks (reentry would skip the OS lock it doesn't own)."""
+    _held.__dict__.pop("slots", None)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_held_locks)
+
+
 @contextlib.contextmanager
 def slot_lock(slot: str, wait: float = 30.0) -> Iterator[None]:
     """Cross-process lock on a session's slot: around a refresh (so a rotated refresh token is used exactly once)
@@ -841,9 +872,13 @@ def refresh_session(meta: Dict, reread: Callable[[], Optional[Dict]], store: Cal
 
     force: the caller's token was rejected (401) or a renewal was asked for, so a stored token that is still
     within its lifetime only counts if it differs from the caller's (i.e. another process already refreshed).
+    A session that is no longer stored (logged out, or renamed while this waited for the lock) or can't be read
+    isn't refreshed from the caller's copy: its refresh token may have been moved or spent; sign in again.
     """
     with slot_lock(slot):
-        current = reread() or meta
+        current = reread()
+        if current is None:
+            return None
         fresh = current.get("_is_valid") and current.get("AccessToken")
         if fresh and (not force or current["AccessToken"] != meta.get("AccessToken")):
             return current["AccessToken"]
