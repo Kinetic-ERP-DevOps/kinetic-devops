@@ -120,7 +120,9 @@ What is covered is exactly that: commits, merge commits, starting a rebase, and 
 during a rebase of `main` started anyway (with `KINETIC_ALLOW_MAIN=1` or `--no-verify`) is refused
 too (HEAD is detached then; the guard reads the rebased branch), but picks the rebase makes itself,
 and `git rebase --continue`, run no commit hook. `git cherry-pick`, `git am`, `git reset` and
-fast-forward merges or pulls run none of these hooks, so they can still move local `main`; pre-push
+fast-forward merges or pulls run none of these hooks, and `git rebase --update-refs` (or
+`rebase.updateRefs=true`) on a branch stacked on `main` moves `main` without the hook seeing it (it only
+checks the branch being rebased), so these can still move local `main`; pre-push
 is the backstop, refusing to push a `main` that isn't exactly `public/main` (get back with
 `git reset --hard public/main`).
 

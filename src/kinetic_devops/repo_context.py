@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -117,8 +118,8 @@ def parse_git_remote(url: str, error_type: type[Exception] = RuntimeError) -> Di
         parsed = urlparse(value)
         host = (parsed.hostname or "").lower()
         port = parsed.port
-    except ValueError as exc:  # invalid port or IPv6 literal
-        raise _parse_error(value, error_type) from exc
+    except ValueError:  # invalid port or IPv6 literal; from None: its message can quote part of a password
+        raise _parse_error(value, error_type) from None
     if not host or not parsed.path:
         raise _parse_error(value, error_type)
 
@@ -182,8 +183,8 @@ def _host_and_port(url_value: str, error_type: type[Exception]) -> Tuple[str, Op
         parsed = urlparse(str(url_value or "").strip())
         host = (parsed.hostname or "").lower()
         port = parsed.port
-    except ValueError as exc:  # invalid port or IPv6 literal
-        raise error_type(f"Unable to parse URL: {redact_url(url_value)}") from exc
+    except ValueError:  # invalid port or IPv6 literal; from None: its message can quote part of a password
+        raise error_type(f"Unable to parse URL: {redact_url(url_value)}") from None
     if not host:
         raise error_type(f"Unable to parse host from URL: {redact_url(url_value)}")
     return host, port
@@ -262,6 +263,12 @@ def resolve_token(
         for account in accounts:
             candidate = str(keyring.get_password(service, account) or "").strip()
             if candidate:
+                if account == legacy and host_value and account != explicit_account:
+                    # The provider-wide legacy account isn't tied to a server: say which token is used for this
+                    # host, so a token meant for another server doesn't go there unnoticed.
+                    print(f"WARNING: no token stored for {scoped_account(host_value, owner_value) or host_value}; "
+                          f"using the legacy keyring account {service}/{legacy} for {host_value}. Store one for "
+                          f"this server (account {host_value}) if that token belongs to another.", file=sys.stderr)
                 return candidate, f"keyring:{service}/{account}", accounts
     except Exception:
         pass

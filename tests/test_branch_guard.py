@@ -168,6 +168,14 @@ class TestBranchGuard(unittest.TestCase):
         self.assertRefused(self.guard_push("public", "refs/heads/main", self.main, "refs/heads/main"),
                            "never pushed to the public remote")
 
+    def test_push_refusal_never_prints_a_url_token(self):
+        # Pushing to a URL: git passes the URL itself as the remote name.
+        url = "https://user:SECRET-TOKEN@forgejo.example.com/o/r.git"
+        result = self.run_in_repo(["sh", str(self.hooks / "branch-guard.sh"), "push", url, url],
+                                  stdin=f"refs/heads/dev {self.feat} refs/heads/dev {ZERO}\n")
+        self.assertRefused(result, "https://***@forgejo.example.com/o/r.git")
+        self.assertNotIn("SECRET-TOKEN", result.stderr + result.stdout)
+
     def test_dev_is_never_pushed(self):
         self.assertRefused(self.guard_push("origin", "refs/heads/dev", self.feat, "refs/heads/dev"),
                            "dev is local scratch")

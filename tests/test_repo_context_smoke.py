@@ -1,5 +1,6 @@
 """Unit tests for kinetic_devops.repo_context smoke helpers."""
 
+import io
 import unittest
 from unittest.mock import patch
 
@@ -217,6 +218,44 @@ class TestRemoteHostIdentity(unittest.TestCase):
             detected = apply_engine._detect_current_repo_from_git()
         self.assertEqual(detected["provider"], "forgejo")
         self.assertEqual(detected["forgejo_api_base"], "https://forgejo.example.com:3000/api/v1")
+
+
+    def test_legacy_account_use_is_announced(self):
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            token, source, _ = self._resolve("forgejo.example.com:3000", {"forgejo": "legacy-token"})
+        self.assertEqual((token, source), ("legacy-token", "keyring:svc/forgejo"))
+        self.assertIn("legacy keyring account svc/forgejo for forgejo.example.com:3000", err.getvalue())
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            self._resolve("forgejo.example.com:3000", {"forgejo.example.com:3000": "own-token"})
+        self.assertEqual(err.getvalue(), "")                      # a server's own token: nothing to say
+
+    def test_parse_errors_carry_no_chained_password_fragment(self):
+        # urlparse's own message quotes the bad "port", i.e. part of a password containing "/".
+        for func in (repo_context.parse_git_remote, repo_context.host_from_url, repo_context.authority_from_url):
+            with self.subTest(func=func.__name__):
+                with self.assertRaises(RuntimeError) as ctx:
+                    func("https://user:ab/cd@forgejo.example.com/o/r")
+                self.assertIsNone(ctx.exception.__cause__)
+                self.assertTrue(ctx.exception.__suppress_context__)
+
+    def test_repo_maker_looks_up_the_token_for_the_server_it_calls(self):
+        from types import SimpleNamespace
+
+        from kinetic_devops import repo_maker
+
+        detected = {"provider": "forgejo", "host": "origin.example.com", "authority": "origin.example.com",
+                    "owner": "me", "scheme": "https"}
+        with patch.object(repo_context, "detect_from_git", return_value=detected), \
+             patch.dict("os.environ", {"FORGEJO_OWNER": ""}):
+            args = SimpleNamespace(owner="", forgejo_url="https://other.example.com:3000")
+            owner, host, api_base = repo_maker._resolve_context("forgejo", args)
+            self.assertEqual((owner, host, api_base), ("me", "other.example.com:3000",
+                                                       "https://other.example.com:3000/api/v1"))
+            args = SimpleNamespace(owner="", forgejo_url="")
+            self.assertEqual(repo_maker._resolve_context("forgejo", args),
+                             ("me", "origin.example.com", "https://origin.example.com/api/v1"))
 
 
 if __name__ == "__main__":

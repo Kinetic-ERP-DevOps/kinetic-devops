@@ -63,6 +63,8 @@ push)
         to_public=1
     fi
     public_main="$(git rev-parse -q --verify refs/remotes/public/main 2>/dev/null)"
+    # git passes a URL as the remote name when pushing to one: never print its user info (a token).
+    remote="$(printf '%s' "$remote" | sed 's#^\([a-zA-Z][a-zA-Z0-9+.-]*://\)[^/@]*@#\1***@#')"
     while read -r local_ref local_sha remote_ref remote_sha; do
         case "$local_ref" in
         refs/heads/dev) refuse "dev is local scratch and is never pushed (to $remote: $remote_ref)." ;;
