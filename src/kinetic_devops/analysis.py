@@ -533,17 +533,32 @@ _VERDICT_WORD = re.compile(r"^[ *#_`]*VERDICT\b", re.IGNORECASE)   # any verdict
 _NUMBERED_HEADING = re.compile(r"^[ \t#*_]*\d+[.)]\s")
 # A GO with a condition is not a pass: "VERDICT: GO if/unless/pending/once/after/until/but ...".
 _CONDITION = re.compile(r"\b(?:if|unless|pending|once|after|until|provided|assuming|conditional(?:ly)?|subject\s+to|"
-                        r"but|except|caveats?|however|though|although|when|reservations?|tentative(?:ly)?|"
-                        r"provisional(?:ly)?)\b|^\s*\?|^\*(?!\*)|^-\w", re.IGNORECASE)   # "GO?", "GO*" footnote, "GO-ish"
+                        r"but|except|caveats?|however|though|although|only\s+when|reservations?|tentative(?:ly)?|"
+                        r"provisional(?:ly)?|contingent|barring|(?:as|so)\s+long\s+as|likely|probably|confidence|"
+                        r"HOLD|needs?|follow-ups?\s+required|with\s+(?:minor\s+)?(?:conditions|concerns|caveats))\b"
+                        r"|^\s*\?|^\*(?!\*)|^-ish\b|^[ \t*_`]*/", re.IGNORECASE)   # "GO?", "GO*", "GO-ish", "GO/HOLD"   # "GO?", "GO*" footnote, "GO-ish"
 # A hedged or withheld verdict in the GO/NO-GO section ("Conditional GO", "HOLD", "not yet", "isn't a GO").
+# The same hedges after a GO inside the GO/NO-GO section, minus words that are ordinary prose there ("nothing to
+# hold back", "needs no migration").
+_SECTION_HEDGE = re.compile(r"\b(?:if|unless|pending|once|after|until|provided|assuming|conditional(?:ly)?|subject\s+to|"
+                            r"but|except|caveats?|however|though|although|contingent|barring|(?:as|so)\s+long\s+as|"
+                            r"tentative(?:ly)?|provisional(?:ly)?|with\s+(?:minor\s+)?(?:conditions|concerns|caveats))\b",
+                            re.IGNORECASE)
 _WITHHELD = re.compile(
     r"\bconditional(?:ly)?\s+GO\b|\bGO\s+with\s+(?:conditions|caveats|reservations)\b|\bon\s+hold\b|\bhold\s+off\b|"
-    r"\bhold\s+(?:until|for|pending)\b|^\W*not\s+yet\b|"
-    # a refusal word opening a line, followed by punctuation or the line end ("NO.", "FAIL — needs rework")
-    r"^\W*(?:HOLD|STOP|NO|NOGO|FAIL(?:ED)?|BLOCK(?:ED)?|REJECT(?:ED)?)(?:\s*[.:!—–]|\s+-\s|\s*$)|"
+    r"\bhold\s+(?:until|for|pending)\b|^[^\w\n]*not\s+yet\b|"
+    r"^[^\w\n]*(?:HOLD|STOP|NOGO|FAIL(?:ED)?|BLOCK(?:ED)?|REJECT(?:ED)?)"
+    r"(?:[^\w\n]*$|\s*[.!]|\s+-\s|\s*:(?![ \t*_]*(?:none|0|n/?a|nothing|no)\b))|"
+    r"^[^\w\n]*NO(?:[^\w\n]*$|\s*[.!]\s|\s+-\s)(?![^\n]*\bGO\b)|"
+    r"\b(?:recommendation|decision|verdict|status|call)\W{0,4}(?:hold|blocked|reject(?:ed)?|fail(?:ed)?|stop)\b|"
+    r"\b(?:do\s+not|don['’]?t)\s+ship\b|\bnot\s+(?:ready|safe)\s+(?:for|to)\s+promot|\b(?:would|will)\s+not\s+promote\b|"
+    r"\bnot\s+promoting\b|\bblock\s+promotion\b|\bdefer\s+promotion\b|\brevert\s+recommended\b|"
+    r"\brework\s+required\b|\b(?:wait|holding)\s+(?:for|until)\b|"
     r"\bnot\s+yet\s+(?:ready|safe|a\s+GO)\b|\bisn['’]?t\s+a\s+GO\b|\bwon['’]?t\s+GO\b|\bcan(?:no|['’])t\s+go\b|"
     r"\b(?:should|must)\s+not\s+be\s+(?:promoted|merged)\b|\b(?:do\s+not|don['’]?t)\s+(?:promote|merge)\b|\bNOGO\b",
     re.IGNORECASE | re.MULTILINE)
+_HEADING_SHAPED = re.compile(r"^[ \t#*_>]*(?:\d+[.)]|[-*+]|#)[^\n]{0,60}?\bGO[ \t]*/[ \t]*NO[- ]GO\b|"
+                             r"^[ \t#*_>]*GO[ \t]*/[ \t]*NO[- ]GO\b", re.IGNORECASE | re.MULTILINE)
 
 _DASHES = re.compile(r"[\u2010-\u2015\u2212]|\\-")   # Unicode dashes, and a markdown-escaped "\-"
 LEAD_WINDOW = 400   # the prompt asks for the VERDICT line first
@@ -588,9 +603,12 @@ def parse_verdict(review_text: str) -> str:
         m = _VERDICT_LINE.match(line.lstrip(" >"))
         if m and m.group(1).upper() != "GO":
             return "NO-GO"
-    heading = _SECTION_HEADING.search(text)
+    heading = _HEADING_SHAPED.search(text) or _SECTION_HEADING.search(text)
     if heading and (_NEGATED_GO.search(text[heading.end():]) or _WITHHELD.search(text[heading.end():])):
         return "NO-GO"
+    if heading and any(_SECTION_HEDGE.search(m.group(1))
+                       for m in re.finditer(r"\bGO\b([^\n]{0,60})", text[heading.end():], re.IGNORECASE)):
+        return "UNKNOWN"   # a hedged GO in the GO/NO-GO section ("GO once the test is fixed", "GO pending sign-off")
     # The lead: the first line the answer gives (one title line before it is allowed), within LEAD_WINDOW.
     fenced, title_seen = False, False
     for line in text[:LEAD_WINDOW].splitlines():
@@ -603,7 +621,8 @@ def parse_verdict(review_text: str) -> str:
             continue   # code, a quote, or the instruction echoed back ("VERDICT: <GO or NO-GO>"): not the answer's
         m = _VERDICT_LINE.match(line)
         if m:
-            return "GO" if m.group(1).upper() == "GO" and not _CONDITION.search(m.group(2)) else "UNKNOWN"
+            g2 = m.group(2).lstrip("*") if line[m.start(1) - 1:m.start(1)] == "*" else m.group(2)
+            return "GO" if m.group(1).upper() == "GO" and not _CONDITION.search(g2) else "UNKNOWN"
         if title_seen or _NUMBERED_HEADING.match(line) or _VERDICT_WORD.match(line):
             return "UNKNOWN"   # the review started without its verdict line
         title_seen = True
