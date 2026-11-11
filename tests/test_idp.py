@@ -1041,6 +1041,37 @@ class TestIdpRefreshAsksForThePassphraseFirst(VaultFixture):
         self.assertIn("KINETIC_VAULT_PASSPHRASE", err)
 
 
+class TestVaultPassphraseIsCheckedAgainstTheServersMap(VaultFixture):
+    """Review finding: a passphrase that opened a token slot was kept, and a write then took it without checking,
+    so it could re-encrypt the servers map with a passphrase nobody else uses."""
+
+    def test_passphrase_that_opens_only_a_slot_is_not_kept(self):
+        self.encrypted_vault()
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        self.kr.set_password(self.slot, "current_token",
+                             _fake_encrypt({"AccessToken": "AT-SECRET", "user_id": "alice"}, "slot-only"))
+        servers_before = self.kr.get_password(auth.SERVICE_SERVERS, "config")
+        with patch.object(sys.stdout, "isatty", return_value=True), patch.object(sys, "stderr", io.StringIO()), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="slot-only"):
+            self.assertEqual(self.mgr._get_token_meta(self.slot)["AccessToken"], "AT-SECRET")
+            self.assertIsNone(getattr(self.mgr, "_vault_pass", None))
+            with self.assertRaisesRegex(auth.VaultError, "doesn't open the vault"):
+                self.mgr._save_server_dict(dict(self.servers))
+        self.assertEqual(self.kr.get_password(auth.SERVICE_SERVERS, "config"), servers_before)
+
+    def test_vault_passphrase_that_opens_a_slot_is_kept(self):
+        self.encrypted_vault()
+        os.environ.pop("KINETIC_VAULT_PASSPHRASE")
+        self.kr.set_password(self.slot, "current_token",
+                             _fake_encrypt({"AccessToken": "AT-SECRET", "user_id": "alice"}, "pass-1"))
+        with patch.object(sys.stdout, "isatty", return_value=True), patch.object(sys, "stderr", io.StringIO()), \
+             patch("kinetic_devops.auth.getpass.getpass", return_value="pass-1") as ask:
+            self.mgr._get_token_meta(self.slot)
+            self.mgr._save_server_dict(dict(self.servers))
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(self.mgr._vault_pass, "pass-1")
+
+
 def _jwt(length):
     """A JWT-shaped token of about this many characters (Kinetic's access tokens are 600-1100)."""
     enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
@@ -1150,7 +1181,7 @@ class TestPasswordSessionChunking(VaultFixture):
 
 
 class TestVaultPromptMode(unittest.TestCase):
-    """A typed vault passphrase is kept until the command ends (--vault-prompt once, the default, said once on stderr)
+    """A typed vault passphrase is kept for the rest of the run (--vault-prompt once, the default, said once on stderr)
     or asked for each time (--vault-prompt every / KINETIC_VAULT_PROMPT=every)."""
 
     def setUp(self):
@@ -1182,7 +1213,7 @@ class TestVaultPromptMode(unittest.TestCase):
     def test_once_is_the_default_asks_once_and_says_so(self):
         asked, err = self.read_twice()
         self.assertEqual(asked, 1)
-        self.assertEqual(err.count("kept in memory until this command ends"), 1)
+        self.assertEqual(err.count("kept in memory for the rest of this run"), 1)
         self.assertIn("--vault-prompt every", err)
 
     def test_every_asks_each_time_and_keeps_nothing(self):

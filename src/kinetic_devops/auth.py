@@ -459,9 +459,10 @@ class KineticConfigManager(KineticCore):
     # encrypted with the vault passphrase; writes go through _save_server_dict and _save_token_meta only. Reads
     # accept clear and encrypted entries alike, so vaults that were never encrypted keep working unchanged.
 
-    # How a typed vault passphrase is reused (--vault-prompt / KINETIC_VAULT_PROMPT): "once" keeps it in memory until
-    # the command ends (never stored; said once on stderr), "every" asks again whenever the vault is read or written.
-    # KINETIC_VAULT_PASSPHRASE, when set, is used either way.
+    # How a typed vault passphrase is reused (--vault-prompt / KINETIC_VAULT_PROMPT): "once" keeps it in memory for
+    # the rest of this run (by this manager; never stored; said once on stderr), "every" asks again whenever the
+    # vault is read or written. KINETIC_VAULT_PASSPHRASE, when set, is used either way. Only a passphrase that opened
+    # the servers map is kept (_remember_vault_pass is called with nothing else).
     VAULT_PROMPT_MODES = ("once", "every")
 
     def _vault_prompt_mode(self) -> str:
@@ -471,16 +472,30 @@ class KineticConfigManager(KineticCore):
         return mode
 
     def _remember_vault_pass(self, passphrase: str) -> None:
-        """Keep a passphrase that opened the vault for the rest of this process, unless --vault-prompt every."""
+        """Keep a passphrase that opened the servers map for the rest of this run, unless --vault-prompt every."""
         if self._vault_prompt_mode() == "every":
             self._vault_pass = None
             return
         typed = passphrase != os.environ.get("KINETIC_VAULT_PASSPHRASE")
         if typed and not getattr(self, "_vault_pass_noted", False):
-            print("🔐 Vault passphrase kept in memory until this command ends (never stored). To be asked every "
+            print("🔐 Vault passphrase kept in memory for the rest of this run (never stored). To be asked every "
                   "time: --vault-prompt every or KINETIC_VAULT_PROMPT=every.", file=sys.stderr)
             self._vault_pass_noted = True
         self._vault_pass = passphrase
+
+    def _remember_if_it_opens_the_vault(self, passphrase: str) -> None:
+        """Remember a passphrase that opened something else (a token slot) only if it opens the servers map too, so
+        a passphrase that opens one slot can never be used to re-encrypt the servers map."""
+        if passphrase == getattr(self, "_vault_pass", None) or self._vault_prompt_mode() == "every":
+            return
+        raw = keyring.get_password(SERVICE_SERVERS, "config")
+        if not raw or not crypto.is_encrypted_blob(raw):
+            return
+        try:
+            crypto.decrypt_json(raw, passphrase)
+        except Exception:
+            return
+        self._remember_vault_pass(passphrase)
 
     def _vault_pass_if_known(self) -> Optional[str]:
         """The vault passphrase if it's at hand without asking (pinned for a refresh, kept from earlier, or
@@ -687,7 +702,8 @@ class KineticConfigManager(KineticCore):
                 data = crypto.decrypt_json(raw_data, passphrase)
             except Exception:
                 return None
-            self._remember_vault_pass(passphrase)
+            # Opening a token slot doesn't prove it's the vault's passphrase: keep it only if it opens the servers map.
+            self._remember_if_it_opens_the_vault(passphrase)
         else:
             try:
                 data = json.loads(raw_data)
@@ -2699,7 +2715,7 @@ def main():
             "Kinetic Config Manager: store Epicor Kinetic environments (URL, API key, companies) in the\n"
             "OS keyring, mint and cache bearer tokens per user, and manage/repair those keyring records.\n"
             "Set KINETIC_VAULT_PASSPHRASE to unlock an encrypted vault non-interactively. A typed vault\n"
-            "passphrase is kept in memory until the command ends; --vault-prompt every asks each time instead."
+            "passphrase is kept in memory for the rest of the run; --vault-prompt every asks each time instead."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -2711,8 +2727,8 @@ def main():
         ),
     )
     parser.add_argument("--vault-prompt", choices=KineticConfigManager.VAULT_PROMPT_MODES, default=None,
-                        help="Encrypted vault: 'once' (default) keeps a typed passphrase in memory until the command "
-                             "ends, never stored; 'every' asks each time the vault is read or written. "
+                        help="Encrypted vault: 'once' (default) keeps a typed passphrase in memory for the rest of the "
+                             "run, never stored; 'every' asks each time the vault is read or written. "
                              "Default: KINETIC_VAULT_PROMPT, else once.")
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 

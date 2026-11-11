@@ -188,10 +188,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   limit (Windows Credential Manager), such as a password session with a typical Kinetic token in an encrypted
   vault, is split over `current_token#N` entries; both forms are read, and `rename`, `logout` and the clean-up
   commands handle the chunks.
-  A typed vault passphrase is kept in memory until the command ends (said once; never stored);
-  `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time instead. An IdP refresh asks for
-  (and checks) the passphrase before it spends the refresh token, and not again during that refresh, so a
-  mistyped passphrase can't lose a rotated refresh token; it takes the sign-in-again path.
+  A typed vault passphrase is kept in memory for the rest of the run (said once; never stored; only a passphrase
+  that opens the servers map is kept); `auth --vault-prompt every` or `KINETIC_VAULT_PROMPT=every` asks each time
+  instead. An IdP refresh asks for (and checks) the passphrase before it spends the refresh token, and not again
+  during that refresh, so a mistyped passphrase can't lose a rotated refresh token; it takes the sign-in-again path.
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.
