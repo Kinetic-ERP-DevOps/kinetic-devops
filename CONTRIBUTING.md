@@ -107,16 +107,25 @@ runner and [scripts/README.md](scripts/README.md#git-hooks) for the opt-in pre-p
 The installed hooks also keep local `main` an exact copy of `public/main`, so the two remotes'
 `main` branches can't drift apart from this clone:
 
-- **No commits on `main`**, merge commits included (pre-commit, pre-merge-commit). `main` only moves
-  by fast-forwarding to `public/main` after a PR merges (`scripts/sync-main.sh`).
+- **No commits on `main`** (pre-commit), **no merge commits on `main`** (pre-merge-commit) and
+  **no rebasing `main`** (pre-rebase: `git rebase` on `main`, or naming `main` as the branch to
+  rebase). `main` only moves by fast-forwarding to `public/main` after a PR merges
+  (`scripts/sync-main.sh`).
 - **`main` is pushed only as exactly `public/main`**, and never to `public` itself, where it
   moves by merging a PR (pre-push).
 - **`dev` is a local scratch branch**: merge feature branches into it to try them together, and
   recreate it when it gets messy (`git branch -f dev main`). It is never pushed (pre-push).
 
-The guard also applies while `main` is being rebased (HEAD is detached then). If `branch-guard.sh`
-is missing from the hooks directory, the hooks refuse instead of skipping it: re-run
-`sh scripts/install-hook.sh` (or `scripts/install-hook.ps1`).
+What is covered is exactly that: commits, merge commits, starting a rebase, and pushes. A `git commit`
+during a rebase of `main` started anyway (with `KINETIC_ALLOW_MAIN=1` or `--no-verify`) is refused
+too (HEAD is detached then; the guard reads the rebased branch), but picks the rebase makes itself,
+and `git rebase --continue`, run no commit hook. `git cherry-pick`, `git am`, `git reset` and
+fast-forward merges or pulls run none of these hooks, so they can still move local `main`; pre-push
+is the backstop, refusing to push a `main` that isn't exactly `public/main` (get back with
+`git reset --hard public/main`).
+
+If `branch-guard.sh` is missing from the hooks directory, the hooks refuse instead of skipping it:
+re-run `sh scripts/install-hook.sh` (or `scripts/install-hook.ps1`).
 
 `KINETIC_ALLOW_MAIN=1` skips the guard for one command, for deliberate repairs only. The guard is
 local: it complements, and doesn't replace, branch protection on the remotes.

@@ -4,12 +4,14 @@
 #
 # Installed next to the git hooks by scripts/install-hook.sh (or .ps1) and called by them:
 #   branch-guard.sh commit                       (pre-commit, pre-merge-commit)
+#   branch-guard.sh rebase [<branch>]            (pre-rebase; no branch = the current one)
 #   branch-guard.sh push <remote> <url> < refs   (pre-push; refs on stdin as git gives them)
 #
 # Rules (see CONTRIBUTING.md, "Local branch guard"):
-#   - No commits (including merge commits) on main: main only moves to public/main,
-#     via scripts/sync-main.sh. Work on a feature branch, or merge into dev to try
-#     branches together.
+#   - No commits (including merge commits) on main, and no rebasing main: main only
+#     moves to public/main, via scripts/sync-main.sh. Work on a feature branch, or
+#     merge into dev to try branches together. (cherry-pick and am run none of these
+#     hooks; pre-push is the backstop for what they put on main.)
 #   - main is never pushed to the public remote (it moves there by merging a PR), and
 #     is pushed elsewhere only when it is exactly public/main (what sync-main.sh does).
 #   - dev is local scratch: never pushed anywhere.
@@ -43,6 +45,15 @@ commit)
                "commit on a feature branch, or merge into dev to try branches together."
     fi
     ;;
+rebase)
+    # pre-rebase gets the branch being rebased as $2, or nothing for the current branch.
+    branch="${2#refs/heads/}"
+    [ -z "$branch" ] && branch="$(git symbolic-ref -q --short HEAD)"
+    if [ "$branch" = "main" ]; then
+        refuse "no rebasing main. main moves only to public/main via scripts/sync-main.sh;" \
+               "rebase a feature branch instead."
+    fi
+    ;;
 push)
     remote="$2"
     url="$3"
@@ -74,7 +85,7 @@ push)
     done
     ;;
 *)
-    echo "usage: branch-guard.sh commit | push <remote> <url> < refs" >&2
+    echo "usage: branch-guard.sh commit | rebase [<branch>] | push <remote> <url> < refs" >&2
     exit 2
     ;;
 esac
