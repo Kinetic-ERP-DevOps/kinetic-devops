@@ -136,6 +136,9 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 - ci-bot no longer runs a PR's own `ai_review.py` with `LLM_API_KEY` and the bot token: it checked the PR out
   into the workspace that holds the review script. The PR now goes into a separate worktree, and the script is
   copied out of the workspace before it runs.
+- Forgejo sync runs the branch's tests (`SYNC_TEST_CMD`) without `GH_TOKEN`: they run the promoted branch's
+  code and got the whole environment. They now get an allowlist (`PATH`, `HOME`, locale, proxy, CA, `UV_*`, ...)
+  with secret-looking names dropped; set anything else inline in `SYNC_TEST_CMD`.
 
 
 ## [0.2.0.0a8] - 2026-11-01

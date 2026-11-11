@@ -10,7 +10,7 @@ sync/dry-run/<name> runs every step except the push and the PR. The same runs fr
      GitHub issues; mentions of a *draft* security advisory (undisclosed fix -> use its private fork);
      open secret-scanning alerts; dependency vulnerabilities introduced (pip-audit on uv.lock, main vs
      branch); open Dependabot alerts the branch resolves
-  3. the repo's tests (SYNC_TEST_CMD)
+  3. the repo's tests (SYNC_TEST_CMD), with an allowlisted environment: no GH_TOKEN
   4. push the result to GitHub branch sync/<name> (never main) and open or update the PR to main
 Env: GH_REPO (owner/name), GH_TOKEN (fine-grained, this repo: Contents/Pull requests RW; Issues, statuses,
 checks, Dependabot alerts, secret-scanning alerts, security advisories R; no Workflows), TAG, SYNC_TEST_CMD,
@@ -60,6 +60,20 @@ def gh(path, method="GET", body=None, ok404=False):
 def git_auth():  # token only in a per-command header, never in a URL or the config file
     return ["-c", "http.https://github.com/.extraheader=AUTHORIZATION: basic " +
             __import__("base64").b64encode(f"x-access-token:{TOKEN}".encode()).decode()]
+
+
+# What the branch's tests may see. They run the promoted branch's code, conftest and dependencies, so they get an
+# allowlist: never GH_TOKEN or the runner's tokens. Names that look secret are dropped even if listed.
+TEST_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR", "CI",
+            "PYTHONUNBUFFERED", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+            "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+TEST_ENV_PREFIXES = ("LC_", "UV_", "XDG_")
+
+
+def test_env(environ):
+    secret = re.compile(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|AUTH", re.I)
+    return {k: v for k, v in environ.items()
+            if (k in TEST_ENV or k.startswith(TEST_ENV_PREFIXES)) and not secret.search(k)}
 
 
 def locked_versions(lock_text):
@@ -256,7 +270,7 @@ if lock_branch:
 # 3. tests
 cmd = E.get("SYNC_TEST_CMD") or "uv sync --locked && uv run python -m pytest -q -p no:cacheprovider"
 print(f"tests: {cmd}")
-t = subprocess.run(["bash", "-c", cmd])
+t = subprocess.run(["bash", "-c", cmd], env=test_env(E))   # without GH_TOKEN or other secrets: see test_env
 if t.returncode:
     problems.append(f"tests failed ({cmd})")
 
