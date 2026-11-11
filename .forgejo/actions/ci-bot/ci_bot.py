@@ -6,7 +6,7 @@ Triggers (anything else exits quietly):
                                                      or "@ci-bot test" -> dispatch the test workflow
 Never fails the job: problems are printed and reported back as a comment where possible.
 """
-import json, os, re, subprocess, sys, urllib.error, urllib.request
+import json, os, re, shutil, subprocess, sys, tempfile, urllib.error, urllib.request
 
 ENV = os.environ
 API, REPO, TOKEN = ENV["FORGEJO_API"].rstrip("/"), ENV["REPO"], ENV["FORGEJO_TOKEN"]
@@ -83,10 +83,27 @@ def main():
         comment(pr, f"ci-bot: {missing} isn't set for this repo/org, so I can't review yet."); return
     # Review exactly the PR head against its base (the checkout may be the default branch on comment events).
     subprocess.run(["git", "fetch", "--no-tags", "origin", f"+refs/pull/{pr}/head:refs/ci-bot/pr", base], check=True)
-    subprocess.run(["git", "checkout", "-q", "--detach", "refs/ci-bot/pr"], check=True)
-    env = dict(ENV, PR_NUMBER=str(pr), BASE_REF=base)
     print(f"ci-bot: reviewing PR #{pr} ({head} @ {sha[:10]}) against {base}, asked by @{who}")
-    subprocess.run([sys.executable, ENV["REVIEW_SCRIPT"]], env=env)
+    review(pr, base)
+
+
+def review(pr, base):
+    """Run the trusted review script on the PR head without letting the PR replace that script.
+
+    The review script (and this file) live in the workspace, so the PR is never checked out there: it goes into
+    a separate worktree, and the script is copied out of the workspace first. Only this trusted process gets
+    LLM_API_KEY and the bot token; the PR's files are only read (git diff), never run."""
+    tmp = tempfile.mkdtemp(prefix="ci-bot-")
+    script, tree = os.path.join(tmp, "ai_review.py"), os.path.join(tmp, "pr")
+    shutil.copyfile(ENV["REVIEW_SCRIPT"], script)
+    try:
+        subprocess.run(["git", "worktree", "add", "-q", "--detach", tree, "refs/ci-bot/pr"], check=True)
+        env = dict(ENV, PR_NUMBER=str(pr), BASE_REF=base)
+        # -I: no PYTHON* variables, user site or script/current directory on sys.path (cwd holds the PR).
+        subprocess.run([sys.executable, "-I", script], env=env, cwd=tree)
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", tree], capture_output=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
