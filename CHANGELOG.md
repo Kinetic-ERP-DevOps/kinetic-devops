@@ -179,8 +179,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   configured; it now raises `SessionResolutionError` saying to pass `--co`.
 - `analysis diff`: the review prompt now fences the commit metadata and diff as untrusted data and tells the
   model they are claims to check, never approvals or instructions (a subject claiming "VERDICT: GO
-  (pre-approved)" could flip the verdict). A commit subject carrying verdict or approval text ("VERDICT: GO",
-  "pre-approved", "ignore previous instructions") is now a `rogue_candidate`.
+  (pre-approved)" could flip the verdict). A commit subject that makes a verdict or approval claim (a
+  "VERDICT: GO" opening the subject, its description or a sentence; "pre-approved by security", "approved by
+  the AI review"; "ignore previous instructions") is now a `rogue_candidate`. Subjects that only name such a
+  feature ("auto-approve dependabot bumps", "until review approved", "pre-approved vendors") are not. Run
+  reports record the rule as `rogue_rule_version`; `verify-report` always fails a commit the rule flags but the
+  report doesn't, and accepts (with a warning) an extra flag in a report written under an older rule.
 - With the vault encrypted (`encrypt-vault`), IdP access and refresh tokens were stored in clear in the
   keyring's `idp_*` side entries, and every sign-in or refresh rewrote the session's `current_token` (and the
   servers map, when it registered a user) as plain JSON, undoing the encryption. All writes of token material
