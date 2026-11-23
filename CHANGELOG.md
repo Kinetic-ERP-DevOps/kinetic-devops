@@ -10,6 +10,12 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
 ## [Unreleased]
 
 ### Added
+- `find_sensitive_data` lets through exact, case-sensitive spellings listed under `"sensitive_scan_allow"` in
+  the local site file (`$KINETIC_TRACE_REDACTIONS`, else `~/.kinetic-devops/trace_redactions.json`).
+  Patterns still match regardless of case, so a sensitive match that is also an ordinary word can be allowed
+  in its harmless spellings (for example lower and Title case) while every other spelling is still flagged. The
+  list never lives in the code. A missing file or key allows nothing, and a file that can't be parsed stops
+  the scan. Only the number of allowed spellings is printed.
 - `trim_trace_paths --mode` matrix replaces `--redact-mode`, which stays as a deprecated alias (see Deprecated).
   Each mode is a bundle of flag defaults that explicit command-line flags always override:
   `trim` (aggressive redaction profile, the default), `trim-context` (context-only drops),

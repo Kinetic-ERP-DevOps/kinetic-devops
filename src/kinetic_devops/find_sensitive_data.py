@@ -9,10 +9,19 @@ import zipfile
 import io
 from typing import List, Tuple, Dict, Any, Optional
 
+import json
+from pathlib import Path
+
 try:
     from .auth import KineticConfigManager
 except ImportError:
     KineticConfigManager = None
+
+try:
+    from .trim_trace_paths import DEFAULT_REDACTIONS_PATH as SITE_FILE_PATH, REDACTIONS_ENV_VAR as SITE_FILE_ENV_VAR
+except ImportError:
+    SITE_FILE_ENV_VAR = "KINETIC_TRACE_REDACTIONS"
+    SITE_FILE_PATH = Path.home() / ".kinetic-devops" / "trace_redactions.json"
 
 # Define generic patterns for sensitive information
 GENERIC_PATTERNS = {
@@ -249,6 +258,35 @@ KNOWN_PATTERN_FALSE_POSITIVES: Dict[str, set] = {
 }
 
 
+# Exact, case-sensitive spellings that are let through even though a pattern matches them. Patterns match
+# regardless of case, so a sensitive match that is also an ordinary word can be allowed in its harmless
+# spellings while every other spelling is still flagged. The list lives in the local site file, never in the code:
+# key "sensitive_scan_allow" in $KINETIC_TRACE_REDACTIONS, else ~/.kinetic-devops/trace_redactions.json (the
+# same file trim_trace_paths reads). Set by main(); empty means nothing is let through.
+SITE_FILE_ALLOW_KEY = "sensitive_scan_allow"
+ALLOWED_MATCHES: frozenset = frozenset()
+
+
+def load_allowed_matches(path: Optional[str] = None) -> frozenset:
+    """The allowed spellings from the site file. A missing file or key allows nothing; a file that can't be
+    parsed, or a key that isn't a list, raises ValueError so a broken file never silently changes the scan."""
+    source = Path(path or os.environ.get(SITE_FILE_ENV_VAR) or SITE_FILE_PATH)
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return frozenset()
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"can't read the site file {source}: {exc}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"the site file {source} must hold a JSON object")
+    values = data.get(SITE_FILE_ALLOW_KEY)
+    if values is None:
+        return frozenset()
+    if not isinstance(values, list):
+        raise ValueError(f'"{SITE_FILE_ALLOW_KEY}" in {source} must be a list of exact spellings')
+    return frozenset(str(v).strip() for v in values if str(v).strip())
+
+
 def _is_known_pattern_false_positive(pattern_name: str, path: str) -> bool:
     paths = KNOWN_PATTERN_FALSE_POSITIVES.get(pattern_name)
     if not paths:
@@ -272,6 +310,8 @@ def _collect_line_matches(
         if path and _is_known_pattern_false_positive(pattern_name, path):
             continue
         for match in regex.finditer(line):
+            if match.group(0) in ALLOWED_MATCHES:
+                continue
             if pattern_name == "GENERIC_BASE64_32":
                 candidate = match.group(1) if match.lastindex else match.group(0).strip("\"'")
                 if not _should_report_generic_base64(candidate, **options):
@@ -689,6 +729,16 @@ def main():
                 print(f"✅ Added custom pattern: {pattern_str}")
             except re.error as e:
                 print(f"❌ Error compiling custom pattern '{pattern_str}': {e}")
+
+    global ALLOWED_MATCHES
+    try:
+        ALLOWED_MATCHES = load_allowed_matches()
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return 1
+    if ALLOWED_MATCHES:
+        # The count only: the spellings themselves hint at what they stand in for.
+        print(f"Allowed exact spellings from the site file: {len(ALLOWED_MATCHES)}")
 
     all_patterns = {**GENERIC_PATTERNS, **custom_patterns}
     generic_base64_options = {
