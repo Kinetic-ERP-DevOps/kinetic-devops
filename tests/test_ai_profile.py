@@ -531,7 +531,8 @@ class TestDiffChunking(unittest.TestCase):
             "6) GO/NO-GO for further promotion\n**NO-GO**: API key printed": "NO-GO",
             "VERDICT: GO\n1) Change Classification ...\nOn second look:\nVERDICT: NO-GO": "NO-GO",
             "VERDICT: GO\n1) Change Classification ...\n6) GO/NO-GO for further promotion\nGO: safe": "GO",
-            "VERDICT: GO\n3) Regression Risk: it would be NO-GO if the check were missing; it isn't.": "GO",
+            # without a final section any NO-GO after the lead line overrules it, hypothetical or not (fail safe)
+            "VERDICT: GO\n3) Regression Risk: it would be NO-GO if the check were missing; it isn't.": "NO-GO",
             "VERDICT: NO-GO\n6) GO/NO-GO for further promotion\nGO once the test passes": "NO-GO",
         }
         for text, expected in cases.items():
