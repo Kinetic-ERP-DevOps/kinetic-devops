@@ -187,9 +187,10 @@ def _resolve_context(provider: str, args: argparse.Namespace):
             )
         if not url_value:
             url_value = f"{detected.get('scheme', 'https')}://{detected.get('authority') or detected['host']}/api/v1"
+            # The token is looked up for the server the API calls go to: the remote's only when its URL is used.
+            host = detected.get("authority") or detected["host"]
         if not owner:
             owner = detected["owner"]
-        host = detected.get("authority") or detected["host"]
 
     api_base = repo_context.normalize_forgejo_api_base(url_value, error_type=RepoMakerError)
     if not host:

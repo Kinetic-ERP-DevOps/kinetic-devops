@@ -8,9 +8,10 @@
 #
 #   pre-commit        branch guard, then the sensitive-data scan and the test suite
 #   pre-merge-commit  branch guard (no merge commits on main)
+#   pre-rebase        branch guard (no rebasing main)
 #   pre-push          branch guard (always), then the opt-in Windows Sandbox test
 #                     (enable: git config kinetic.prepushSandbox true)
-#   branch-guard.sh   the guard the three hooks call
+#   branch-guard.sh   the guard the four hooks call
 # ---------------------------------------------------------------------------
 
 try {
@@ -35,7 +36,7 @@ if ($LASTEXITCODE -ne 0 -or -not $hooksDir) {
 $templates = Join-Path $PSScriptRoot "hooks/templates"
 
 New-Item -ItemType Directory -Path $hooksDir -Force -ErrorAction SilentlyContinue | Out-Null
-foreach ($name in @("pre-commit", "pre-merge-commit", "pre-push", "branch-guard.sh")) {
+foreach ($name in @("pre-commit", "pre-merge-commit", "pre-rebase", "pre-push", "branch-guard.sh")) {
     # sh needs LF line endings whatever the checkout used.
     $text = [IO.File]::ReadAllText((Join-Path $templates $name)) -replace "`r`n", "`n"
     [IO.File]::WriteAllText((Join-Path $hooksDir $name), $text, (New-Object Text.ASCIIEncoding))
