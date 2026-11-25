@@ -117,6 +117,10 @@ and versions follow the rule in the README (*Versioning*): [PEP 440](https://pep
   will be removed in a later breaking release. Giving it together with a different `--mode` is an error.
 
 ### Fixed
+- `analysis diff` and the Forgejo `ai-review` action: a stream that ended with neither `data: [DONE]` nor a
+  `finish_reason` (a dropped connection) was returned as a complete answer. Because the verdict comes first,
+  an answer cut off after `VERDICT: GO` became a GO review with no analysis and no error. Both readers now
+  raise; `analysis diff` retries the chunk with the compact prompt, so its verdict is UNKNOWN, never GO.
 - `analysis diff` and the Forgejo `ai-review` action: the AI request deadline was only checked between lines,
   so one slow read could run a full timeout past it, and the plain-JSON fallback had no deadline at all. The
   deadline now bounds the whole answer: a watchdog shuts the connection down when it passes, so a server
