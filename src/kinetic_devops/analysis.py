@@ -372,6 +372,8 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool, idle_timeout: float 
     body) has arrived, at most `idle_timeout` (KINETIC_AI_READ_TIMEOUT). Blank, keep-alive and role-only
     events don't start the idle timer. The stream ends at ``data: [DONE]`` even if the server keeps the
     connection open. With call_ai's watchdog, the deadline also bounds a read that trickles bytes.
+    A stream that ends with neither ``[DONE]`` nor a finish_reason was cut off (a dropped connection): it
+    raises instead of returning, since a cut-off answer can still start with "VERDICT: GO".
     """
     idle_after_content = _ai_read_timeout() if idle_timeout is None else idle_timeout
     idle: float | None = None
@@ -401,12 +403,14 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool, idle_timeout: float 
     parts: list[str] = []
     finish_reason = None
     usage = None
+    done = False
     line = first
     while line:
         text = line.decode("utf-8", errors="replace").strip()
         if text.startswith("data:"):
             data = text[5:].strip()
             if data == "[DONE]":
+                done = True
                 break
             event = json.loads(data)
             if event.get("error"):
@@ -421,6 +425,9 @@ def _read_ai_stream(resp: Any, deadline: float, chat: bool, idle_timeout: float 
                     idle = idle_after_content   # content is flowing: from now on a stall is an error
                 finish_reason = choice.get("finish_reason") or finish_reason
         line = readline()
+    if not done and finish_reason is None:
+        raise RuntimeError("AI stream ended without [DONE] or a finish_reason: the answer was cut off "
+                           f"after {len(''.join(parts))} characters (connection dropped?)")
     content = "".join(parts)
     choice = {"message": {"role": "assistant", "content": content}} if chat else {"text": content}
     choice["finish_reason"] = finish_reason

@@ -78,7 +78,8 @@ def chat(url, payload, headers, deadline_s=900, idle_s=READ_TIMEOUT):
     """Streamed chat completion: giving up (deadline, error) closes the connection, which frees the
     server slot at once; an abandoned non-streaming request keeps the GPU busy until it finishes.
     The deadline bounds the whole answer, plain-JSON fallback included; once content flows (not on a
-    blank, keep-alive or role-only line) a recv may stall at most idle_s. Stops at `data: [DONE]`."""
+    blank, keep-alive or role-only line) a recv may stall at most idle_s. Stops at `data: [DONE]`; a stream
+    that ends with neither [DONE] nor a finish_reason was cut off and raises, so a partial review isn't posted."""
     deadline = time.monotonic() + deadline_s
     try:
         return _chat(url, payload, headers, deadline, deadline_s, idle_s)
@@ -92,7 +93,7 @@ def chat(url, payload, headers, deadline_s=900, idle_s=READ_TIMEOUT):
 
 def _chat(url, payload, headers, deadline, deadline_s, idle_s):
     req = urllib.request.Request(url, json.dumps(dict(payload, stream=True)).encode(), headers, method="POST")
-    parts, idle = [], None
+    parts, idle, done, finish = [], None, False, None
     with urllib.request.urlopen(req, timeout=deadline_s) as r, deadline_watchdog(r, deadline):
         while True:
             bound_next_read(r, deadline, idle)
@@ -103,6 +104,7 @@ def _chat(url, payload, headers, deadline, deadline_s, idle_s):
                 break
             line = raw.decode("utf-8", "replace").strip()
             if line == "data: [DONE]" or line == "data:[DONE]":
+                done = True
                 break
             if not line.startswith("data:"):
                 if line.startswith("{"):  # server ignored stream: plain JSON, read under the same deadline
@@ -127,6 +129,9 @@ def _chat(url, payload, headers, deadline, deadline_s, idle_s):
                 if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
                     idle = idle_s
                 parts.append(delta.get("content") or "")
+                finish = c.get("finish_reason") or finish
+    if not done and not finish:   # the connection ended mid-answer: don't post a partial review as the review
+        raise RuntimeError(f"AI stream ended without [DONE] or a finish_reason after {len(''.join(parts))} characters")
     return "".join(parts)
 
 

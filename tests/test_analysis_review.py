@@ -558,6 +558,18 @@ class TestRequestDeadline(unittest.TestCase):
         self.assertEqual(self.read(resp, 100), "VERDICT: GO!")
         self.assertEqual(resp.reads, len(SSE))
 
+    def test_a_stream_cut_off_before_done_raises(self):
+        # #34: the connection ends after "VERDICT: GO" with no finish_reason and no [DONE]; returning the
+        # partial text made the review a GO with no analysis and no error
+        for lines in (SSE[:2], [b": keep-alive\n", b"\n"] + SSE[:2]):
+            with self.subTest(lines=lines[0][:12]):
+                with self.assertRaisesRegex(RuntimeError, r"without \[DONE\]"):
+                    self.read(FakeResponse(self.clock, lines, step=1.0), 100)
+
+    def test_a_finish_reason_without_done_is_a_complete_answer(self):
+        # servers that end the stream after the finish_reason event, without [DONE], are fine
+        self.assertEqual(self.read(FakeResponse(self.clock, SSE[:4], step=1.0), 100), "VERDICT: GO!")
+
     def test_idle_timer_starts_with_the_first_content(self):
         preamble = [b": keep-alive\n", b"\n", b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n', b"\n"]
         resp = FakeResponse(self.clock, preamble + SSE, step=1.0)
@@ -722,6 +734,55 @@ class OneShotServer:
     def close(self):
         self.sock.close()
         self.thread.join(5)
+
+
+class DrainingOneShotServer(OneShotServer):
+    """OneShotServer that reads the whole request (headers and Content-Length body) before answering and
+    closes with a FIN: closing with unread request bytes would send a RST, and the client would see
+    ConnectionResetError instead of a stream that simply ended."""
+
+    def serve(self):
+        conn, _ = self.sock.accept()
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(65536)
+            head, _, body = data.partition(b"\r\n\r\n")
+            length = next((int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                           if line.lower().startswith(b"content-length:")), 0)
+            while len(body) < length:
+                body += conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" + self.body)
+            conn.shutdown(socket.SHUT_WR)
+
+
+class TestCutOffStreamAgainstARealSocket(unittest.TestCase):
+    """#34: the server closes the connection after "VERDICT: GO" (no finish_reason, no [DONE]). Before
+    the fix both readers returned the partial text, and the review was a GO with no analysis."""
+
+    CUT = b'data: {"choices": [{"delta": {"content": "VERDICT: GO\\n"}, "finish_reason": null}]}\n\n'
+
+    def test_call_ai_raises(self):
+        server = DrainingOneShotServer(self.CUT)
+        self.addCleanup(server.close)
+        with mock.patch.object(analysis, "_ai_client_settings", return_value=("openai-chat", {})), \
+                mock.patch.object(analysis, "_profile_for_url", return_value={}), \
+                mock.patch.dict(os.environ, {"KINETIC_AI_READ_TIMEOUT": ""}):
+            with self.assertRaisesRegex(RuntimeError, r"without \[DONE\]"):
+                analysis.call_ai(server.url, 5, "m", "p")
+
+    def test_forgejo_chat_raises(self):
+        server = DrainingOneShotServer(self.CUT)
+        self.addCleanup(server.close)
+        with self.assertRaisesRegex(RuntimeError, r"without \[DONE\]"):
+            load_ai_review().chat(server.url + "/v1/chat/completions", {"model": "m"}, {}, deadline_s=5)
+
+    def test_a_complete_stream_still_reads(self):
+        server = DrainingOneShotServer(self.CUT + b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
+                               b"data: [DONE]\n\n")
+        self.addCleanup(server.close)
+        self.assertEqual(load_ai_review().chat(server.url + "/v1/chat/completions", {"model": "m"}, {},
+                                               deadline_s=5), "VERDICT: GO\n")
 
 
 class TestDeadlineErrorsAndServerErrors(unittest.TestCase):
