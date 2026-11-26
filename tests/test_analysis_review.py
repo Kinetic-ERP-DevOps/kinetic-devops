@@ -597,6 +597,20 @@ class TestRequestDeadline(unittest.TestCase):
         out = analysis._read_ai_stream(resp, self.clock.now + 60, chat=True)
         self.assertEqual(analysis.extract_text(out), "VERDICT: GO")
 
+    def test_stream_cut_off_without_done_or_finish_reason_is_an_error(self):
+        # Dropped right after the verdict line: must not come back as a GO with no analysis.
+        resp = FakeResponse(self.clock, SSE[:2])
+        with self.assertRaisesRegex(RuntimeError, "cut off"):
+            self.read(resp, 100)
+
+    def test_stream_with_a_finish_reason_but_no_done_is_complete(self):
+        resp = FakeResponse(self.clock, SSE[:-1])
+        self.assertEqual(self.read(resp, 100), "VERDICT: GO!")
+
+    def test_stream_with_done_but_no_finish_reason_is_complete(self):
+        resp = FakeResponse(self.clock, SSE[:2] + [b"data: [DONE]\n"])
+        self.assertEqual(self.read(resp, 100), "VERDICT: GO")
+
 
 class TestForgejoAIReviewDeadline(TestRequestDeadline):
     """The Forgejo ai-review action has the same read loop; it must honour the deadline the same way."""
@@ -716,7 +730,16 @@ class OneShotServer:
     def serve(self):
         conn, _ = self.sock.accept()
         with conn:
-            conn.recv(65536)
+            # Read the whole request: closing with the body unread makes the OS reset the connection
+            # (urllib sends headers and body separately), and the client sees ConnectionResetError.
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += conn.recv(65536)
+            head, _, body = request.partition(b"\r\n\r\n")
+            length = next((int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                           if line.lower().startswith(b"content-length:")), 0)
+            while len(body) < length:
+                body += conn.recv(65536)
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" + self.body)
 
     def close(self):
@@ -751,6 +774,24 @@ class TestDeadlineErrorsAndServerErrors(unittest.TestCase):
                                b'data: {"error": {"message": "model overloaded"}}\n\n')
         self.addCleanup(server.close)
         with self.assertRaisesRegex(RuntimeError, "model overloaded"):
+            load_ai_review().chat(server.url + "/v1/chat/completions", {"model": "m"}, {}, deadline_s=5)
+
+    CUT_OFF = b'data: {"choices": [{"delta": {"content": "VERDICT: GO\\n"}, "finish_reason": null}]}\n\n'
+
+    def test_call_ai_raises_on_a_stream_cut_off_after_the_verdict(self):
+        # #34: the connection closes after the verdict line, with no finish_reason and no [DONE].
+        server = OneShotServer(self.CUT_OFF)
+        self.addCleanup(server.close)
+        with mock.patch.object(analysis, "_ai_client_settings", return_value=("openai-chat", {})), \
+                mock.patch.object(analysis, "_profile_for_url", return_value={}), \
+                mock.patch.dict(os.environ, {"KINETIC_AI_READ_TIMEOUT": ""}):
+            with self.assertRaisesRegex(RuntimeError, "cut off"):
+                analysis.call_ai(server.url, 5, "m", "p")
+
+    def test_forgejo_chat_raises_on_a_stream_cut_off_after_the_verdict(self):
+        server = OneShotServer(self.CUT_OFF)
+        self.addCleanup(server.close)
+        with self.assertRaisesRegex(RuntimeError, "cut off"):
             load_ai_review().chat(server.url + "/v1/chat/completions", {"model": "m"}, {}, deadline_s=5)
 
 
